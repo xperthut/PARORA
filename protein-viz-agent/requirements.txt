@@ -1,0 +1,7 @@
+streamlit
+ollama
+rcsb-api
+requests
+fastmcp
+MDAnalysis
+numpy

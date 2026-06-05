@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from ollama import Client
@@ -193,6 +193,12 @@ def run_agent(prompt: str) -> tuple[str, list[dict]]:
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    ico = _LOGO_DIR / "favicon.ico"
+    return FileResponse(str(ico), media_type="image/x-icon")
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):

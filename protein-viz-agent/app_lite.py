@@ -344,6 +344,79 @@ def build_ngl_html() -> str:
     """
 
 
+# ── Chat HTML renderer ───────────────────────────────────────────────────────
+
+def _render_chat_html(messages: list) -> str:
+    """Render the conversation as a WhatsApp/Teams-style bubble chat."""
+    rows = []
+    for msg in messages:
+        text = (msg["content"]
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\n", "<br>"))
+        if msg["role"] == "user":
+            rows.append(
+                f'<div class="row user">'
+                f'<div class="bubble ubbl">{text}</div>'
+                f'<div class="av uav">&#128100;</div>'   # 👤
+                f'</div>'
+            )
+        else:
+            rows.append(
+                f'<div class="row">'
+                f'<div class="av aav">&#129302;</div>'   # 🤖
+                f'<div class="bubble abbl">{text}</div>'
+                f'</div>'
+            )
+
+    body = "\n".join(rows)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+html,body{{
+  background:#1c1c1e;
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  padding:12px 10px 6px;
+}}
+body{{display:flex;flex-direction:column;gap:10px;}}
+.row{{display:flex;align-items:flex-end;gap:8px;}}
+.row.user{{flex-direction:row-reverse;}}
+/* avatars */
+.av{{
+  width:32px;height:32px;min-width:32px;
+  border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  font-size:16px;flex-shrink:0;
+  box-shadow:0 1px 4px rgba(0,0,0,.5);
+}}
+.uav{{background:#0a84ff;}}
+.aav{{background:#3a3a3c;}}
+/* bubbles */
+.bubble{{
+  max-width:78%;padding:9px 14px;
+  border-radius:18px;
+  font-size:13.5px;line-height:1.55;
+  word-break:break-word;
+  box-shadow:0 1px 3px rgba(0,0,0,.35);
+}}
+.ubbl{{
+  background:#0b93f6;color:#fff;
+  border-bottom-right-radius:4px;
+}}
+.abbl{{
+  background:#2c2c2e;color:#f2f2f7;
+  border-bottom-left-radius:4px;
+  border:1px solid #3a3a3c;
+}}
+</style></head>
+<body>
+{body}
+<div id="btm"></div>
+<script>document.getElementById('btm').scrollIntoView();</script>
+</body></html>"""
+
+
 # ====================== 25% / 75% HORIZONTAL LAYOUT ======================
 
 left, right = st.columns([1.5, 3])   # ~33% chat/controls | ~67% 3D viewer
@@ -351,14 +424,11 @@ left, right = st.columns([1.5, 3])   # ~33% chat/controls | ~67% 3D viewer
 with left:
     st.subheader("💬 Agent Chat")
 
-    # Scrollable chat history container
-    chat_container = st.container(height=420)
-    _agent_avatar = str(_LOGO_NOTEXT) if _LOGO_NOTEXT.exists() else "🧬"
-    with chat_container:
-        for msg in st.session_state.messages:
-            avatar = "👤" if msg["role"] == "user" else _agent_avatar
-            with st.chat_message(msg["role"], avatar=avatar):
-                st.markdown(msg["content"])
+    st.components.v1.html(
+        _render_chat_html(st.session_state.messages),
+        height=440,
+        scrolling=True,
+    )
 
     if prompt := st.chat_input("e.g. Load 3pp0, show ATP as ball+stick..."):
         st.session_state.messages.append({"role": "user", "content": prompt})

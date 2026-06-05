@@ -10,6 +10,33 @@ Ask it to isolate residues within 5 Å of a ligand binding site, filter by B-fac
 
 ---
 
+## Table of Contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Prerequisites](#prerequisites) *(macOS & Windows)*
+  - [1. Docker](#1-docker-for-containerized-deployment)
+  - [2. Ollama](#2-ollama-local-llm-runtime)
+  - [3. Python 3.12](#3-python-312-for-local-development-only) *(local dev only)*
+- [Getting Started](#getting-started)
+  - [Option A: Docker (Recommended)](#option-a-docker-recommended)
+  - [Option B: Local Development](#option-b-local-development)
+- [App Variants](#app-variants)
+- [Agent Tools Reference](#agent-tools-reference)
+  - [Data Loading](#data-loading)
+  - [Selections](#selections)
+  - [Visualization](#visualization)
+  - [Analysis](#analysis)
+- [Supported Representations](#supported-representations)
+- [Example Interactions](#example-interactions)
+- [Project Structure](#project-structure)
+- [Environment Variables](#environment-variables)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
 ## Features
 
 - **Natural language interface** — type "Show me hemoglobin" or "Highlight the ATP binding site as ball and stick" and the agent handles everything
@@ -24,33 +51,7 @@ Ask it to isolate residues within 5 Å of a ligand binding site, filter by B-fac
 
 ## Architecture
 
-```text
-User Input (Natural Language)
-        │
-        ▼
-   Ollama LLM (llama3.2)          ← runs locally via Ollama
-        │
-        ▼
-  Multi-Turn Tool Loop
-        │
-        ├── search_pdb(term)       → RCSB PDB text search → PDB ID
-        ├── fetch_structure(id)    → Download .pdb file from RCSB
-        ├── load_local(path)       → Load a local PDB file
-        ├── select(name, expr)     → Create a named selection
-        ├── select_within(…)       → Proximity-based selection (Å radius)
-        ├── select_by_bfactor(…)   → B-factor threshold selection
-        ├── show / hide / color    → Manage representation layers
-        ├── measure_distance(…)    → Inter-atom distance in Ångstroms
-        ├── align_structures(…)    → Backbone RMSD structural alignment
-        ├── zoom / set_background  → Camera and scene controls
-        └── save_structure / remove_solvent / add_hydrogens
-        │
-        ▼
-  Streamlit Session State
-        │
-        ▼
-  NGL.js 3D Renderer (WebGL in browser)
-```
+<img src="logo/arch.png" alt="PARORA Architecture" width="100%" style="max-width:100%;display:block;"/>
 
 ---
 
@@ -72,44 +73,93 @@ User Input (Natural Language)
 
 Before running PARORA, ensure the following are installed on your system.
 
+---
+
 ### 1. Docker (for containerized deployment)
 
-Download and install Docker Desktop from [https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/).
+Docker is required only if you plan to run PARORA via the Docker option.
 
-Verify installation:
+**macOS** — Download and install **Docker Desktop for Mac** (supports both Intel and Apple Silicon):
+[https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)
+
+After installation, launch Docker Desktop from your Applications folder and wait for the whale icon to appear in the menu bar.
+
+**Windows** — Download and install **Docker Desktop for Windows**:
+[https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)
+
+> **Windows requirement:** Docker Desktop requires **WSL 2** (Windows Subsystem for Linux). The installer will prompt you to enable it automatically. If not, run the following in PowerShell as Administrator, then restart your machine:
+>
+> ```powershell
+> wsl --install
+> ```
+
+**Verify:**
 
 ```bash
 docker --version
 ```
 
+---
+
 ### 2. Ollama (local LLM runtime)
 
-Download and install Ollama from [https://ollama.com/download](https://ollama.com/download). The installer registers Ollama as a background service — no need to run `ollama serve` manually after installation.
+**macOS** — Download the `.dmg` from [https://ollama.com/download](https://ollama.com/download), open it, and drag Ollama to Applications. Launch it once — it registers as a background menu bar service automatically.
 
-Verify installation:
+Alternatively, install via Homebrew:
 
 ```bash
-ollama --version
+brew install ollama
 ```
 
-Pull the required model:
+**Windows** — Download the `.exe` installer from [https://ollama.com/download](https://ollama.com/download) and run it. Ollama installs as a background Windows service and appears in the system tray.
+
+**Pull the required model (both platforms)** — after installation, open a terminal and run:
+
+```bash
+ollama pull llama3.2:latest
+```
+
+On macOS you can also use the provided script:
 
 ```bash
 bash ollama.sh
-# Pulls llama3.2:latest and confirms Ollama is ready at http://localhost:11434
+```
+
+**Verify:**
+
+```bash
+ollama list   # should show llama3.2:latest
 ```
 
 > **Note:** The model download is approximately 2 GB. A one-time internet connection is required for this step only. All subsequent inference runs entirely offline.
 
+---
+
 ### 3. Python 3.12 (for local development only)
 
-Download from [https://www.python.org/downloads/](https://www.python.org/downloads/) or install via your system package manager.
+Python is only required if you are running PARORA outside of Docker.
 
-Verify installation:
+**macOS** — Download from [https://www.python.org/downloads/](https://www.python.org/downloads/) and run the `.pkg`, or install via Homebrew:
 
 ```bash
-python3 --version   # should report 3.12.x
+brew install python@3.12
 ```
+
+**Windows** — Download the installer from [https://www.python.org/downloads/](https://www.python.org/downloads/) and run the `.exe`.
+
+> **Important:** On the first screen of the installer, check **"Add Python to PATH"** before clicking Install. Without this, `python` and `pip` will not be recognized in the terminal.
+
+**Verify:**
+
+```bash
+# macOS
+python3 --version
+
+# Windows
+python --version
+```
+
+Both should report `3.12.x`.
 
 ---
 
@@ -161,7 +211,7 @@ pip install -r requirements.txt
 streamlit run app.py
 
 # Simplified MCP-style version — lightweight three-tool agent
-streamlit run app_mcp.py
+streamlit run app_lite.py
 ```
 
 **Step 4** — Open your browser at `http://localhost:8501`.
@@ -173,7 +223,7 @@ streamlit run app_mcp.py
 | File | Description |
 | --- | --- |
 | `app.py` | Full-featured agent — MDAnalysis structural analysis, 18 tools, named selections, B-factor filtering, distance measurement, structure alignment, camera persistence, agent debug panel |
-| `app_mcp.py` | Simplified MCP-style agent — three core tools (search, load, represent); Docker default |
+| `app_lite.py` | Lite agent — three core tools (search, load, represent); Docker default |
 
 ---
 
@@ -265,7 +315,7 @@ PARORA/
 │   └── logo_notext.png          # Logo without text
 ├── protein-viz-agent/
 │   ├── app.py                   # Full-featured agent (recommended)
-│   ├── app_mcp.py               # Simplified MCP-style agent (Docker default)
+│   ├── app_lite.py              # Lite agent — three tools (Docker default)
 │   ├── requirements.txt         # Python dependencies
 │   ├── Dockerfile               # Container configuration
 │   └── structures/              # Local PDB file cache

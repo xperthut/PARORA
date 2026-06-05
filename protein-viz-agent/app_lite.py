@@ -1,23 +1,48 @@
 # =============================================================================
 # Developer : Methun Kamruzzaman
 # Date      : 2026-06-04
-# Summary   : Simplified MCP-style tool-calling protein visualizer.
-#             Exposes three formal tools to the Ollama agent — search_pdb,
-#             set_pdb, and add_representation — and uses Ollama's native
-#             tool-calling API to dispatch them. Structures are fetched
-#             directly from RCSB PDB and rendered as interactive 3D models
-#             via NGL.js embedded in the Streamlit UI.
+# Summary   : PARORA lite — a three-tool agentic protein visualizer.
+#             Exposes search_pdb, set_pdb, and add_representation to an
+#             Ollama agent via native tool-calling. Structures are fetched
+#             from RCSB PDB and rendered as interactive 3D models via NGL.js.
+#             This is the Docker default; see app.py for the full-featured
+#             variant with MDAnalysis and 18 tools.
 # =============================================================================
 
 import streamlit as st
 import os
+import json
+from pathlib import Path
 from ollama import Client
 from rcsbapi.search import TextQuery
-import json
 
-st.set_page_config(page_title="PDB Agentic Visualizer", layout="wide")
-st.title("🧬 MCP-Style Agentic Protein Visualizer (PDB)")
-st.caption("Real tool-calling agent • 25% / 75% horizontal layout • Black 3D view • State memory")
+# ── Logo resolution: works in both Docker (/app/logo/) and local dev (../logo/)
+_HERE = Path(__file__).parent
+_LOGO = _HERE / "logo" / "logo.png"
+if not _LOGO.exists():
+    _LOGO = _HERE.parent / "logo" / "logo.png"
+_LOGO_NOTEXT = _HERE / "logo" / "logo_notext.png"
+if not _LOGO_NOTEXT.exists():
+    _LOGO_NOTEXT = _HERE.parent / "logo" / "logo_notext.png"
+
+st.set_page_config(
+    page_title="PARORA",
+    page_icon=str(_LOGO_NOTEXT) if _LOGO_NOTEXT.exists() else "🧬",
+    layout="wide"
+)
+
+# ── Branding header ───────────────────────────────────────────────────────────
+col_logo, col_title = st.columns([1, 8])
+with col_logo:
+    if _LOGO.exists():
+        st.image(str(_LOGO), width=120)
+    else:
+        st.markdown("### 🧬")
+with col_title:
+    st.title("PARORA")
+    st.caption("Protein Agentic Rendering & Observation for Residue Analysis")
+
+st.divider()
 
 # ── Ollama host resolution: prefer env var, fall back to Docker bridge ────────
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
@@ -36,7 +61,7 @@ if "representations" not in st.session_state:
 model = "llama3.2:latest"
 
 
-# ====================== MCP-STYLE TOOLS ======================
+# ====================== AGENT TOOLS ======================
 
 def tool_search_pdb(search_term: str) -> str:
     """
@@ -157,7 +182,7 @@ tools = [
 
 def run_agent(prompt: str):
     """
-    Run a single-turn MCP-style agentic loop for a given user prompt.
+    Run a single-turn agentic loop for a given user prompt.
 
     Sends the prompt plus the current viewer state to the Ollama model with
     the tool schema attached. Iterates over any tool calls returned and
@@ -172,7 +197,7 @@ def run_agent(prompt: str):
         {
             "role": "system",
             "content": (
-                f"You are an MCP-style protein visualization agent. "
+                f"You are PARORA, a protein structure visualization agent. "
                 f"Current PDB: {st.session_state.pdb_id or 'none'}. "
                 "Use the provided tools to load structures and add representations. "
                 "Keep all previous layers unless the user asks for a new structure."
@@ -230,7 +255,7 @@ with left:
     prompt = st.text_area("Your command (one at a time)",
                           value="Download the structure of 3pp0", height=120)
 
-    if st.button("🚀 Run Agent (Tool Calling)", type="primary"):
+    if st.button("🚀 Run Agent", type="primary"):
         with st.spinner("Agent reasoning + calling tools..."):
             run_agent(prompt)
             st.rerun()
@@ -252,7 +277,7 @@ with left:
         st.rerun()
 
 with right:
-    st.subheader("Interactive 3D Visualization (Black Background)")
+    st.subheader("Interactive 3D Visualization")
     if st.session_state.pdb_id:
         pdb = st.session_state.pdb_id
         # Build one addRepresentation JS call per active layer
@@ -281,5 +306,3 @@ with right:
         st.components.v1.html(html, height=750, scrolling=False)
     else:
         st.info("Run a command on the left panel")
-
-st.caption("✅ 25% left controls / 75% right 3D view • Real MCP-style tool-calling agent")

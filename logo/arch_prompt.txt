@@ -1,0 +1,40 @@
+Use the following information to build a nice looking image that I am going to use in my publication. 
+
+The project name is PARORA — Protein Agentic Rendering & Observation for Residue Analysis. 
+
+User Input (Natural Language)
+        │
+        ▼
+  Browser Chat Panel              ← index.html  served by FastAPI
+        │
+        │  POST /api/chat  { prompt }
+        ▼
+  FastAPI Server                  ← server.py · Docker · :8000
+        │
+        ▼
+  Ollama LLM (qwen2.5:7b)           ← runs locally · host.docker.internal:11434
+        │
+        ▼
+  Multi-Turn Tool Loop
+        │
+        ├── search_pdb(term)      → RCSB PDB text search → PDB ID
+        ├── set_pdb(pdb_id)       → set session state + default cartoon layer
+        └── add_representation    → append rep to session state
+              (rep_type,
+               selection,          ── NGL Selection Normaliser ──
+               color)                   "chain A"  →  ":A"
+                                        "chains"   →  "protein"
+                                        "A"        →  ":A"
+        │
+        ▼
+  JSON Action List
+        │
+        │  { reply, actions: [ { action: "load_pdb" | "add_rep", ... } ] }
+        ▼
+  Browser: applyAction()          ← no page reload · NGL stage persists
+        │
+        ├── load_pdb  →  stage.loadFile(rcsb.org/…pdb) · comp.autoView()
+        └── add_rep   →  comp.addRepresentation(type, { sele, color })
+        │
+        ▼
+  NGL.js Stage (WebGL in browser) ← driven directly via JS API · never rebuilt

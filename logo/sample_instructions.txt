@@ -1,0 +1,69 @@
+load the structure of 3pp0
+select non-standard residues
+Select standard residues
+Select the ligand
+
+load the structure of 3pp0, after loading, select the non-standard residue, color it red, show licorice for it. After that, Select standard residues and show that in the figure. Also select and show the ligand.
+
+Select ATP 
+Color red for ATP
+Show licorcie for ATP
+
+Show cartoon for chains
+Show cartoon for chain A 
+Show ribbon for chain B
+Make color red for chain A
+Make color green for chain B
+Make chain A transparent
+Make Chain B transparent.
+
+
+
+
+
+
+
+
+PyMOL contains hundreds of individual commands, settings, and Boolean selection operators. Providing a literally complete table of every mathematical, rendering, and movie-frame iteration syntax would create an unreadable database.
+To give you the most comprehensive and high-utility resource possible, the table below expands your original criteria to cover every primary operational category in PyMOL. It incorporates core manipulation syntax, advanced structural selections, rendering properties, camera actions, and chemical modification tools.
+## The Comprehensive PyMOL Command & Selector Reference
+
+| Category | Instruction / Action | Detailed PyMOL Command Syntax & Logic |
+|---|---|---|
+| Original Table Requests | Select standard residues | select std_res, polymer.protein or polymer.nucleic Groups all canonical structural building blocks. |
+| | Select the ligand | select ligand, organic Targets non-polymer carbon-containing small molecules. |
+| | Select ATP | select atp_res, resn ATP Selects molecules matched to a 3-letter residue name code. |
+| | Color red for ATP | color red, atp_res Overrides default CPK element coloring with structural red. |
+| | Show licorice for ATP | show licorice, atp_res Displays thick bond cylinders with hidden atom spheres. |
+| | Show cartoon for chains | show cartoon, all Renders all eligible secondary structures globally. |
+| | Show cartoon for chain A | show cartoon, chain A Restricts the structural cartoon rendering explicitly to Chain A. |
+| | Show ribbon for chain B | show ribbon, chain B Renders Chain B as a thin, smooth trace backbone instead. |
+| | Make color red for chain A | color red, chain A Changes entire visual schematic of Chain A to red. |
+| | Make color green for chain B | color green, chain B Changes entire visual schematic of Chain B to green. |
+| | Make chain A transparent | set cartoon_transparency, 0.5, chain A Controls transparency value (0.0 to 1.0) on cartoon representations. |
+| | Make Chain B transparent | set ribbon_transparency, 0.5, chain B Controls transparency value specifically on ribbon geometry. |
+| Advanced Selection Expressions | Select around an object | select pocket, (all within 5.0 of atp_res) Selects any atom inside a 5.0 Å radius of the target selection. |
+| | Expand selection to whole residues | select complete_pocket, byres (all within 5.0 of atp_res) Expands a selection to include entire whole amino acid units. |
+| | Select based on element type | select carbons, symbol C Filters atoms by chemical element (e.g., C, N, O, S, FE). |
+| | Select by Secondary Structure | select helices, ss H Selects secondary features (H for helix, S for sheet, L for loop). |
+| | Select based on B-factors | select high_flex, b > 50 Isolates regions with high crystallographic mobility values. |
+| File I/O & Structure Fetching | Download directly from PDB database | fetch 1ubq, async=0 Connects to RCSB PDB to download and open structural models. |
+| | Load local coordinate files | load /path/to/molecule.pdb, my_protein Imports local PDB, SDF, or MOL2 structures into named objects. |
+| | Save current workspace state | save my_session.pse Exports the active window state as a native PyMOL Session (.pse). |
+| Visual Representations | Show solid surface overlay | show surface, protein Generates a solvent-accessible analytical surface. |
+| | Show all atoms as sphere layout | show spheres, ligands Displays space-filling Van der Waals structural models. |
+| | Hide everything globally | hide everything, all Clears the screen array completely without removing structural data. |
+| Structural Alignment | Structural superimposition | align proteinA, proteinB Performs sequence-guided 3D structure alignment and calculates RMSD. |
+| | Secondary structure alignment | cealign proteinA, proteinB Uses combinatorial extension for structural alignment on low sequence identities. |
+| Camera & Display Viewport | Focus view on selection | zoom target_selection Re-centers and fits camera viewing boundary box tightly to selection. |
+| | Orient camera angle natively | orient target_selection Aligns target along principal axes for optimal snapshot perspectives. |
+| | Adjust background field color | bg_color white Switches background between white (publications) and black (default contrast). |
+| Chemical Editing & Geometry | Measure atomic space distance | distance measurement_name, atom1, atom2 Draws dashed geometric trace lines detailing distance in Ångstroms. |
+| | Add explicit hydrogen atoms | h_add all Mathematically projects geometric hydrogens onto missing valences. |
+| | Remove chemical properties | remove solvent Deletes target classifications permanently from the workspace layout. |
+| High-Quality Exporting | Render publication ray tracing | ray 2400, 1800 Compiles lighting, realistic shadows, and ambient textures at designated pixel resolutions. |
+| | Export display view as graphic | png image_output.png Captures current screen frame matrix as a standard digital graphic file. |
+
+------------------------------
+To tailor this workspace to your workflow, would you like me to show you how to chain these commands together into a reusable script file (.pml), or do you need help mapping a specific command sequence to a custom mouse shortcut?
+

@@ -9,6 +9,7 @@
 #             variant with MDAnalysis and 18 tools.
 # =============================================================================
 
+import re
 import streamlit as st
 import os
 import json
@@ -16,11 +17,8 @@ from pathlib import Path
 from ollama import Client
 from rcsbapi.search import TextQuery
 
-# ── Logo resolution: works in both Docker (/app/logo/) and local dev (../logo/)
+# ── Asset resolution: works in both Docker (/app/logo/) and local dev (../logo/)
 _HERE = Path(__file__).parent
-_LOGO = _HERE / "logo" / "logo.png"
-if not _LOGO.exists():
-    _LOGO = _HERE.parent / "logo" / "logo.png"
 _LOGO_NOTEXT = _HERE / "logo" / "logo_notext.png"
 if not _LOGO_NOTEXT.exists():
     _LOGO_NOTEXT = _HERE.parent / "logo" / "logo_notext.png"
@@ -31,16 +29,30 @@ st.set_page_config(
     layout="wide"
 )
 
-# ── Branding header ───────────────────────────────────────────────────────────
-col_logo, col_title = st.columns([1, 8])
+# ── Compact header: logo + product name + one-line description ────────────────
+_LOGO = _HERE / "logo" / "logo.png"
+if not _LOGO.exists():
+    _LOGO = _HERE.parent / "logo" / "logo.png"
+
+col_logo, col_title = st.columns([1, 10])
 with col_logo:
     if _LOGO.exists():
-        st.image(str(_LOGO), width=120)
+        st.image(str(_LOGO), width=72)
     else:
         st.markdown("### 🧬")
 with col_title:
-    st.title("PARORA")
-    st.caption("Protein Agentic Rendering & Observation for Residue Analysis")
+    st.markdown(
+        "<div style='display:flex; flex-direction:column; justify-content:center; height:72px;'>"
+        "<span style='font-size:1.6rem; font-weight:700; line-height:1.2;'>PARORA</span>"
+        "<span style='font-size:0.85rem; color:#888;'>Protein Agentic Rendering &amp; Observation for Residue Analysis</span>"
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+st.markdown(
+    "<style>[data-testid='stToolbar'] { display: none; }</style>",
+    unsafe_allow_html=True
+)
 
 st.divider()
 
@@ -51,35 +63,42 @@ if os.path.exists("/.dockerenv"):
 ollama_client = Client(host=OLLAMA_HOST)
 
 # ── Session state ─────────────────────────────────────────────────────────────
-# pdb_id          : currently loaded PDB accession (e.g. "3PP0")
-# representations : ordered list of NGL representation layers for the viewer
-if "pdb_id" not in st.session_state:
-    st.session_state.pdb_id = None
-if "representations" not in st.session_state:
-    st.session_state.representations = []
+defaults = {
+    "messages":        [],        # chat history shown in the left panel
+    "debug_logs":      [],        # internal tool-call trace for the debug expander
+    "pdb_id":          None,      # currently loaded PDB accession (e.g. "3PP0")
+    "representations": [],        # ordered list of NGL representation layers
+    "background":      "black",   # NGL viewer background colour
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 model = "llama3.2:latest"
 
 
 # ====================== AGENT TOOLS ======================
 
+def _normalize_ngl_selection(sel: str) -> str:
+    """Map natural-language chain/residue references to valid NGL selection syntax."""
+    s = sel.strip()
+    # "chain A" / "chain: A" → ":A"
+    m = re.match(r'^chain[:\s]+([A-Za-z0-9])$', s, re.IGNORECASE)
+    if m:
+        return f":{m.group(1).upper()}"
+    # bare single uppercase letter assumed to be a chain ID → ":A"
+    if re.match(r'^[A-Z]$', s):
+        return f":{s}"
+    # plural / generic "chains" → "protein"
+    if s.lower() in ("chain", "chains", "all chains", "all protein chains"):
+        return "protein"
+    return s
+
+
 def tool_search_pdb(search_term: str) -> str:
-    """
-    Search the RCSB PDB database by free-text and return the top matching PDB ID.
-
-    Uses the rcsbapi TextQuery interface to retrieve the single best result.
-    Returns "No results" when the query yields nothing, or an error string on
-    network/API failure.
-
-    Args:
-        search_term: Free-text description or protein name (e.g. "human insulin").
-
-    Returns:
-        PDB accession string (e.g. "3I40"), "No results", or "Error: <detail>".
-    """
     try:
         query_obj = TextQuery(value=search_term)
-        session = query_obj(rows=1)       # Only fetch the top-ranked result
+        session = query_obj(rows=1)
         pdb_id = next(session, None)
         return pdb_id if pdb_id else "No results"
     except Exception as e:
@@ -87,42 +106,14 @@ def tool_search_pdb(search_term: str) -> str:
 
 
 def tool_set_pdb(pdb_id: str) -> str:
-    """
-    Load a PDB structure into the viewer by setting session state.
-
-    Uppercases the accession, stores it, and resets representations to a
-    default spectrum-colored cartoon covering the whole protein chain.
-
-    Args:
-        pdb_id: 4-character PDB accession code (case-insensitive).
-
-    Returns:
-        Confirmation string indicating which structure was loaded.
-    """
     st.session_state.pdb_id = pdb_id.upper()
-    # Reset to a single default cartoon layer whenever a new structure is loaded
     st.session_state.representations = [{"type": "cartoon", "selection": "protein", "color": "spectrum"}]
     return f"Loaded {pdb_id}"
 
 
 def tool_add_representation(rep_type: str, selection: str, color: str = "element") -> str:
-    """
-    Append an additional NGL representation layer to the current structure.
-
-    Layers are cumulative — calling this multiple times stacks representations
-    without removing existing ones, enabling combined views (e.g. cartoon
-    backbone + ball+stick ligands).
-
-    Args:
-        rep_type : NGL representation type ("cartoon", "ball+stick", "surface",
-                   "spacefill", or "ribbon").
-        selection: NGL selection string or atom group (e.g. "ligand", "protein",
-                   "ATP", ":A").
-        color    : NGL color scheme or named color (default: "element").
-
-    Returns:
-        Confirmation string describing the added layer.
-    """
+    color = color or "element"
+    selection = _normalize_ngl_selection(selection)
     st.session_state.representations.append({
         "type": rep_type,
         "selection": selection,
@@ -132,8 +123,6 @@ def tool_add_representation(rep_type: str, selection: str, color: str = "element
 
 
 # ── Formal tool schema exposed to the Ollama agent ───────────────────────────
-# Each entry follows the OpenAI-compatible function-calling format that Ollama
-# uses to decide which tool to invoke and with what arguments.
 tools = [
     {
         "type": "function",
@@ -163,13 +152,21 @@ tools = [
         "type": "function",
         "function": {
             "name": "add_representation",
-            "description": "Add a visual representation layer (cartoon, ligand, ATP, surface, etc.)",
+            "description": (
+                "Add a visual representation layer to the current structure. "
+                "selection must use NGL syntax: ':A' for chain A, 'protein' for all chains, "
+                "'hetero' for ligands/cofactors, 'water' for water, or a 3-letter residue code. "
+                "Never pass a bare chain letter without the leading colon."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "rep_type": {"type": "string", "enum": ["cartoon", "ball+stick", "surface", "spacefill", "ribbon"]},
-                    "selection": {"type": "string"},
-                    "color": {"type": "string"}
+                    "rep_type": {
+                        "type": "string",
+                        "enum": ["cartoon", "ball+stick", "licorice", "surface", "spacefill", "ribbon", "line"]
+                    },
+                    "selection": {"type": "string", "description": "NGL selection string (e.g. ':A', 'protein', 'hetero', 'ATP')"},
+                    "color": {"type": "string", "description": "Color name or scheme (e.g. 'red', 'element', 'spectrum', 'chainname')"}
                 },
                 "required": ["rep_type", "selection"]
             }
@@ -180,19 +177,9 @@ tools = [
 
 # ====================== AGENT ======================
 
-def run_agent(prompt: str):
-    """
-    Run a single-turn agentic loop for a given user prompt.
+def run_agent(prompt: str) -> str:
+    st.session_state.debug_logs.append(f"📨 User: {prompt}")
 
-    Sends the prompt plus the current viewer state to the Ollama model with
-    the tool schema attached. Iterates over any tool calls returned and
-    dispatches them to the corresponding tool functions, updating session
-    state in place. The viewer is then re-rendered by Streamlit on the next
-    rerun cycle.
-
-    Args:
-        prompt: Natural-language command from the user.
-    """
     messages = [
         {
             "role": "system",
@@ -200,7 +187,12 @@ def run_agent(prompt: str):
                 f"You are PARORA, a protein structure visualization agent. "
                 f"Current PDB: {st.session_state.pdb_id or 'none'}. "
                 "Use the provided tools to load structures and add representations. "
-                "Keep all previous layers unless the user asks for a new structure."
+                "Keep all previous layers unless the user asks for a new structure. "
+                "NGL selection syntax rules — always follow these exactly: "
+                "chain A → ':A', chain B → ':B', all protein chains → 'protein', "
+                "heteroatoms/ligands → 'hetero', water → 'water', "
+                "specific residue name → its 3-letter code (e.g. 'ATP', 'HEM'). "
+                "Never pass a bare letter like 'A' as a selection; always prefix chains with ':'."
             )
         },
         {"role": "user", "content": prompt}
@@ -210,17 +202,17 @@ def run_agent(prompt: str):
         model=model,
         messages=messages,
         tools=tools,
-        options={"temperature": 0.0}   # Deterministic tool selection
+        options={"temperature": 0.0}
     )
 
     tool_calls = response.get("message", {}).get("tool_calls", [])
+    summary_parts = []
 
     for tool_call in tool_calls:
         func = tool_call.get("function", {})
         name = func.get("name")
         arguments = func.get("arguments", "{}")
 
-        # Ollama may return arguments as a JSON string or as a dict directly
         if isinstance(arguments, str):
             try:
                 args = json.loads(arguments)
@@ -229,80 +221,133 @@ def run_agent(prompt: str):
         else:
             args = arguments if isinstance(arguments, dict) else {}
 
-        # Dispatch to the matching tool function
         if name == "search_pdb":
             result = tool_search_pdb(args.get("search_term", ""))
             st.info(f"🔍 Search result: {result}")
-            # Auto-load the found structure when no structure is currently active
             if result and result not in ["No results", ""] and not st.session_state.pdb_id:
                 tool_set_pdb(result)
+                summary_parts.append(f"Loaded {result}")
+            else:
+                summary_parts.append(f"search_pdb: {result}")
         elif name == "set_pdb":
-            tool_set_pdb(args.get("pdb_id", ""))
+            result = tool_set_pdb(args.get("pdb_id", ""))
+            summary_parts.append(result)
         elif name == "add_representation":
-            tool_add_representation(
+            result = tool_add_representation(
                 args.get("rep_type", "ball+stick"),
                 args.get("selection", "ligand"),
                 args.get("color", "element")
             )
+            summary_parts.append(result)
+        else:
+            result = f"Unknown tool: {name}"
+            summary_parts.append(result)
+
+        st.session_state.debug_logs.append(f"🔧 {name}({args}) → {result}")
+
+    final_text = response.get("message", {}).get("content", "").strip()
+    reply = final_text or ("Done: " + "; ".join(summary_parts)) if summary_parts else "No action taken."
+    st.session_state.debug_logs.append(f"💬 Agent: {reply}")
+    return reply
+
+
+# ── NGL HTML renderer ─────────────────────────────────────────────────────────
+
+def build_ngl_html() -> str:
+    pdb_id = st.session_state.pdb_id
+    if not pdb_id:
+        return ""
+
+    bg = st.session_state.background
+    reps = st.session_state.representations
+
+    reps_js = "".join(
+        f'comp.addRepresentation("{rep["type"]}", {{sele: "{rep["selection"]}", color: "{rep.get("color", "element")}"}}); '
+        for rep in reps
+    )
+
+    return f"""
+    <div style="width:100%; height:680px; border:1px solid #555; border-radius:8px; overflow:hidden; background:{bg};">
+        <div id="viewport" style="width:100%; height:100%;"></div>
+    </div>
+    <script src="https://unpkg.com/ngl@2/dist/ngl.js"></script>
+    <script>
+        (function() {{
+            var stage = new NGL.Stage("viewport", {{backgroundColor: "{bg}"}});
+            stage.loadFile("https://files.rcsb.org/download/{pdb_id}.pdb")
+                .then(function (comp) {{
+                    {reps_js}
+                    comp.autoView();
+                }});
+            window.addEventListener("resize", () => stage.handleResize());
+        }})();
+    </script>
+    """
 
 
 # ====================== 25% / 75% HORIZONTAL LAYOUT ======================
 
-left, right = st.columns([1, 3])   # 25% controls | 75% 3D viewer
+left, right = st.columns([1, 3])   # 25% chat/controls | 75% 3D viewer
 
 with left:
-    st.subheader("Agent Controls")
-    prompt = st.text_area("Your command (one at a time)",
-                          value="Download the structure of 3pp0", height=120)
+    st.subheader("💬 Agent Chat")
 
-    if st.button("🚀 Run Agent", type="primary"):
-        with st.spinner("Agent reasoning + calling tools..."):
-            run_agent(prompt)
-            st.rerun()
+    # Scrollable chat history container
+    chat_container = st.container(height=420)
+    with chat_container:
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
-    st.divider()
+    if prompt := st.chat_input("e.g. Load 3pp0, show ATP as ball+stick..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.spinner("Agent reasoning..."):
+            reply = run_agent(prompt)
+            st.session_state.messages.append({"role": "assistant", "content": reply})
+        st.rerun()
 
-    # Show the currently loaded structure and active representation layers
+    with st.expander("🔍 Agent Debug Logs", expanded=False):
+        for log in st.session_state.debug_logs[-30:]:
+            st.write(log)
+        if not st.session_state.debug_logs:
+            st.write("No logs yet")
+
+    # Compact state summary below the chat
     if st.session_state.pdb_id:
-        st.subheader(f"Current: **{st.session_state.pdb_id}**")
-        for i, rep in enumerate(st.session_state.representations):
-            st.write(f"• **{rep['type']}** — {rep['selection']} ({rep.get('color','default')})")
-    else:
-        st.info("Load a structure first")
+        st.divider()
+        st.markdown(f"**Structure:** `{st.session_state.pdb_id}`")
+        st.markdown(f"**Representations:** {len(st.session_state.representations)}")
 
-    if st.button("🆕 Explore New Structure", type="secondary"):
-        # Clear all state to start fresh with a different protein
-        st.session_state.pdb_id = None
-        st.session_state.representations = []
+    if st.button("🆕 New Structure", type="secondary"):
+        for k, v in defaults.items():
+            st.session_state[k] = v
         st.rerun()
 
 with right:
-    st.subheader("Interactive 3D Visualization")
-    if st.session_state.pdb_id:
-        pdb = st.session_state.pdb_id
-        # Build one addRepresentation JS call per active layer
-        reps_js = "".join(
-            f'comp.addRepresentation("{rep["type"]}", {{sele: "{rep["selection"]}", color: "{rep.get("color", "element")}"}}); '
-            for rep in st.session_state.representations
-        )
+    title_col, btn_col = st.columns([5, 1])
+    with title_col:
+        st.subheader("Interactive 3D Viewer")
+    with btn_col:
+        is_dark = st.session_state.background == "black"
+        label = "☀️ Light" if is_dark else "🌙 Dark"
+        if st.button(label, key="bg_toggle"):
+            st.session_state.background = "white" if is_dark else "black"
+            st.rerun()
 
-        html = f"""
-        <div style="width:100%; height:720px; border:1px solid #555; border-radius:8px; overflow:hidden; background:black;">
-            <div id="viewport" style="width:100%; height:100%;"></div>
-        </div>
-        <script src="https://unpkg.com/ngl@2/dist/ngl.js"></script>
-        <script>
-            (function() {{
-                var stage = new NGL.Stage("viewport", {{backgroundColor: "black"}});
-                stage.loadFile("https://files.rcsb.org/download/{pdb}.pdb")
-                    .then(function (comp) {{
-                        {reps_js}
-                        comp.autoView();
-                    }});
-                window.addEventListener("resize", () => stage.handleResize());
-            }})();
-        </script>
-        """
-        st.components.v1.html(html, height=750, scrolling=False)
+    if st.session_state.pdb_id:
+        html = build_ngl_html()
+        st.components.v1.html(html, height=700, scrolling=False)
+
+        if st.session_state.representations:
+            with st.expander("🎨 Active Representations (NGL selections)", expanded=False):
+                rows = []
+                for i, r in enumerate(st.session_state.representations):
+                    rows.append({
+                        "#": i + 1,
+                        "Type": r["type"],
+                        "Selection": r["selection"],
+                        "Color": r.get("color", "element"),
+                    })
+                st.dataframe(rows, use_container_width=True, hide_index=True)
     else:
-        st.info("Run a command on the left panel")
+        st.info("Load a structure to begin. Try: **\"Load insulin\"** or **\"Fetch 3pp0\"**")

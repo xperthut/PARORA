@@ -59,7 +59,8 @@ Ask it to isolate residues within 5 Å of a ligand binding site, filter by B-fac
 
 | Layer | Technology |
 | --- | --- |
-| UI Framework | [Streamlit](https://streamlit.io/) |
+| Backend | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) |
+| Frontend | Vanilla JS + NGL.js (single-page, no framework) |
 | LLM Runtime | [Ollama](https://ollama.com/) with `llama3.2:latest` |
 | Structural Analysis | [MDAnalysis](https://www.mdanalysis.org/) |
 | 3D Visualization | [NGL.js v2](https://nglviewer.org/) (WebGL via CDN) |
@@ -181,7 +182,7 @@ bash ollama.sh
 bash deploy.sh
 ```
 
-**Step 3** — Open your browser at `http://localhost:8501`.
+**Step 3** — Open your browser at `http://localhost:8000`.
 
 The script automatically removes any previous container, rebuilds the image, and mounts a local `structures/` directory so downloaded PDB files persist between runs.
 
@@ -207,14 +208,20 @@ pip install -r requirements.txt
 **Step 3** — Run the application:
 
 ```bash
-# Full-featured version (recommended) — MDAnalysis, named selections, agent debug log
+# FastAPI server (Docker default) — persistent NGL viewer, no page reloads
+uvicorn server:app --reload
+
+# Full-featured Streamlit agent — MDAnalysis, named selections, agent debug log
 streamlit run app.py
 
-# Simplified MCP-style version — lightweight three-tool agent
+# Lite Streamlit agent — lightweight three-tool agent
 streamlit run app_lite.py
 ```
 
-**Step 4** — Open your browser at `http://localhost:8501`.
+**Step 4** — Open your browser:
+
+- FastAPI: `http://localhost:8000`
+- Streamlit: `http://localhost:8501`
 
 ---
 
@@ -222,8 +229,9 @@ streamlit run app_lite.py
 
 | File | Description |
 | --- | --- |
-| `app.py` | Full-featured agent — MDAnalysis structural analysis, 18 tools, named selections, B-factor filtering, distance measurement, structure alignment, camera persistence, agent debug panel |
-| `app_lite.py` | Lite agent — three core tools (search, load, represent); Docker default |
+| `server.py` | **FastAPI server (Docker default)** — persistent NGL viewer, structured JSON actions, no page reloads |
+| `app.py` | Streamlit full-featured agent — MDAnalysis structural analysis, 18 tools, named selections, B-factor filtering, distance measurement, structure alignment, camera persistence, agent debug panel |
+| `app_lite.py` | Streamlit lite agent — three core tools (search, load, represent) |
 
 ---
 
@@ -314,12 +322,15 @@ PARORA/
 │   ├── logo.png                 # Logo with text
 │   └── logo_notext.png          # Logo without text
 ├── protein-viz-agent/
-│   ├── app.py                   # Full-featured agent (recommended)
-│   ├── app_lite.py              # Lite agent — three tools (Docker default)
+│   ├── server.py                # FastAPI server + agent (Docker default)
+│   ├── templates/
+│   │   └── index.html           # Single-page UI with embedded NGL.js
+│   ├── app.py                   # Streamlit full-featured agent
+│   ├── app_lite.py              # Streamlit lite agent — three tools
 │   ├── requirements.txt         # Python dependencies
 │   ├── Dockerfile               # Container configuration
 │   └── structures/              # Local PDB file cache
-├── deploy.sh                    # Docker build & run script
+├── deploy.sh                    # Docker build & run script (port 8000)
 └── ollama.sh                    # Ollama model setup script
 ```
 
@@ -358,4 +369,4 @@ This project is licensed under the terms of the [LICENSE](LICENSE) file included
 
 ---
 
-Built by **Methun Kamruzzaman** · Powered by [Ollama](https://ollama.com), [Streamlit](https://streamlit.io), [NGL.js](https://nglviewer.org), and [MDAnalysis](https://www.mdanalysis.org)
+Built by **Methun Kamruzzaman** · Powered by [Ollama](https://ollama.com), [FastAPI](https://fastapi.tiangolo.com), [NGL.js](https://nglviewer.org), and [MDAnalysis](https://www.mdanalysis.org)

@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PARORA</title>
+  <script src="https://unpkg.com/ngl@2/dist/ngl.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f7fa;
+      color: #1a1a2e;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 20px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+      flex-shrink: 0;
+    }
+    header img { height: 40px; }
+    header h1 { font-size: 1.3rem; font-weight: 700; color: #1a1a2e; }
+    header p  { font-size: 0.78rem; color: #64748b; margin-top: 1px; }
+
+    /* ── Main split layout ── */
+    main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Left panel: chat ── */
+    #chat-panel {
+      width: 320px;
+      min-width: 280px;
+      display: flex;
+      flex-direction: column;
+      background: #ffffff;
+      border-right: 1px solid #e2e8f0;
+      flex-shrink: 0;
+    }
+
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: #f8fafc;
+    }
+
+    .msg {
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-size: 0.82rem;
+      line-height: 1.5;
+      max-width: 92%;
+    }
+    .msg.user {
+      background: #dbeafe;
+      color: #1e40af;
+      align-self: flex-end;
+    }
+    .msg.assistant {
+      background: #ffffff;
+      color: #374151;
+      align-self: flex-start;
+      border: 1px solid #e2e8f0;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .msg.system {
+      background: transparent;
+      align-self: center;
+      color: #94a3b8;
+      font-size: 0.75rem;
+      font-style: italic;
+    }
+
+    #input-row {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 10px;
+      border-top: 1px solid #e2e8f0;
+      background: #ffffff;
+    }
+    #prompt {
+      width: 100%;
+      background: #f8fafc;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      color: #374151;
+      padding: 8px 10px;
+      font-size: 0.82rem;
+      font-family: inherit;
+      resize: none;
+      min-height: 80px;
+    }
+    #prompt:focus { outline: none; border-color: #2563eb; box-shadow: 0 0 0 2px #dbeafe; }
+
+    #send-btn {
+      align-self: flex-end;
+      background: #2563eb;
+      border: none;
+      border-radius: 8px;
+      color: #ffffff;
+      padding: 7px 20px;
+      cursor: pointer;
+      font-size: 0.82rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      transition: background 0.15s;
+    }
+    #send-btn:hover { background: #1d4ed8; }
+    #send-btn:disabled { background: #93c5fd; cursor: default; }
+
+    #reset-btn {
+      margin: 0 10px 10px;
+      background: transparent;
+      border: 1px solid #cbd5e1;
+      border-radius: 8px;
+      color: #64748b;
+      padding: 5px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      transition: all 0.15s;
+    }
+    #reset-btn:hover { border-color: #94a3b8; color: #374151; }
+
+    /* ── Right panel: 3D viewer ── */
+    #viewer-panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+    }
+
+    #viewer-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 12px;
+      background: #ffffff;
+      border-bottom: 1px solid #e2e8f0;
+      flex-shrink: 0;
+      min-height: 36px;
+    }
+
+    #status-text {
+      font-size: 0.78rem;
+      color: #64748b;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    #status-text .spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid #cbd5e1;
+      border-top-color: #2563eb;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      display: none;
+    }
+    #status-text.busy .spinner { display: inline-block; }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    #bg-btn {
+      background: transparent;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      color: #64748b;
+      padding: 3px 10px;
+      cursor: pointer;
+      font-size: 0.78rem;
+      transition: all 0.15s;
+      flex-shrink: 0;
+    }
+    #bg-btn:hover { border-color: #94a3b8; color: #374151; }
+
+    /* ── Progress bar ── */
+    #progress-bar {
+      height: 3px;
+      background: #e2e8f0;
+      overflow: hidden;
+      flex-shrink: 0;
+      transition: opacity 0.2s;
+    }
+    #progress-bar.hidden { opacity: 0; pointer-events: none; }
+    #progress-fill {
+      height: 100%;
+      width: 35%;
+      background: linear-gradient(90deg, #2563eb, #60a5fa);
+      border-radius: 2px;
+      animation: slide 1.4s ease-in-out infinite;
+    }
+    @keyframes slide {
+      0%   { transform: translateX(-150%); }
+      100% { transform: translateX(380%); }
+    }
+
+    #viewport {
+      flex: 1;
+      background: #ffffff;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <img src="/static/logo.png" onerror="this.style.display='none'" alt="logo">
+  <div>
+    <h1>PARORA</h1>
+    <p>Protein Agentic Rendering &amp; Observation for Residue Analysis</p>
+  </div>
+</header>
+
+<main>
+  <!-- ── Chat panel ── -->
+  <div id="chat-panel">
+    <div id="messages">
+      <div class="msg system">Load a structure to begin — e.g. "Load 3pp0"</div>
+    </div>
+    <div id="input-row">
+      <textarea id="prompt" rows="4" placeholder="e.g. Load insulin, show ATP as ball+stick…"></textarea>
+      <button id="send-btn">Process</button>
+    </div>
+    <button id="reset-btn">⟳ New structure</button>
+  </div>
+
+  <!-- ── NGL viewer ── -->
+  <div id="viewer-panel">
+    <div id="viewer-toolbar">
+      <span id="status-text"><span class="spinner"></span><span id="status-label"></span></span>
+      <button id="bg-btn">🌙 Dark</button>
+    </div>
+    <div id="progress-bar" class="hidden"><div id="progress-fill"></div></div>
+    <div id="viewport"></div>
+  </div>
+</main>
+
+<script>
+  // ── NGL stage ─────────────────────────────────────────────────────────────
+  const stage = new NGL.Stage("viewport", { backgroundColor: "white" });
+  window.addEventListener("resize", () => stage.handleResize());
+
+  let comp = null;
+  let bgDark = false;
+
+  // ── Background toggle ──────────────────────────────────────────────────────
+  document.getElementById("bg-btn").addEventListener("click", () => {
+    bgDark = !bgDark;
+    stage.setParameters({ backgroundColor: bgDark ? "black" : "white" });
+    document.getElementById("bg-btn").textContent = bgDark ? "☀️ Light" : "🌙 Dark";
+  });
+
+  // ── Status / progress helpers ─────────────────────────────────────────────
+  function setStatus(text) {
+    const el = document.getElementById("status-text");
+    document.getElementById("status-label").textContent = text;
+    el.classList.toggle("busy", !!text);
+    document.getElementById("progress-bar").classList.toggle("hidden", !text);
+  }
+
+  // ── Apply a single action returned by the agent ───────────────────────────
+  async function applyAction(action) {
+    console.log("applyAction:", action);
+    if (action.action === "load_pdb") {
+      setStatus(`Loading ${action.pdb_id}…`);
+      if (comp) stage.removeComponent(comp);
+      comp = await stage.loadFile(
+        `https://files.rcsb.org/download/${action.pdb_id}.pdb`
+      );
+      if (!comp) throw new Error(`Failed to load PDB ${action.pdb_id}`);
+      comp.addRepresentation("cartoon", { sele: "protein", color: "spectrum" });
+      comp.autoView();
+    } else if (action.action === "add_rep") {
+      if (!comp) throw new Error("No structure loaded — load a PDB first.");
+      setStatus(`Adding ${action.type} representation…`);
+      comp.addRepresentation(action.type, { sele: action.selection, color: action.color || "chainname" });
+    }
+  }
+
+  // ── Chat ──────────────────────────────────────────────────────────────────
+  function addMessage(role, text) {
+    const div = document.createElement("div");
+    div.className = `msg ${role}`;
+    div.textContent = text;
+    const box = document.getElementById("messages");
+    box.appendChild(div);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function sendMessage() {
+    const ta = document.getElementById("prompt");
+    const btn = document.getElementById("send-btn");
+    const text = ta.value.trim();
+    if (!text) return;
+
+    ta.value = "";
+    btn.disabled = true;
+    addMessage("user", text);
+    setStatus("Sending to agent…");
+
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: text }),
+      });
+
+      if (!res.ok) {
+        addMessage("assistant", `Server error ${res.status}. Check the console.`);
+        return;
+      }
+
+      setStatus("Processing response…");
+      const data = await res.json();
+
+      for (const action of data.actions) {
+        await applyAction(action);
+      }
+
+      addMessage("assistant", data.reply);
+    } catch (err) {
+      addMessage("assistant", `Error: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+      setStatus("");
+    }
+  }
+
+  document.getElementById("send-btn").addEventListener("click", sendMessage);
+  document.getElementById("prompt").addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+
+  // ── Reset ─────────────────────────────────────────────────────────────────
+  document.getElementById("reset-btn").addEventListener("click", async () => {
+    await fetch("/api/reset", { method: "POST" });
+    if (comp) { stage.removeComponent(comp); comp = null; }
+    document.getElementById("messages").innerHTML =
+      '<div class="msg system">Load a structure to begin — e.g. "Load 3pp0"</div>';
+  });
+</script>
+
+</body>
+</html>

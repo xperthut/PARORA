@@ -1,12 +1,15 @@
 # =============================================================================
 # Developer : Methun Kamruzzaman
 # Date      : 2026-06-04
-# Summary   : PARORA lite — a three-tool agentic protein visualizer.
-#             Exposes search_pdb, set_pdb, and add_representation to an
-#             Ollama agent via native tool-calling. Structures are fetched
-#             from RCSB PDB and rendered as interactive 3D models via NGL.js.
-#             This is the Docker default; see app.py for the full-featured
-#             variant with MDAnalysis and 18 tools.
+# Summary   : PARORA Lite — lightweight Streamlit variant.
+#             Three-tool agentic protein visualizer (search_pdb, set_pdb,
+#             add_representation) powered by Ollama native tool-calling.
+#             Structures are fetched from RCSB PDB and rendered via NGL.js.
+#             For the production FastAPI server with SSE streaming and
+#             server-side deduplication see server.py.
+#             For the full-featured Streamlit agent with MDAnalysis (18 tools,
+#             B-factor filtering, proximity selections, RMSD alignment) see
+#             app.py.
 # =============================================================================
 
 import re

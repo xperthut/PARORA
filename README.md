@@ -4,9 +4,9 @@
 
 > A natural language interface for protein structure exploration — powered by a local agentic AI pipeline that queries the RCSB Protein Data Bank, performs residue-level structural analysis, and renders interactive 3D models directly in your browser.
 
-PARORA puts a conversational interface in front of the full protein structure analysis workflow. Describe what you want in plain English and a multi-turn LLM agent — running entirely on your machine via Ollama — autonomously searches the RCSB PDB, downloads the structure, applies MDAnalysis-powered residue selections, and builds layered WebGL visualizations through NGL.js.
+PARORA puts a conversational interface in front of the full protein structure analysis workflow. Describe what you want in plain English and a local LLM agent — running entirely on your machine via Ollama — autonomously searches the RCSB PDB, downloads the structure, and builds layered WebGL visualizations through NGL.js.
 
-Ask it to isolate residues within 5 Å of a ligand binding site, filter by B-factor to reveal flexible regions, measure inter-atom distances, or align two structures by backbone RMSD. Every operation is driven by a set of 18 structured agent tools — no scripting, no command-line flags, no manual data wrangling. The full analysis pipeline, from database query to rendered 3D model, runs offline after a one-time model download.
+The production server streams each action to the browser as an SSE event, so the 3D viewer updates progressively — structure loads first, then each representation appears one by one. LLM tool calls are deduplicated server-side before execution, colour is extracted directly from natural language when the model omits it, and existing representation attributes (colour, opacity) are preserved when only one property is changed. The full analysis pipeline, from database query to rendered 3D model, runs offline after a one-time model download.
 
 ---
 
@@ -40,10 +40,12 @@ Ask it to isolate residues within 5 Å of a ligand binding site, filter by B-fac
 ## Features
 
 - **Natural language interface** — type "Show me hemoglobin" or "Highlight the ATP binding site as ball and stick" and the agent handles everything
-- **Autonomous multi-turn tool calling** — the LLM agent orchestrates a rich set of structural tools across multiple reasoning steps
-- **Advanced structural analysis** — MDAnalysis-powered B-factor filtering, proximity selections, solvent removal, and backbone RMSD alignment
-- **Named selections** — define, reuse, and layer selections by name across the entire session
-- **Interactive 3D viewer** — WebGL-based NGL.js renderer with rotation, zoom, camera persistence, and layered representation support
+- **Progressive SSE streaming** — each action streams to the browser as it executes; the 3D viewer updates one representation at a time, not all at once
+- **Server-side deduplication** — redundant LLM tool calls for the same selection are resolved before any execution, picking the rep type the user explicitly named
+- **Robust NGL selection mapping** — normalises natural language ("non-standard residues", "chains", "ligand") and corrects model quirks (e.g. `:protein` → `protein`) before any call reaches NGL.js
+- **Color and opacity preservation** — explicit colours are extracted from the prompt when the model omits them; changing opacity alone never reverts a previously set colour
+- **Advanced structural analysis** — MDAnalysis-powered B-factor filtering, proximity selections, solvent removal, and backbone RMSD alignment (full `app.py` variant)
+- **Interactive 3D viewer** — WebGL-based NGL.js renderer with rotation, zoom, dark/light toggle, and layered representation support
 - **Fully local inference** — powered by Ollama; no API keys, no data leaves your machine
 - **Docker-ready** — one command to build and run in a containerized environment
 
@@ -61,7 +63,7 @@ Ask it to isolate residues within 5 Å of a ligand binding site, filter by B-fac
 | --- | --- |
 | Backend | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) |
 | Frontend | Vanilla JS + NGL.js (single-page, no framework) |
-| LLM Runtime | [Ollama](https://ollama.com/) with `llama3.2:latest` |
+| LLM Runtime | [Ollama](https://ollama.com/) with `qwen2.5:7b` |
 | Structural Analysis | [MDAnalysis](https://www.mdanalysis.org/) |
 | 3D Visualization | [NGL.js v2](https://nglviewer.org/) (WebGL via CDN) |
 | PDB Data Source | [RCSB PDB API](https://www.rcsb.org/) (`rcsb-api`) |
@@ -117,7 +119,7 @@ brew install ollama
 **Pull the required model (both platforms)** — after installation, open a terminal and run:
 
 ```bash
-ollama pull llama3.2:latest
+ollama pull qwen2.5:7b
 ```
 
 On macOS you can also use the provided script:
@@ -129,10 +131,10 @@ bash ollama.sh
 **Verify:**
 
 ```bash
-ollama list   # should show llama3.2:latest
+ollama list   # should show qwen2.5:7b
 ```
 
-> **Note:** The model download is approximately 2 GB. A one-time internet connection is required for this step only. All subsequent inference runs entirely offline.
+> **Note:** The model download is approximately 4.7 GB. A one-time internet connection is required for this step only. All subsequent inference runs entirely offline.
 
 ---
 
@@ -229,9 +231,9 @@ streamlit run app_lite.py
 
 | File | Description |
 | --- | --- |
-| `server.py` | **FastAPI server (Docker default)** — persistent NGL viewer, structured JSON actions, no page reloads |
+| `server.py` | **FastAPI server (Docker default)** — SSE streaming, server-side tool-call deduplication, NGL selection normalisation, color extraction from natural language, in-place representation updates via `repMap` |
 | `app.py` | Streamlit full-featured agent — MDAnalysis structural analysis, 18 tools, named selections, B-factor filtering, distance measurement, structure alignment, camera persistence, agent debug panel |
-| `app_lite.py` | Streamlit lite agent — three core tools (search, load, represent) |
+| `app_lite.py` | Streamlit lite agent — three core tools (search, load, represent); useful for development and debugging without the full server pipeline |
 
 ---
 
@@ -350,13 +352,13 @@ PARORA/
 Ensure Ollama is running. On macOS, the installer registers it as a background service; verify with `ollama list`. If not running, launch the Ollama desktop app or run `ollama serve`.
 
 **Model not found**
-Run `bash ollama.sh` to pull the `llama3.2:latest` model before starting the app.
+Run `bash ollama.sh` to pull the `qwen2.5:7b` model before starting the app.
 
 **Docker can't reach Ollama**
 On macOS, the container connects to `host.docker.internal:11434` automatically. On Linux, you may need to add `--add-host=host.docker.internal:host-gateway` to the `docker run` command in `deploy.sh`.
 
 **Slow responses**
-`llama3.2` runs on CPU by default if no compatible GPU is detected. For faster inference on Apple Silicon, ensure the Ollama version supports Metal acceleration (included by default in recent Ollama releases).
+`qwen2.5:7b` runs on CPU by default if no compatible GPU is detected. For faster inference on Apple Silicon, ensure the Ollama version supports Metal acceleration (included by default in recent Ollama releases). The model requires approximately 6 GB of memory to run.
 
 **MDAnalysis not available**
 The `app.py` full-featured agent gracefully degrades if MDAnalysis fails to import. Re-install with `pip install MDAnalysis` in your environment.

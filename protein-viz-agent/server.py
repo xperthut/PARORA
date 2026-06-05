@@ -1,8 +1,15 @@
 # =============================================================================
 # Developer : Methun Kamruzzaman
-# Summary   : PARORA — FastAPI backend.
-#             Agent runs server-side; frontend receives structured "actions"
-#             and drives NGL.js directly, so the 3D viewer never reloads.
+# Summary   : PARORA — FastAPI backend (Docker default).
+#             Agentic pipeline powered by qwen2.5:7b via Ollama.
+#             LLM tool calls are parsed, deduplicated per-selection, and
+#             executed one at a time.  Each action is streamed to the browser
+#             as an SSE event so the NGL.js viewer updates progressively
+#             without a page reload.
+#             Includes NGL selection normalisation (handles qwen2.5 quirks
+#             such as ':protein'), server-side color extraction from natural
+#             language prompts, and session-state tracking so opacity and
+#             color changes preserve existing representation attributes.
 # Run       : uvicorn server:app --reload
 # =============================================================================
 
@@ -12,7 +19,7 @@ import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from ollama import Client
@@ -60,8 +67,31 @@ _VALID_REP_TYPES: set[str] = {
 }
 
 
+_KEYWORD_SELS = frozenset({"protein", "hetero", "water", "backbone", "all"})
+
+# Explicit color names the user might say in natural language
+_EXPLICIT_COLORS = {
+    "red", "green", "blue", "yellow", "orange", "purple", "pink",
+    "cyan", "magenta", "white", "black", "grey", "gray",
+    "gold", "silver", "teal", "lime", "violet", "indigo",
+}
+
+_COLOR_RE = re.compile(
+    r'\b(' + '|'.join(_EXPLICIT_COLORS) + r')\b', re.IGNORECASE
+)
+
+
+def _extract_prompt_color(prompt: str) -> str | None:
+    """Return the first explicit color word found in the prompt, or None."""
+    m = _COLOR_RE.search(prompt)
+    return m.group(1).lower() if m else None
+
+
 def _normalize_ngl_selection(sel: str) -> str:
     s = sel.strip()
+    # qwen2.5 sometimes prefixes keyword selections with ':' (e.g. ":protein") — strip it
+    if s.startswith(':') and s[1:].lower() in _KEYWORD_SELS:
+        s = s[1:].lower()
     mapped = _NL_TO_NGL.get(s.lower())
     if mapped:
         return mapped
@@ -108,6 +138,14 @@ def tool_add_representation(rep_type: str, selection: str, color: str = "element
             None,
         )
         color = existing["color"] if existing else "element"
+
+    # Inherit a previously-set specific color when LLM passes a generic default
+    if color in ("element", "chainname"):
+        existing_any = next(
+            (r for r in _session["representations"] if r["selection"] == selection), None
+        )
+        if existing_any and existing_any["color"] not in ("element", "chainname", "spectrum"):
+            color = existing_any["color"]
 
     opacity = max(0.0, min(1.0, float(opacity)))
     rep = {"type": rep_type, "selection": selection, "color": color, "opacity": opacity}
@@ -182,35 +220,76 @@ TOOLS = [
 
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
-def run_agent(prompt: str) -> tuple[str, list[dict]]:
-    """Returns (reply_text, list_of_actions).
+def _deduplicate_tool_calls(parsed: list[dict], prompt: str) -> list[dict]:
+    """For each selection, keep only the one add_representation call that best
+    matches what the user explicitly asked for.  All other tool types pass through."""
+    prompt_lower = prompt.lower()
+    rep_indices = [(i, c) for i, c in enumerate(parsed) if c["name"] == "add_representation"]
 
-    Actions are structured dicts the browser applies directly to the NGL stage:
-      {"action": "load_pdb", "pdb_id": "3PP0"}
-      {"action": "add_rep",  "type": "cartoon", "selection": ":A", "color": "red"}
+    if not rep_indices:
+        return parsed
+
+    # Group by raw selection string
+    by_sel: dict[str, list[tuple[int, dict]]] = {}
+    for i, call in rep_indices:
+        sel = call["args"].get("selection", "")
+        by_sel.setdefault(sel, []).append((i, call))
+
+    # For each selection, pick the call whose rep_type the user named; else take the last
+    keep: set[int] = set()
+    for group in by_sel.values():
+        if len(group) == 1:
+            keep.add(group[0][0])
+        else:
+            chosen = next(
+                (i for i, c in group if c["args"].get("rep_type", "").lower() in prompt_lower),
+                group[-1][0],
+            )
+            keep.add(chosen)
+
+    return [c for i, c in enumerate(parsed) if c["name"] != "add_representation" or i in keep]
+
+
+def run_agent_stream(prompt: str):
+    """Sync generator that yields SSE event strings, one per executed action.
+
+    Event envelope uses 'evt' as the discriminator key so it never collides
+    with the NGL 'type' field carried inside add_rep action payloads:
+      data: {"evt": "action", "action": "load_pdb", "pdb_id": "3PP0"}
+      data: {"evt": "action", "action": "add_rep",  "type": "cartoon", ...}
+      data: {"evt": "reply",  "text": "Done: ..."}
     """
+    reps_json = json.dumps(_session["representations"])
     messages = [
         {
             "role": "system",
             "content": (
                 f"You are PARORA, a protein structure visualization agent. "
                 f"Current PDB: {_session['pdb_id'] or 'none'}. "
+                f"Current representations: {reps_json}.\n"
                 "NGL selection syntax — follow these rules exactly:\n"
                 "  'chain A' or 'chain A only' → ':A'\n"
                 "  'chain B' or 'chain B only' → ':B'\n"
                 "  'chains', 'all chains', 'both chains', 'protein', 'whole protein', "
-                "  'standard residues', 'amino acids' → 'protein'\n"
+                "  'standard residues', 'amino acids' → 'protein' (no leading colon)\n"
+                "  IMPORTANT: 'protein', 'hetero', 'water' are keywords — never write ':protein', "
+                "  ':hetero', ':water'. Only chain letters get a leading colon (e.g. ':A').\n"
                 "  IMPORTANT: if the user says 'chains' (plural) without naming a specific letter, "
                 "  ALWAYS use 'protein', never ':A'.\n"
                 "  non-standard residues / ligands / heteroatoms → 'hetero'\n"
                 "  water → 'water'  |  specific residue → 3-letter code (e.g. 'ATP', 'HEM')\n"
                 "  Never pass a bare letter like 'A'; always prefix chains with ':'.\n"
                 "Representation rules:\n"
+                "  - Call add_representation at most ONCE per selection per user message.\n"
+                "  - Do NOT add multiple representation types for the same selection; pick one.\n"
                 "  - To CHANGE color, style, or opacity of an existing layer, call add_representation "
                 "with the SAME rep_type and selection — it replaces the layer in-place.\n"
+                "  - When changing only opacity, look up the current color from Current representations "
+                "and pass it explicitly so the color is preserved.\n"
+                "  - When changing only color, look up the current rep_type and opacity and pass them.\n"
                 "  - To make something transparent/ghost: use opacity=0.3.\n"
                 "  - To restore full opacity: use opacity=1.0.\n"
-                "  - Do NOT add duplicate layers for the same type+selection.\n"
+                "  - Do NOT add a cartoon for 'protein' if one already exists in Current representations.\n"
                 "  - Only call set_pdb to load a new structure."
             ),
         },
@@ -221,52 +300,72 @@ def run_agent(prompt: str) -> tuple[str, list[dict]]:
         model=MODEL, messages=messages, tools=TOOLS, options={"temperature": 0.0}
     )
 
-    actions: list[dict] = []
-    summary: list[str] = []
-
+    # Parse all tool calls, then deduplicate before executing any
+    parsed: list[dict] = []
     for call in response.get("message", {}).get("tool_calls", []):
         func = call.get("function", {})
         name = func.get("name")
         raw_args = func.get("arguments", "{}")
         args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        parsed.append({"name": name, "args": args})
+
+    deduped = _deduplicate_tool_calls(parsed, prompt)
+
+    summary: list[str] = []
+    _all_chains_words = re.compile(
+        r'\b(chains|all chains|both chains|whole protein|all protein|protein chains)\b',
+        re.IGNORECASE,
+    )
+    _specific_chain = re.compile(r'^chain\s+[A-Za-z]$', re.IGNORECASE)
+
+    for call in deduped:
+        name = call["name"]
+        args = call["args"]
+        action = None
 
         if name == "search_pdb":
             pdb_id = tool_search_pdb(args.get("search_term", ""))
             if pdb_id not in ("No results", ""):
                 action = tool_set_pdb(pdb_id)
-                actions.append(action)
                 summary.append(f"Loaded {pdb_id}")
         elif name == "set_pdb":
             action = tool_set_pdb(args.get("pdb_id", ""))
-            actions.append(action)
             summary.append(f"Loaded {args.get('pdb_id', '')}")
         elif name == "add_representation":
             raw_opacity = args.get("opacity")
             opacity = float(raw_opacity) if raw_opacity is not None else 1.0
             sel = args.get("selection", "protein")
-            # Safety net: if the LLM returned a specific chain but the user
-            # clearly meant all chains, override to "protein".
-            _all_chains_words = re.compile(
-                r'\b(chains|all chains|both chains|whole protein|all protein|protein chains)\b',
-                re.IGNORECASE,
-            )
-            _specific_chain = re.compile(r'^chain\s+[A-Za-z]$', re.IGNORECASE)
             if (_all_chains_words.search(prompt)
                     and not _specific_chain.search(prompt)
                     and re.match(r'^:[A-Z]$', sel)):
                 sel = "protein"
-            action = tool_add_representation(
-                args.get("rep_type", "ball+stick"),
-                sel,
-                args.get("color") or "chainname",
-                opacity,
+            rep_type = args.get("rep_type", "ball+stick")
+            # If the LLM picked a rep type not explicitly mentioned in the prompt,
+            # prefer the type already stored for this selection (keeps existing style).
+            if rep_type.lower() not in prompt.lower():
+                norm_sel = _normalize_ngl_selection(sel)
+                existing = next(
+                    (r for r in _session["representations"] if r["selection"] == norm_sel), None
+                )
+                if existing:
+                    rep_type = existing["type"]
+            llm_color = args.get("color") or ""
+            # If LLM omitted or used a generic default, fall back to any
+            # explicit color word the user typed in the prompt
+            if not llm_color or llm_color in ("element", "chainname"):
+                llm_color = _extract_prompt_color(prompt) or llm_color or "chainname"
+            action = tool_add_representation(rep_type, sel, llm_color, opacity)
+            summary.append(
+                f"Added {action['type']} for {action['selection']} "
+                f"({action['color']}, opacity={action['opacity']})"
             )
-            actions.append(action)
-            summary.append(f"Added {action['type']} for {action['selection']} ({action['color']}, opacity={action['opacity']})")
+
+        if action:
+            yield f"data: {json.dumps({'evt': 'action', **action})}\n\n"
 
     text = response.get("message", {}).get("content", "").strip()
     reply = text or ("Done: " + "; ".join(summary)) or "No action taken."
-    return reply, actions
+    yield f"data: {json.dumps({'evt': 'reply', 'text': reply})}\n\n"
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -285,8 +384,11 @@ async def index(request: Request):
 @app.post("/api/chat")
 async def chat(request: Request):
     body = await request.json()
-    reply, actions = run_agent(body.get("prompt", ""))
-    return JSONResponse({"reply": reply, "actions": actions})
+    return StreamingResponse(
+        run_agent_stream(body.get("prompt", "")),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/reset")

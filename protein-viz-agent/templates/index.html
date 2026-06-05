@@ -1,3 +1,17 @@
+<!--
+  Developer : Methun Kamruzzaman
+  Summary   : PARORA — Single-page chat + 3D viewer UI.
+              Chat panel sends user prompts to the FastAPI /api/chat endpoint
+              and consumes the SSE stream it returns, applying each structured
+              action (load_pdb, add_rep) to the NGL.js stage as it arrives so
+              the 3D viewer updates progressively without a page reload.
+              Representation state is tracked in a repMap (Map) so existing
+              layers are removed before a replacement is added, enabling true
+              in-place updates for color, opacity, and style changes.
+              Avatars (user / bot SVG), gradient bubbles, dot-grid background,
+              and fade-in animations are embedded directly in CSS/JS with no
+              external UI dependencies beyond NGL.js (loaded via CDN).
+-->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -409,19 +423,36 @@
         return;
       }
 
-      setStatus("Processing response…");
-      const data = await res.json();
+      // Stream SSE events — each action is applied to the viewer as it arrives
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-      for (const action of data.actions) {
-        try {
-          await applyAction(action);
-        } catch (e) {
-          console.error("Action failed:", action, e);
-          if (action.action === "load_pdb") throw e;  // fatal — stop processing
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";   // keep any incomplete trailing line
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          let evt;
+          try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+          if (evt.evt === "action") {
+            try {
+              await applyAction(evt);
+            } catch (e) {
+              console.error("Action failed:", evt, e);
+              if (evt.action === "load_pdb") throw e;  // fatal
+            }
+          } else if (evt.evt === "reply") {
+            addMessage("assistant", evt.text);
+          }
         }
       }
-
-      addMessage("assistant", data.reply);
     } catch (err) {
       addMessage("assistant", `Error: ${err.message}`);
     } finally {

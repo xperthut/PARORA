@@ -79,9 +79,39 @@ model = "llama3.2:latest"
 
 # ====================== AGENT TOOLS ======================
 
+_NL_TO_NGL: dict[str, str] = {
+    # ligand / hetero aliases
+    "ligand": "hetero", "ligands": "hetero",
+    "het": "hetero", "hetatm": "hetero",
+    "heteroatom": "hetero", "heteroatoms": "hetero",
+    "non-standard residue": "hetero", "non-standard residues": "hetero",
+    "nonstandard residue": "hetero", "nonstandard residues": "hetero",
+    "non standard residue": "hetero", "non standard residues": "hetero",
+    "non-standard": "hetero", "nonstandard": "hetero",
+    # protein aliases
+    "standard residue": "protein", "standard residues": "protein",
+    "amino acid": "protein", "amino acids": "protein",
+    "backbone only": "backbone",
+    # water
+    "water molecule": "water", "water molecules": "water", "solvent": "water",
+    # catch-all
+    "all": "*", "everything": "*",
+}
+
+_VALID_REP_TYPES: set[str] = {
+    "cartoon", "ball+stick", "licorice", "surface", "spacefill",
+    "ribbon", "line", "backbone", "rope", "tube", "trace",
+    "helixorient", "hyperball", "contact", "base", "label",
+}
+
+
 def _normalize_ngl_selection(sel: str) -> str:
     """Map natural-language chain/residue references to valid NGL selection syntax."""
     s = sel.strip()
+    # natural-language → NGL keyword (case-insensitive)
+    mapped = _NL_TO_NGL.get(s.lower())
+    if mapped:
+        return mapped
     # "chain A" / "chain: A" → ":A"
     m = re.match(r'^chain[:\s]+([A-Za-z0-9])$', s, re.IGNORECASE)
     if m:
@@ -113,12 +143,31 @@ def tool_set_pdb(pdb_id: str) -> str:
 
 def tool_add_representation(rep_type: str, selection: str, color: str = "element") -> str:
     color = color or "element"
+    if rep_type not in _VALID_REP_TYPES:
+        rep_type = "ball+stick"
     selection = _normalize_ngl_selection(selection)
-    st.session_state.representations.append({
-        "type": rep_type,
-        "selection": selection,
-        "color": color
-    })
+
+    # "transparent" / "translucent" are not NGL colors — convert to opacity.
+    # Preserve the layer's existing color when only opacity is being changed.
+    opacity = 1.0
+    if color.lower() in ("transparent", "translucent", "semi-transparent", "semitransparent"):
+        opacity = 0.3
+        existing = next(
+            (r for r in st.session_state.representations
+             if r["type"] == rep_type and r["selection"] == selection),
+            None,
+        )
+        color = existing["color"] if existing else "element"
+
+    rep = {"type": rep_type, "selection": selection, "color": color, "opacity": opacity}
+
+    # Replace an existing layer with the same type+selection rather than stacking.
+    for i, r in enumerate(st.session_state.representations):
+        if r["type"] == rep_type and r["selection"] == selection:
+            st.session_state.representations[i] = rep
+            return f"Updated {rep_type} for {selection} ({color}, opacity={opacity})"
+
+    st.session_state.representations.append(rep)
     return f"Added {rep_type} for {selection} ({color})"
 
 
@@ -166,7 +215,7 @@ tools = [
                         "enum": ["cartoon", "ball+stick", "licorice", "surface", "spacefill", "ribbon", "line"]
                     },
                     "selection": {"type": "string", "description": "NGL selection string (e.g. ':A', 'protein', 'hetero', 'ATP')"},
-                    "color": {"type": "string", "description": "Color name or scheme (e.g. 'red', 'element', 'spectrum', 'chainname')"}
+                    "color": {"type": "string", "description": "Color name, scheme, or 'transparent' (e.g. 'red', 'element', 'spectrum', 'chainname', 'transparent')"}
                 },
                 "required": ["rep_type", "selection"]
             }
@@ -186,13 +235,17 @@ def run_agent(prompt: str) -> str:
             "content": (
                 f"You are PARORA, a protein structure visualization agent. "
                 f"Current PDB: {st.session_state.pdb_id or 'none'}. "
-                "Use the provided tools to load structures and add representations. "
-                "Keep all previous layers unless the user asks for a new structure. "
-                "NGL selection syntax rules — always follow these exactly: "
-                "chain A → ':A', chain B → ':B', all protein chains → 'protein', "
-                "heteroatoms/ligands → 'hetero', water → 'water', "
-                "specific residue name → its 3-letter code (e.g. 'ATP', 'HEM'). "
-                "Never pass a bare letter like 'A' as a selection; always prefix chains with ':'."
+                "NGL selection syntax — follow these rules exactly:\n"
+                "  chain A → ':A'  |  chain B → ':B'  |  all chains / whole protein → 'protein'\n"
+                "  non-standard residues / ligands / heteroatoms → 'hetero'\n"
+                "  water → 'water'  |  specific residue → 3-letter code (e.g. 'ATP', 'HEM')\n"
+                "  Never pass a bare letter like 'A'; always prefix chains with ':'.\n"
+                "Representation rules:\n"
+                "  - To CHANGE the color or style of an existing layer, call add_representation "
+                "with the SAME rep_type and selection as before — it replaces the layer.\n"
+                "  - To make something transparent, pass color='transparent'.\n"
+                "  - Do NOT add duplicate layers for the same type+selection.\n"
+                "  - Only call set_pdb to load a new structure, not to re-apply representations."
             )
         },
         {"role": "user", "content": prompt}
@@ -223,7 +276,6 @@ def run_agent(prompt: str) -> str:
 
         if name == "search_pdb":
             result = tool_search_pdb(args.get("search_term", ""))
-            st.info(f"🔍 Search result: {result}")
             if result and result not in ["No results", ""] and not st.session_state.pdb_id:
                 tool_set_pdb(result)
                 summary_parts.append(f"Loaded {result}")
@@ -235,7 +287,7 @@ def run_agent(prompt: str) -> str:
         elif name == "add_representation":
             result = tool_add_representation(
                 args.get("rep_type", "ball+stick"),
-                args.get("selection", "ligand"),
+                args.get("selection", "hetero"),
                 args.get("color", "element")
             )
             summary_parts.append(result)
@@ -261,8 +313,13 @@ def build_ngl_html() -> str:
     bg = st.session_state.background
     reps = st.session_state.representations
 
-    reps_js = "".join(
-        f'comp.addRepresentation("{rep["type"]}", {{sele: "{rep["selection"]}", color: "{rep.get("color", "element")}"}}); '
+    reps_js = "\n                    ".join(
+        "try {{ comp.addRepresentation({t}, {{sele: {s}, color: {c}, opacity: {o}}}); }} catch(e) {{ console.warn('NGL rep failed:', e); }}".format(
+            t=json.dumps(rep["type"]),
+            s=json.dumps(rep["selection"]),
+            c=json.dumps(rep.get("color", "element")),
+            o=rep.get("opacity", 1.0),
+        )
         for rep in reps
     )
 
@@ -276,9 +333,11 @@ def build_ngl_html() -> str:
             var stage = new NGL.Stage("viewport", {{backgroundColor: "{bg}"}});
             stage.loadFile("https://files.rcsb.org/download/{pdb_id}.pdb")
                 .then(function (comp) {{
+                    if (!comp) return;
                     {reps_js}
                     comp.autoView();
-                }});
+                }})
+                .catch(function (err) {{ console.error("NGL load error:", err); }});
             window.addEventListener("resize", () => stage.handleResize());
         }})();
     </script>
@@ -287,16 +346,18 @@ def build_ngl_html() -> str:
 
 # ====================== 25% / 75% HORIZONTAL LAYOUT ======================
 
-left, right = st.columns([1, 3])   # 25% chat/controls | 75% 3D viewer
+left, right = st.columns([1.5, 3])   # ~33% chat/controls | ~67% 3D viewer
 
 with left:
     st.subheader("💬 Agent Chat")
 
     # Scrollable chat history container
     chat_container = st.container(height=420)
+    _agent_avatar = str(_LOGO_NOTEXT) if _LOGO_NOTEXT.exists() else "🧬"
     with chat_container:
         for msg in st.session_state.messages:
-            with st.chat_message(msg["role"]):
+            avatar = "👤" if msg["role"] == "user" else _agent_avatar
+            with st.chat_message(msg["role"], avatar=avatar):
                 st.markdown(msg["content"])
 
     if prompt := st.chat_input("e.g. Load 3pp0, show ATP as ball+stick..."):
@@ -347,6 +408,7 @@ with right:
                         "Type": r["type"],
                         "Selection": r["selection"],
                         "Color": r.get("color", "element"),
+                        "Opacity": r.get("opacity", 1.0),
                     })
                 st.dataframe(rows, use_container_width=True, hide_index=True)
     else:

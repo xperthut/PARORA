@@ -1,7 +1,6 @@
-# =============================================================================
-# Developer : Methun Kamruzzaman
+# =============================================================================# Developer : Methun Kamruzzaman
 # Date      : 2026-06-04
-# Summary   : PARORA Lite — lightweight Streamlit variant.
+# Summary   : PARORA Lite — lightweight Streamlit variant. 
 #             Three-tool agentic protein visualizer (search_pdb, set_pdb,
 #             add_representation) powered by Ollama native tool-calling.
 #             Structures are fetched from RCSB PDB and rendered via NGL.js.
@@ -39,10 +38,7 @@ if not _LOGO.exists():
 
 col_logo, col_title = st.columns([1, 10])
 with col_logo:
-    if _LOGO.exists():
-        st.image(str(_LOGO), width=72)
-    else:
-        st.markdown("### 🧬")
+    st.markdown("### 🧬")
 with col_title:
     st.markdown(
         "<div style='display:flex; flex-direction:column; justify-content:center; height:72px;'>"

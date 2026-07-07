@@ -19,6 +19,18 @@ import numpy as np
 from pathlib import Path
 from ollama import Client
 from rcsbapi.search import TextQuery
+from analysis_tools import (
+    summarize_chains_from_universe,
+    list_residues_from_universe,
+    bfactor_summary_from_universe,
+    measure_distance_from_universe,
+    nearby_residues_from_universe,
+    measure_angle_from_universe,
+    measure_dihedral_from_universe,
+    contact_detection_from_universe,
+    salt_bridge_detection_from_universe,
+    hydrogen_bond_detection_from_universe,
+)
 
 # MDAnalysis is optional — structural analysis features degrade gracefully
 mda = None
@@ -591,7 +603,6 @@ def tool_measure_distance(atom1_sel: str, atom2_sel: str) -> str:
         return f"Distance between '{atom1_sel}' and '{atom2_sel}': {dist:.2f} Å"
     except Exception as e:
         return f"Error: {e}"
-
 def tool_measure_mda_distance(sel1: str, sel2: str) -> str:
     """
     Notebook-derived deterministic MDAnalysis distance tool.
@@ -601,17 +612,7 @@ def tool_measure_mda_distance(sel1: str, sel2: str) -> str:
         return "MDAnalysis unavailable — cannot measure distance"
 
     try:
-        ag1 = u.select_atoms(sel1)
-        ag2 = u.select_atoms(sel2)
-
-        if len(ag1) == 0 or len(ag2) == 0:
-            return f"Empty selection: sel1 atoms={len(ag1)}, sel2 atoms={len(ag2)}"
-
-        c1 = ag1.center_of_geometry()
-        c2 = ag2.center_of_geometry()
-        d = float(np.linalg.norm(c1 - c2))
-        return f"Distance between [{sel1}] and [{sel2}] = {d:.2f} Å"
-
+        return measure_distance_from_universe(u, sel1, sel2)
     except Exception as e:
         return f"Error measuring MDAnalysis distance: {e}"
 

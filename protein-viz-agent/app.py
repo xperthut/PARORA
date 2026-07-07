@@ -741,6 +741,108 @@ def tool_add_hydrogens() -> str:
     """
     return "Hydrogen addition requires OpenBabel or RDKit (not installed). Install openbabel-python to enable."
 
+def tool_summarize_chains() -> str:
+    """Summarize chains/segments in the currently loaded structure."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot summarize chains"
+
+    try:
+        df = summarize_chains_from_universe(u)
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error summarizing chains: {e}"
+
+
+def tool_list_residues(max_rows: int = 200) -> str:
+    """List residues in the currently loaded structure."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot list residues"
+
+    try:
+        df = list_residues_from_universe(u, max_rows=max_rows)
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error listing residues: {e}"
+
+
+def tool_bfactor_summary() -> str:
+    """Summarize B-factor/tempfactor values for the loaded structure."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot summarize B-factors"
+
+    try:
+        df = bfactor_summary_from_universe(u)
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error summarizing B-factors: {e}"
+
+
+def tool_detect_contacts(
+    sel1: str = "protein",
+    sel2: str = "protein",
+    cutoff: float = 4.0,
+    max_rows: int = 100
+) -> str:
+    """Detect residue-level contacts between two selections."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot detect contacts"
+
+    try:
+        df = contact_detection_from_universe(
+            u,
+            sel1=sel1,
+            sel2=sel2,
+            cutoff=cutoff,
+            max_rows=max_rows
+        )
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error detecting contacts: {e}"
+
+
+def tool_detect_salt_bridges(
+    cutoff: float = 4.0,
+    max_rows: int = 100
+) -> str:
+    """Detect candidate salt bridges using acidic O atoms and basic N atoms."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot detect salt bridges"
+
+    try:
+        df = salt_bridge_detection_from_universe(
+            u,
+            cutoff=cutoff,
+            max_rows=max_rows
+        )
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error detecting salt bridges: {e}"
+
+
+def tool_detect_hydrogen_bonds(
+    cutoff: float = 3.5,
+    max_rows: int = 100
+) -> str:
+    """Detect candidate hydrogen bonds using a distance-only donor/acceptor screen."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot detect hydrogen bonds"
+
+    try:
+        df = hydrogen_bond_detection_from_universe(
+            u,
+            cutoff=cutoff,
+            max_rows=max_rows
+        )
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error detecting hydrogen bonds: {e}"
+
 
 # ── NGL → MDAnalysis expression approximation ────────────────────────────────
 
@@ -956,45 +1058,207 @@ TOOLS = [
         "type": "function", "function": {
             "name": "remove_solvent",
             "description": "Remove all water molecules from the loaded structure and save",
-            "parameters": {"type": "object", "properties": {}}
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "measure_mda_distance",
+            "description": "Measure the distance between two MDAnalysis atom selections. Use exact MDAnalysis syntax such as 'segid A and resid 50 and name CA'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sel1": {
+                        "type": "string",
+                        "description": "First MDAnalysis selection"
+                    },
+                    "sel2": {
+                        "type": "string",
+                        "description": "Second MDAnalysis selection"
+                    }
+                },
+                "required": ["sel1", "sel2"]
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "summarize_chains",
+            "description": "Summarize available chains/segments in the currently loaded protein structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "list_residues",
+            "description": "List residues in the currently loaded protein structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_rows": {
+                        "type": "integer",
+                        "default": 200
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "bfactor_summary",
+            "description": "Summarize B-factor values for the currently loaded structure.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "detect_contacts",
+            "description": "Detect residue-level contacts between two selections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sel1": {"type": "string", "default": "protein"},
+                    "sel2": {"type": "string", "default": "protein"},
+                    "cutoff": {"type": "number", "default": 4.0},
+                    "max_rows": {"type": "integer", "default": 100}
+                }
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "detect_salt_bridges",
+            "description": "Detect candidate salt bridges between acidic and basic residues.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cutoff": {"type": "number", "default": 4.0},
+                    "max_rows": {"type": "integer", "default": 100}
+                }
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "detect_hydrogen_bonds",
+            "description": "Detect candidate hydrogen bonds using a distance-based donor/acceptor screen.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cutoff": {"type": "number", "default": 3.5},
+                    "max_rows": {"type": "integer", "default": 100}
+                }
+            }
         }
     },
 ]
-{
-    "type": "function", "function": {
-        "name": "measure_mda_distance",
-        "description": "Measure the distance between two MDAnalysis atom selections. Use exact MDAnalysis syntax such as 'segid A and resid 50 and name CA'.",
-        "parameters": {"type": "object", "properties": {
-            "sel1": {"type": "string", "description": "First MDAnalysis selection"},
-            "sel2": {"type": "string", "description": "Second MDAnalysis selection"}
-        }, "required": ["sel1", "sel2"]}
-    }
-},
 
 # Lambda dispatch table maps tool names → callables with argument extraction
+
+def _safe_int(value, default):
+    if value is None:
+        return default
+    return int(value)
+
+
+def _safe_float(value, default):
+    if value is None:
+        return default
+    return float(value)
+
 TOOL_DISPATCH = {
-    "search_pdb":        lambda a: tool_search_pdb(a.get("search_term", "")),
-    "fetch_structure":   lambda a: tool_fetch_structure(a.get("pdb_id", "")),
-    "load_local":        lambda a: tool_load_local(a.get("filepath", "")),
-    "select":            lambda a: tool_select(a.get("name", "sel"), a.get("expression", "all")),
-    "select_within":     lambda a: tool_select_within(a.get("name", "pocket"), a.get("radius", 5.0), a.get("target_selection", "ligand")),
-    "select_by_bfactor": lambda a: tool_select_by_bfactor(a.get("name", "flex"), a.get("operator", ">"), a.get("threshold", 50.0)),
-    "show":              lambda a: tool_show(a.get("rep_type", "cartoon"), a.get("selection", "protein"), a.get("color", "element")),
-    "hide":              lambda a: tool_hide(a.get("selection", "all")),
-    "hide_all":          lambda _: tool_hide_all(),
-    "show_all":          lambda a: tool_show_all(a.get("rep_type", "cartoon")),
-    "color":             lambda a: tool_color(a.get("color", "red"), a.get("selection", "all")),
-    "set_transparency":  lambda a: tool_set_transparency(a.get("value", 0.5), a.get("selection", "all")),
-    "measure_distance":  lambda a: tool_measure_distance(a.get("atom1_sel", ""), a.get("atom2_sel", "")),
+    "search_pdb": lambda a: tool_search_pdb(a.get("search_term", "")),
+    "fetch_structure": lambda a: tool_fetch_structure(a.get("pdb_id", "")),
+    "load_local": lambda a: tool_load_local(a.get("filepath", "")),
+    "select": lambda a: tool_select(
+        a.get("name", "sel"),
+        a.get("expression", "all"),
+    ),
+    "select_within": lambda a: tool_select_within(
+        a.get("name", "pocket"),
+        a.get("radius", 5.0),
+        a.get("target_selection", "ligand"),
+    ),
+    "select_by_bfactor": lambda a: tool_select_by_bfactor(
+        a.get("name", "flex"),
+        a.get("operator", ">"),
+        a.get("threshold", 50.0),
+    ),
+    "show": lambda a: tool_show(
+        a.get("rep_type", "cartoon"),
+        a.get("selection", "protein"),
+        a.get("color", "element"),
+    ),
+    "hide": lambda a: tool_hide(a.get("selection", "all")),
+    "hide_all": lambda _: tool_hide_all(),
+    "show_all": lambda a: tool_show_all(a.get("rep_type", "cartoon")),
+    "color": lambda a: tool_color(
+        a.get("color", "red"),
+        a.get("selection", "all"),
+    ),
+    "set_transparency": lambda a: tool_set_transparency(
+        a.get("value", 0.5),
+        a.get("selection", "all"),
+    ),
+
+    # ---------- Analysis ----------
+    "measure_distance": lambda a: tool_measure_distance(
+        a.get("atom1_sel", ""),
+        a.get("atom2_sel", ""),
+    ),
+
     "measure_mda_distance": lambda a: tool_measure_mda_distance(
-    a.get("sel1", ""),
-    a.get("sel2", "")
-),
-    "align_structures":  lambda a: tool_align_structures(a.get("mobile_id", ""), a.get("reference_id", "")),
-    "zoom":              lambda a: tool_zoom(a.get("selection", "all")),
-    "set_background":    lambda a: tool_set_background(a.get("color", "black")),
-    "save_structure":    lambda a: tool_save_structure(a.get("filename", "output.pdb")),
-    "remove_solvent":    lambda _: tool_remove_solvent(),
+        a.get("sel1", ""),
+        a.get("sel2", ""),
+    ),
+
+    "summarize_chains": lambda _: tool_summarize_chains(),
+
+    "list_residues": lambda a: tool_list_residues(
+       _safe_int(a.get("max_rows", 200)),
+    ),
+
+    "bfactor_summary": lambda _: tool_bfactor_summary(),
+
+    "detect_contacts": lambda a: tool_detect_contacts(
+        a.get("sel1", "protein"),
+        a.get("sel2", "protein"),
+        _safe_float(a.get("cutoff", 4.0)),
+        _safe_int(a.get("max_rows", 100)),
+    ),
+
+    "detect_salt_bridges": lambda a: tool_detect_salt_bridges(
+        _safe_float(a.get("cutoff", 4.0)),
+        _safe_int(a.get("max_rows", 100)),
+    ),
+
+    "detect_hydrogen_bonds": lambda a: tool_detect_hydrogen_bonds(
+        _safe_float(a.get("cutoff", 3.5)),
+        _safe_int(a.get("max_rows", 100)),
+    ),
+
+    # ---------- Structure ----------
+    "align_structures": lambda a: tool_align_structures(
+        a.get("mobile_id", ""),
+        a.get("reference_id", ""),
+    ),
+    "zoom": lambda a: tool_zoom(a.get("selection", "all")),
+    "set_background": lambda a: tool_set_background(
+        a.get("color", "black"),
+    ),
+    "save_structure": lambda a: tool_save_structure(
+        a.get("filename", "output.pdb"),
+    ),
+    "remove_solvent": lambda _: tool_remove_solvent(),
 }
 
 
@@ -1031,8 +1295,16 @@ def _system_prompt() -> str:
         "   - 'chains' or 'all chains' → expression='chains' "
         "   - NEVER invent residue names like STANDARD, CANONICAL, NORMAL — use 'protein' instead. "
         "6. Never call `hide` unless the user explicitly asked to hide something. "
-        "7. After your tools have run, reply with a plain-text summary. Stop calling tools."
-	"8. For atom/residue distance analysis, prefer `measure_mda_distance` with MDAnalysis syntax. Example: sel1='segid A and resid 50 and name CA', sel2='segid A and resid 100 and name CA'. CA means alpha carbon atom name CA."
+        "7. After your tools have run, reply with a plain-text summary. Stop calling tools. "
+	"8. For atom/residue distance analysis, prefer `measure_mda_distance` with MDAnalysis syntax. "
+	"Example: sel1='segid A and resid 50 and name CA', sel2='segid A and resid 100 and name CA'. "
+	"CA means alpha carbon atom name CA. "
+	"9. For chain summaries, use `summarize_chains`. "
+	"10. For residue tables, use `list_residues`. "
+	"11. For B-factor summaries, use `bfactor_summary`. "
+	"12. For contact detection, use `detect_contacts`. "
+	"13. For salt bridge detection, use `detect_salt_bridges`; do not use `select_by_bfactor` for salt bridges. "
+	"14. For hydrogen bond candidates, use `detect_hydrogen_bonds`."
     )
 
 
@@ -1096,6 +1368,15 @@ def run_agent(user_prompt: str) -> str:
 
             results.append(tool_measure_mda_distance(sel1, sel2))
             return "Done: " + "; ".join(results)
+
+    if "salt bridge" in prompt_lower or "salt bridges" in prompt_lower:
+        results = []
+        if st.session_state.pdb_id is None:
+            pdb_match = re.search(r"\b([0-9][A-Za-z0-9]{3})\b", user_prompt)
+            if pdb_match:
+                results.append(tool_fetch_structure(pdb_match.group(1)))
+        results.append(tool_detect_salt_bridges())
+        return "Done: " + "; ".join(results)
 
     # Gate: destructive tools only when user explicitly asked for hiding
     DESTRUCTIVE_TOOLS = {"hide_all", "hide"}

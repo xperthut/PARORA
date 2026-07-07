@@ -592,6 +592,29 @@ def tool_measure_distance(atom1_sel: str, atom2_sel: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+def tool_measure_mda_distance(sel1: str, sel2: str) -> str:
+    """
+    Notebook-derived deterministic MDAnalysis distance tool.
+    """
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot measure distance"
+
+    try:
+        ag1 = u.select_atoms(sel1)
+        ag2 = u.select_atoms(sel2)
+
+        if len(ag1) == 0 or len(ag2) == 0:
+            return f"Empty selection: sel1 atoms={len(ag1)}, sel2 atoms={len(ag2)}"
+
+        c1 = ag1.center_of_geometry()
+        c2 = ag2.center_of_geometry()
+        d = float(np.linalg.norm(c1 - c2))
+        return f"Distance between [{sel1}] and [{sel2}] = {d:.2f} Å"
+
+    except Exception as e:
+        return f"Error measuring MDAnalysis distance: {e}"
+
 
 def tool_align_structures(mobile_id: str, reference_id: str) -> str:
     """
@@ -936,6 +959,16 @@ TOOLS = [
         }
     },
 ]
+{
+    "type": "function", "function": {
+        "name": "measure_mda_distance",
+        "description": "Measure the distance between two MDAnalysis atom selections. Use exact MDAnalysis syntax such as 'segid A and resid 50 and name CA'.",
+        "parameters": {"type": "object", "properties": {
+            "sel1": {"type": "string", "description": "First MDAnalysis selection"},
+            "sel2": {"type": "string", "description": "Second MDAnalysis selection"}
+        }, "required": ["sel1", "sel2"]}
+    }
+},
 
 # Lambda dispatch table maps tool names → callables with argument extraction
 TOOL_DISPATCH = {
@@ -952,6 +985,10 @@ TOOL_DISPATCH = {
     "color":             lambda a: tool_color(a.get("color", "red"), a.get("selection", "all")),
     "set_transparency":  lambda a: tool_set_transparency(a.get("value", 0.5), a.get("selection", "all")),
     "measure_distance":  lambda a: tool_measure_distance(a.get("atom1_sel", ""), a.get("atom2_sel", "")),
+    "measure_mda_distance": lambda a: tool_measure_mda_distance(
+    a.get("sel1", ""),
+    a.get("sel2", "")
+),
     "align_structures":  lambda a: tool_align_structures(a.get("mobile_id", ""), a.get("reference_id", "")),
     "zoom":              lambda a: tool_zoom(a.get("selection", "all")),
     "set_background":    lambda a: tool_set_background(a.get("color", "black")),
@@ -994,6 +1031,7 @@ def _system_prompt() -> str:
         "   - NEVER invent residue names like STANDARD, CANONICAL, NORMAL — use 'protein' instead. "
         "6. Never call `hide` unless the user explicitly asked to hide something. "
         "7. After your tools have run, reply with a plain-text summary. Stop calling tools."
+	"8. For atom/residue distance analysis, prefer `measure_mda_distance` with MDAnalysis syntax. Example: sel1='segid A and resid 50 and name CA', sel2='segid A and resid 100 and name CA'. CA means alpha carbon atom name CA."
     )
 
 
@@ -1038,7 +1076,25 @@ def run_agent(user_prompt: str) -> str:
         {"role": "user", "content": user_prompt}
     ]
 
-    prompt_lower = user_prompt.lower()
+    prompt_lower = user_prompt.lower() 
+    # Direct deterministic route for explicit MDAnalysis distance prompts
+    if "sel1=" in prompt_lower and "sel2=" in prompt_lower:
+        import re
+        m1 = re.search(r"sel1=['\"]([^'\"]+)['\"]", user_prompt)
+        m2 = re.search(r"sel2=['\"]([^'\"]+)['\"]", user_prompt)
+
+        if m1 and m2:
+            sel1 = m1.group(1)
+            sel2 = m2.group(1)
+
+            results = []
+            if st.session_state.pdb_id is None:
+                pdb_match = re.search(r"\b([0-9][A-Za-z0-9]{3})\b", user_prompt)
+                if pdb_match:
+                    results.append(tool_fetch_structure(pdb_match.group(1)))
+
+            results.append(tool_measure_mda_distance(sel1, sel2))
+            return "Done: " + "; ".join(results)
 
     # Gate: destructive tools only when user explicitly asked for hiding
     DESTRUCTIVE_TOOLS = {"hide_all", "hide"}

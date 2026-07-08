@@ -91,9 +91,9 @@ def measure_angle_from_universe(u, sel1: str, sel2: str, sel3: str) -> str:
     """
     Measure angle sel1-sel2-sel3 using centers of geometry.
     """
-    p1, n1 = _single_atom_position(u, sel1)
-    p2, n2 = _single_atom_position(u, sel2)
-    p3, n3 = _single_atom_position(u, sel3)
+    p1, n1 = single_atom_position_from_universe(u, sel1)
+    p2, n2 = single_atom_position_from_universe(u, sel2)
+    p3, n3 = single_atom_position_from_universe(u, sel3)
 
     v1 = p1 - p2
     v2 = p3 - p2
@@ -107,10 +107,10 @@ def measure_dihedral_from_universe(u, sel1: str, sel2: str, sel3: str, sel4: str
     """
     Measure dihedral/torsion angle using centers of geometry.
     """
-    p1, n1 = _single_atom_position(u, sel1)
-    p2, n2 = _single_atom_position(u, sel2)
-    p3, n3 = _single_atom_position(u, sel3)
-    p4, n4 = _single_atom_position(u, sel4)
+    p1, n1 = single_atom_position_from_universe(u, sel1)
+    p2, n2 = single_atom_position_from_universe(u, sel2)
+    p3, n3 = single_atom_position_from_universe(u, sel3)
+    p4, n4 = single_atom_position_from_universe(u, sel4)
 
     b0 = -(p2 - p1)
     b1 = p3 - p2

@@ -30,6 +30,9 @@ from analysis_tools import (
     contact_detection_from_universe,
     salt_bridge_detection_from_universe,
     hydrogen_bond_detection_from_universe,
+    nearby_residues_from_universe,
+    measure_angle_from_universe,
+    measure_dihedral_from_universe,
 )
 
 # MDAnalysis is optional — structural analysis features degrade gracefully
@@ -843,6 +846,55 @@ def tool_detect_hydrogen_bonds(
     except Exception as e:
         return f"Error detecting hydrogen bonds: {e}"
 
+def tool_nearby_residues(selection: str, cutoff: float = 5.0, max_rows: int = 100) -> str:
+    """Find residues near an MDAnalysis selection in the currently loaded structure."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot find nearby residues"
+
+    try:
+        df = nearby_residues_from_universe(
+            u,
+            selection=selection,
+            cutoff=_safe_float(cutoff, 5.0),
+            max_rows=_safe_int(max_rows, 100),
+        )
+        return df.to_string(index=False)
+    except Exception as e:
+        return f"Error finding nearby residues: {e}"
+
+
+def tool_measure_angle(sel1: str, sel2: str, sel3: str) -> str:
+    """Measure an angle between three MDAnalysis atom selections."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot measure angle"
+
+    try:
+        result = measure_angle_from_universe(u, sel1=sel1, sel2=sel2, sel3=sel3)
+        return str(result)
+    except Exception as e:
+        return f"Error measuring angle: {e}"
+
+
+def tool_measure_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> str:
+    """Measure a dihedral angle between four MDAnalysis atom selections."""
+    u = get_universe()
+    if not u:
+        return "MDAnalysis unavailable — cannot measure dihedral"
+
+    try:
+        result = measure_dihedral_from_universe(
+            u,
+            sel1=sel1,
+            sel2=sel2,
+            sel3=sel3,
+            sel4=sel4,
+        )
+        return str(result)
+    except Exception as e:
+        return f"Error measuring dihedral: {e}"
+
 
 # ── NGL → MDAnalysis expression approximation ────────────────────────────────
 
@@ -1160,8 +1212,53 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function", "function": {
+            "name": "nearby_residues",
+            "description": "Find residues near a selected atom, residue, ligand, or protein region using MDAnalysis selections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selection": {"type": "string"},
+                    "cutoff": {"type": "number", "default": 5.0},
+                    "max_rows": {"type": "integer", "default": 100}
+                },
+                "required": ["selection"]
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "measure_angle",
+            "description": "Measure the angle formed by three atom selections using MDAnalysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sel1": {"type": "string"},
+                    "sel2": {"type": "string"},
+                    "sel3": {"type": "string"}
+                },
+                "required": ["sel1", "sel2", "sel3"]
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "measure_dihedral",
+            "description": "Measure the dihedral angle formed by four atom selections using MDAnalysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sel1": {"type": "string"},
+                    "sel2": {"type": "string"},
+                    "sel3": {"type": "string"},
+                    "sel4": {"type": "string"}
+                },
+                "required": ["sel1", "sel2", "sel3", "sel4"]
+            }
+        }
+    }
 ]
-
 # Lambda dispatch table maps tool names → callables with argument extraction
 
 def _safe_int(value, default):
@@ -1224,7 +1321,7 @@ TOOL_DISPATCH = {
     "summarize_chains": lambda _: tool_summarize_chains(),
 
     "list_residues": lambda a: tool_list_residues(
-       _safe_int(a.get("max_rows", 200)),
+       _safe_int(a.get("max_rows", 200), 200),
     ),
 
     "bfactor_summary": lambda _: tool_bfactor_summary(),
@@ -1232,8 +1329,8 @@ TOOL_DISPATCH = {
     "detect_contacts": lambda a: tool_detect_contacts(
         a.get("sel1", "protein"),
         a.get("sel2", "protein"),
-        _safe_float(a.get("cutoff", 4.0)),
-        _safe_int(a.get("max_rows", 100)),
+        _safe_float(a.get("cutoff", 4.0), 4.0),
+        _safe_int(a.get("max_rows", 100), 100),
     ),
 
     "detect_salt_bridges": lambda a: tool_detect_salt_bridges(
@@ -1242,9 +1339,29 @@ TOOL_DISPATCH = {
     ),
 
     "detect_hydrogen_bonds": lambda a: tool_detect_hydrogen_bonds(
-        _safe_float(a.get("cutoff", 3.5)),
-        _safe_int(a.get("max_rows", 100)),
+        _safe_float(a.get("cutoff", 3.5), 3.5),
+        _safe_int(a.get("max_rows", 100), 100),
     ),
+
+    "nearby_residues": lambda a: tool_nearby_residues(
+        a.get("selection", "protein"),
+	_safe_float(a.get("cutoff", 5.0), 5.0),
+        _safe_int(a.get("max_rows", 100), 100),
+    ),
+
+    "measure_angle": lambda a: tool_measure_angle(
+        a.get("sel1", ""),
+	a.get("sel2", ""),
+	a.get("sel3", ""),
+    ),
+
+    "measure_dihedral": lambda a: tool_measure_dihedral(
+        a.get("sel1", ""),
+        a.get("sel2", ""),
+        a.get("sel3", ""),
+        a.get("sel4", ""),
+    ),
+
 
     # ---------- Structure ----------
     "align_structures": lambda a: tool_align_structures(

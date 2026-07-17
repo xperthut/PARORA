@@ -606,13 +606,58 @@ def tool_measure_distance(atom1_sel: str, atom2_sel: str) -> str:
         return f"Distance between '{atom1_sel}' and '{atom2_sel}': {dist:.2f} Å"
     except Exception as e:
         return f"Error: {e}"
+def _clean_mda_selection(selection) -> str:
+    """Remove accidental list, bracket, or quote wrappers from a selection."""
+    if isinstance(selection, (list, tuple)):
+        if not selection:
+            return ""
+        selection = selection[0]
+
+    selection = str(selection or "").strip()
+
+    changed = True
+    while changed and len(selection) >= 2:
+        changed = False
+
+        if selection[0] == "[" and selection[-1] == "]":
+            selection = selection[1:-1].strip()
+            changed = True
+        elif selection[0] == "(" and selection[-1] == ")":
+            selection = selection[1:-1].strip()
+            changed = True
+        elif selection[0] == selection[-1] and selection[0] in {"'", '"'}:
+            selection = selection[1:-1].strip()
+            changed = True
+
+    return selection
+
+
+def _selection_missing(selection) -> bool:
+    cleaned = _clean_mda_selection(selection)
+    return cleaned.lower() in {
+        "",
+        "none",
+        "null",
+        "unknown",
+        "unspecified",
+    }
+
+
 def tool_measure_mda_distance(sel1: str, sel2: str) -> str:
-    """
-    Notebook-derived deterministic MDAnalysis distance tool.
-    """
+    """Measure a deterministic distance using MDAnalysis selections."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot measure distance"
+        return "Load a protein structure before measuring a distance."
+
+    sel1 = _clean_mda_selection(sel1)
+    sel2 = _clean_mda_selection(sel2)
+
+    if _selection_missing(sel1) or _selection_missing(sel2):
+        return (
+            "To calculate a distance, specify two atoms or atom selections. "
+            "For example: measure the distance between the CA atoms of "
+            "residues 50 and 100 in chain A."
+        )
 
     try:
         return measure_distance_from_universe(u, sel1, sel2)
@@ -744,15 +789,154 @@ def tool_add_hydrogens() -> str:
     """
     return "Hydrogen addition requires OpenBabel or RDKit (not installed). Install openbabel-python to enable."
 
+def _format_chain_summary(df) -> str:
+    """Convert chain-summary output into readable scientific prose."""
+    if df is None or df.empty:
+        return "No chain or segment information was found."
+
+    if "error" in df.columns:
+        return str(df.iloc[0]["error"])
+
+    rows = df.to_dict(orient="records")
+
+    # Protein residues usually contain multiple atoms per residue. Groups with
+    # approximately one atom per residue are commonly waters or ions.
+    protein_rows = []
+    auxiliary_rows = []
+
+    for row in rows:
+        atoms = int(row.get("n_atoms", 0))
+        residues = int(row.get("n_residues", 0))
+        atoms_per_residue = atoms / residues if residues else 0
+
+        if residues >= 10 and atoms_per_residue >= 2:
+            protein_rows.append(row)
+        else:
+            auxiliary_rows.append(row)
+
+    if not protein_rows:
+        protein_rows = rows
+        auxiliary_rows = []
+
+    descriptions = []
+    for row in protein_rows:
+        chain = row.get("chain_or_segment") or "unlabeled"
+        descriptions.append(
+            f"chain {chain} contains "
+            f"{int(row.get('n_residues', 0)):,} residues and "
+            f"{int(row.get('n_atoms', 0)):,} atoms"
+        )
+
+    count = len(protein_rows)
+    label = "primary protein chain" if count == 1 else "primary protein chains"
+
+    response = (
+        f"The loaded structure contains {count} {label}: "
+        + "; ".join(descriptions)
+        + "."
+    )
+
+    if auxiliary_rows:
+        response += (
+            f" It also contains {len(auxiliary_rows)} smaller segment"
+            f"{'s' if len(auxiliary_rows) != 1 else ''}, which may represent "
+            "ligands, ions, solvent, or other non-protein components."
+        )
+
+    return response
+
+
+def _format_salt_bridge_summary(df, cutoff: float) -> str:
+    """Summarize geometric acidic-basic contacts."""
+    if df is None or df.empty:
+        return (
+            f"No candidate acidic–basic contacts were found within "
+            f"the {cutoff:.1f} Å cutoff."
+        )
+
+    if "error" in df.columns:
+        return str(df.iloc[0]["error"])
+
+    if "result" in df.columns:
+        return str(df.iloc[0]["result"])
+
+    required = {"acidic_residue", "basic_residue"}
+    if not required.issubset(df.columns):
+        return df.to_string(index=False)
+
+    unique_pairs = (
+        df[["acidic_residue", "basic_residue"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    examples = [
+        f"{row.acidic_residue}–{row.basic_residue}"
+        for row in unique_pairs.head(3).itertuples(index=False)
+    ]
+
+    response = (
+        f"PARORA identified {len(df)} candidate acidic–basic atom contacts "
+        f"within a {cutoff:.1f} Å cutoff, representing "
+        f"{len(unique_pairs)} unique residue-pair interactions."
+    )
+
+    if examples:
+        response += " Representative pairs include " + ", ".join(examples) + "."
+
+    response += (
+        " These are geometry-based candidates rather than confirmed stable "
+        "salt bridges. The complete interaction table is shown below."
+    )
+
+    return response + "\n\n" + df.to_string(index=False)
+
+
+def _format_nearby_residue_summary(df, selection: str, cutoff: float) -> str:
+    """Summarize residues located near a target selection."""
+    if df is None or df.empty:
+        return f"No residues were found within {cutoff:g} Å of {selection}."
+
+    if "error" in df.columns:
+        return str(df.iloc[0]["error"])
+
+    residues = []
+    for row in df.to_dict(orient="records"):
+        label = (
+            f"{row.get('resname', '')}{row.get('resid', '')}:"
+            f"{row.get('chain_or_segment', '')}"
+        ).rstrip(":")
+        if label and label not in residues:
+            residues.append(label)
+
+    preview = ", ".join(residues[:8])
+
+    response = (
+        f"PARORA found {len(residues)} residue"
+        f"{'s' if len(residues) != 1 else ''} within "
+        f"{cutoff:g} Å of {selection}."
+    )
+
+    if preview:
+        response += f" Nearby residues include {preview}"
+        if len(residues) > 8:
+            response += f", and {len(residues) - 8} additional residues"
+        response += "."
+
+    response += " These residues have been highlighted in the viewer."
+
+    return response + "\n\n" + df.to_string(index=False)
+
+
 def tool_summarize_chains() -> str:
     """Summarize chains/segments in the currently loaded structure."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot summarize chains"
+        return "Load a protein structure before requesting a chain summary."
 
     try:
         df = summarize_chains_from_universe(u)
-        return df.to_string(index=False)
+        return _format_chain_summary(df)
     except Exception as e:
         return f"Error summarizing chains: {e}"
 
@@ -811,10 +995,13 @@ def tool_detect_salt_bridges(
     cutoff: float = 4.0,
     max_rows: int = 100
 ) -> str:
-    """Detect candidate salt bridges using acidic O atoms and basic N atoms."""
+    """Detect and summarize candidate salt bridges."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot detect salt bridges"
+        return "Load a protein structure before identifying salt bridges."
+
+    cutoff = _safe_float(cutoff, 4.0)
+    max_rows = _safe_int(max_rows, 100)
 
     try:
         df = salt_bridge_detection_from_universe(
@@ -822,7 +1009,7 @@ def tool_detect_salt_bridges(
             cutoff=cutoff,
             max_rows=max_rows
         )
-        return df.to_string(index=False)
+        return _format_salt_bridge_summary(df, cutoff)
     except Exception as e:
         return f"Error detecting salt bridges: {e}"
 
@@ -846,20 +1033,37 @@ def tool_detect_hydrogen_bonds(
     except Exception as e:
         return f"Error detecting hydrogen bonds: {e}"
 
-def tool_nearby_residues(selection: str, cutoff: float = 5.0, max_rows: int = 100) -> str:
-    """Find residues near an MDAnalysis selection in the currently loaded structure."""
+def tool_nearby_residues(
+    selection: str,
+    cutoff: float = 5.0,
+    max_rows: int = 100
+) -> str:
+    """Find and summarize residues near an MDAnalysis selection."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot find nearby residues"
+        return "Load a protein structure before finding nearby residues."
+
+    selection = _clean_mda_selection(selection)
+    cutoff = _safe_float(cutoff, 5.0)
+
+    if _selection_missing(selection):
+        return (
+            "To find nearby residues, specify a ligand, residue, atom, or "
+            "MDAnalysis selection. For example: find residues within 5 Å "
+            "of resname DCK."
+        )
 
     try:
         df = nearby_residues_from_universe(
             u,
-            selection=selection,
-            cutoff=_safe_float(cutoff, 5.0),
-            max_rows=_safe_int(max_rows, 100),
+            target_selection=selection,
+            radius=cutoff,
         )
-        return df.to_string(index=False)
+
+        if max_rows and len(df) > _safe_int(max_rows, 100):
+            df = df.head(_safe_int(max_rows, 100))
+
+        return _format_nearby_residue_summary(df, selection, cutoff)
     except Exception as e:
         return f"Error finding nearby residues: {e}"
 
@@ -868,10 +1072,35 @@ def tool_measure_angle(sel1: str, sel2: str, sel3: str) -> str:
     """Measure an angle between three MDAnalysis atom selections."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot measure angle"
+        return "Load a protein structure before measuring an angle."
+
+    selections = [
+        _clean_mda_selection(sel1),
+        _clean_mda_selection(sel2),
+        _clean_mda_selection(sel3),
+    ]
+
+    if any(_selection_missing(sel) for sel in selections):
+        return (
+            "To calculate an angle, specify three atoms or atom selections. "
+            "For example: calculate the angle between the CA atoms of "
+            "residues 50, 51, and 52 in chain A."
+        )
+
+    generic = {"protein", "ligand", "nonstandard", "non-standard", "chain", "chains"}
+    if any(sel.lower() in generic for sel in selections):
+        return (
+            "An angle requires three specific atom selections rather than a "
+            "whole protein, chain, or ligand."
+        )
 
     try:
-        result = measure_angle_from_universe(u, sel1=sel1, sel2=sel2, sel3=sel3)
+        result = measure_angle_from_universe(
+            u,
+            sel1=selections[0],
+            sel2=selections[1],
+            sel3=selections[2],
+        )
         return str(result)
     except Exception as e:
         return f"Error measuring angle: {e}"
@@ -881,15 +1110,36 @@ def tool_measure_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> str:
     """Measure a dihedral angle between four MDAnalysis atom selections."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot measure dihedral"
+        return "Load a protein structure before measuring a dihedral."
+
+    selections = [
+        _clean_mda_selection(sel1),
+        _clean_mda_selection(sel2),
+        _clean_mda_selection(sel3),
+        _clean_mda_selection(sel4),
+    ]
+
+    if any(_selection_missing(sel) for sel in selections):
+        return (
+            "To calculate a dihedral, specify four atoms or atom selections. "
+            "For example: use the N, CA, C, and N atoms across two adjacent "
+            "residues in chain A."
+        )
+
+    generic = {"protein", "ligand", "nonstandard", "non-standard", "chain", "chains"}
+    if any(sel.lower() in generic for sel in selections):
+        return (
+            "A dihedral requires four specific atom selections rather than a "
+            "whole protein, chain, or ligand."
+        )
 
     try:
         result = measure_dihedral_from_universe(
             u,
-            sel1=sel1,
-            sel2=sel2,
-            sel3=sel3,
-            sel4=sel4,
+            sel1=selections[0],
+            sel2=selections[1],
+            sel3=selections[2],
+            sel4=selections[3],
         )
         return str(result)
     except Exception as e:

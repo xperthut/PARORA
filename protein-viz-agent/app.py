@@ -14,6 +14,7 @@
 import streamlit as st
 import os
 import json
+import re
 import requests
 import numpy as np
 from pathlib import Path
@@ -941,15 +942,31 @@ def tool_summarize_chains() -> str:
         return f"Error summarizing chains: {e}"
 
 
-def tool_list_residues(max_rows: int = 200) -> str:
-    """List residues in the currently loaded structure."""
+def tool_list_residues(
+    chain: str = "",
+    max_rows: int = 200
+) -> str:
+    """List residues, optionally restricted to one chain or segment."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot list residues"
+        return "Load a protein structure before listing residues."
+
+    chain = str(chain or "").strip()
+    max_rows = _safe_int(max_rows, 200)
 
     try:
-        df = list_residues_from_universe(u, max_rows=max_rows)
-        return df.to_string(index=False)
+        df = list_residues_from_universe(
+            u,
+            chain=chain or None,
+            max_rows=max_rows,
+        )
+
+        if "error" in df.columns:
+            return str(df.iloc[0]["error"])
+
+        prefix = f"Chain {chain} residues:\n" if chain else ""
+        return prefix + df.to_string(index=False)
+
     except Exception as e:
         return f"Error listing residues: {e}"
 
@@ -992,27 +1009,40 @@ def tool_detect_contacts(
 
 
 def tool_detect_salt_bridges(
+    chain: str = "",
     cutoff: float = 4.0,
     max_rows: int = 100
 ) -> str:
-    """Detect and summarize candidate salt bridges."""
+    """
+    Detect and summarize candidate salt bridges.
+
+    When a chain is provided, both residues in every returned pair must
+    belong to that chain.
+    """
     u = get_universe()
     if not u:
         return "Load a protein structure before identifying salt bridges."
 
+    chain = str(chain).strip()
     cutoff = _safe_float(cutoff, 4.0)
     max_rows = _safe_int(max_rows, 100)
 
     try:
         df = salt_bridge_detection_from_universe(
             u,
+            chain=chain or None,
             cutoff=cutoff,
-            max_rows=max_rows
+            max_rows=max_rows,
         )
-        return _format_salt_bridge_summary(df, cutoff)
+
+        summary = _format_salt_bridge_summary(df, cutoff)
+
+        if chain and "error" not in summary.lower():
+            summary = f"Chain {chain} analysis: {summary}"
+
+        return summary
     except Exception as e:
         return f"Error detecting salt bridges: {e}"
-
 
 def tool_detect_hydrogen_bonds(
     cutoff: float = 3.5,
@@ -1399,10 +1429,18 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "list_residues",
-            "description": "List residues in the currently loaded protein structure.",
+            "description": (
+                "List residues in the currently loaded protein structure, "
+                "optionally restricted to a chain or segment."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "chain": {
+                        "type": "string",
+                        "description": "Optional chain or segment identifier, such as A or B.",
+                        "default": ""
+                    },
                     "max_rows": {
                         "type": "integer",
                         "default": 200
@@ -1443,6 +1481,15 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                        "chain": {
+                            "type": "string",
+                            "description": (
+                                "Optional chain or segment identifier, such as A. "
+                                "When provided, both interacting residues must "
+                                "belong to that chain."
+                            )
+                        },
+
                     "cutoff": {"type": "number", "default": 4.0},
                     "max_rows": {"type": "integer", "default": 100}
                 }
@@ -1514,7 +1561,16 @@ TOOLS = [
 def _safe_int(value, default):
     if value is None:
         return default
-    return int(value)
+
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in ("", "none", "null"):
+            return default
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_float(value, default):
@@ -1571,7 +1627,8 @@ TOOL_DISPATCH = {
     "summarize_chains": lambda _: tool_summarize_chains(),
 
     "list_residues": lambda a: tool_list_residues(
-       _safe_int(a.get("max_rows", 200), 200),
+        chain=a.get("chain", ""),
+        max_rows=_safe_int(a.get("max_rows", 200), 200),
     ),
 
     "bfactor_summary": lambda _: tool_bfactor_summary(),
@@ -1584,8 +1641,9 @@ TOOL_DISPATCH = {
     ),
 
     "detect_salt_bridges": lambda a: tool_detect_salt_bridges(
-        _safe_float(a.get("cutoff", 4.0)),
-        _safe_int(a.get("max_rows", 100)),
+        chain=a.get("chain", ""),
+        cutoff=_safe_float(a.get("cutoff", 4.0), 4.0),
+        max_rows=_safe_int(a.get("max_rows", 100), 100),
     ),
 
     "detect_hydrogen_bonds": lambda a: tool_detect_hydrogen_bonds(
@@ -1634,44 +1692,71 @@ TOOL_DISPATCH = {
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _system_prompt() -> str:
-    """
-    Build the system prompt injected at every agent turn.
-
-    Includes the current structure, named selections, and active representation
-    count so the LLM can reason about what already exists before deciding which
-    tools to call.
-    """
+    """Build concise agent instructions with critical routing safeguards."""
     pdb = st.session_state.pdb_id or "none"
     sels = ", ".join(st.session_state.selections.keys()) or "none"
-    reps = len(st.session_state.representations)
+
     return (
-        f"You are a protein structure analysis agent. "
-        f"Current structure: {pdb}. Named selections: [{sels}]. Active representations: {reps}. "
-        "Rules — follow exactly: "
-        "1. Only call fetch_structure or search_pdb when the current structure is 'none'. "
-        "2. Call the MINIMUM tools needed. Never repeat a tool with the same arguments. "
-        "3. Use a short descriptive selection name (e.g. 'nonstandard', 'atp_res', 'chain_a') — never 'sel'. "
-        "4. `show` vs `select` are MUTUALLY EXCLUSIVE for the same command: "
-        "   - User says 'show <type> for X' → call ONLY `show`. NEVER also call `select`. "
-        "   - User says 'select X' or 'highlight X' → call ONLY `select`. Only also call `show` if the user explicitly wants a different rep type (e.g. surface, cartoon) in addition. "
-        "5. Expression rules for `select` and `show`: "
-        "   - 'standard residues' or 'protein' → expression='protein' "
-        "   - 'ligand' or 'small molecule' → expression='ligand' "
-        "   - 'non-standard residues' → expression='non-standard residues' "
-        "   - 'chain A' → expression='chain A' "
-        "   - 'chains' or 'all chains' → expression='chains' "
-        "   - NEVER invent residue names like STANDARD, CANONICAL, NORMAL — use 'protein' instead. "
-        "6. Never call `hide` unless the user explicitly asked to hide something. "
-        "7. After your tools have run, reply with a plain-text summary. Stop calling tools. "
-	"8. For atom/residue distance analysis, prefer `measure_mda_distance` with MDAnalysis syntax. "
-	"Example: sel1='segid A and resid 50 and name CA', sel2='segid A and resid 100 and name CA'. "
-	"CA means alpha carbon atom name CA. "
-	"9. For chain summaries, use `summarize_chains`. "
-	"10. For residue tables, use `list_residues`. "
-	"11. For B-factor summaries, use `bfactor_summary`. "
-	"12. For contact detection, use `detect_contacts`. "
-	"13. For salt bridge detection, use `detect_salt_bridges`; do not use `select_by_bfactor` for salt bridges. "
-	"14. For hydrogen bond candidates, use `detect_hydrogen_bonds`."
+        f"You are PARORA, a protein structure analysis assistant. "
+        f"Current structure: {pdb}. "
+        f"Named selections: [{sels}]. "
+
+        "Complete only the user's explicitly requested task. "
+        "Call the minimum number of tools required and never repeat an identical call. "
+        "Once the requested task succeeds, fails with a clear error, or requires clarification, "
+        "stop calling tools and respond to the user. "
+        "Never attempt speculative recovery by loading another structure, searching the PDB, "
+        "or inventing selections. "
+
+        "Structure loading rules: "
+        "Use fetch_structure only when no structure is loaded or when the user explicitly requests "
+        "a different PDB ID. "
+        "Do not call load_local after fetch_structure. "
+        "Do not automatically summarize, select, or analyze a newly loaded structure unless requested. "
+
+        "Visualization rules: "
+        "The 3D viewer is part of the scientific response. "
+        "Whenever a visualization tool is called, ensure the requested visual change is reflected "
+        "in the viewer. "
+        "Use show when the user requests a representation. "
+        "Use select when the user requests highlighting or selection. "
+        "Use color when the user requests a color change. "
+        "Use set_transparency when the user requests transparency. "
+        "Use the corresponding show or hide tools when the user requests objects to be shown or hidden. "
+        "Do not assume a previous visualization is sufficient when the user explicitly requests "
+        "a new visual state. "
+        "If the user requests both visualization and analysis, update the visualization first, "
+        "then perform the analysis. "
+        "Do not call both show and select unless both actions are explicitly requested. "
+        "Use descriptive selection names and never use sel, sel1, or sel2 as generic names. "
+        "After a visualization tool succeeds, treat the viewer state as updated. "
+        "Do not repeatedly issue additional visualization commands unless the user requests "
+        "another visual change. "
+        "When analysis results refer to residues, chains, ligands, or interactions already highlighted "
+        "in the viewer, preserve those highlights so the user can relate the result to the structure. "
+        "Do not automatically clear user selections after analysis. "
+        "Do not invent visualization changes that the user did not request. "
+
+        "Analysis rules: "
+        "Use summarize_chains for chain summaries. "
+        "Use detect_salt_bridges for salt bridges and pass the requested chain restriction. "
+        "Use select_within for residues near a ligand. "
+        "For ligand DCK, use the explicit residue expression 'resname DCK'; "
+        "do not use the words ligand or DCK alone as an analysis selection. "
+
+        "Use measure_mda_distance for distances. "
+        "MDAnalysis selections must be plain strings joined with 'and', for example: "
+        "'segid A and resid 50 and name CA'. "
+        "Never use brackets, commas, lists, named selections, or visualization selection names "
+        "as MDAnalysis measurement arguments. "
+
+        "Angles require three explicit atom selections and dihedrals require four. "
+        "If the user does not provide enough atoms, ask for the missing selections and stop. "
+        "Do not guess residues, atoms, ligands, chains, or parameters. "
+
+        "Treat tool output as the source of truth. "
+        "Return a concise scientific summary after the requested operation. "
+        "Do not expose internal reasoning or raw tool-call syntax."
     )
 
 
@@ -1686,6 +1771,449 @@ def _tc_args(tc: dict) -> dict:
         except Exception:
             return {}
     return {}
+
+
+TERMINAL_TOOLS = {
+    "summarize_chains",
+    "list_residues",
+    "bfactor_summary",
+    "measure_mda_distance",
+    "measure_angle",
+    "measure_dihedral",
+    "select_within",
+    "nearby_residues",
+    "detect_contacts",
+    "detect_hydrogen_bonds",
+    "detect_salt_bridges",
+}
+
+
+
+# ============================================================
+# Deterministic workflow pre-router
+# ============================================================
+#
+# Returns:
+#   - str: workflow was recognized and completed/failed deterministically
+#   - None: prompt was not recognized; continue through the existing agent
+#
+# This function is intentionally narrow so unrelated PARORA functions
+# continue through the original LLM/tool-calling pathway unchanged.
+def handle_deterministic_workflow(user_prompt):
+    import inspect
+    import re
+
+    prompt = str(user_prompt or "").strip()
+    prompt_lower = prompt.lower()
+
+    if not prompt:
+        return None
+
+    def _result_failed(result):
+        result_lower = str(result).lower()
+        return any(
+            token in result_lower
+            for token in (
+                "error",
+                "failed",
+                "failure",
+                "not found",
+                "could not load",
+                "unable to load",
+            )
+        )
+
+    def _show_chain_compat(representation, chain):
+        """
+        Call the existing tool_show function without forcing one exact
+        parameter naming convention.
+        """
+        selection = f"chain {chain}"
+
+        try:
+            params = inspect.signature(tool_show).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        kwargs = {}
+
+        if "rep_type" in params:
+            kwargs["rep_type"] = representation
+        elif "representation" in params:
+            kwargs["representation"] = representation
+        elif "style" in params:
+            kwargs["style"] = representation
+        elif "representation_type" in params:
+            kwargs["representation_type"] = representation
+
+        if "selection" in params:
+            kwargs["selection"] = selection
+        elif "target_selection" in params:
+            kwargs["target_selection"] = selection
+        elif "expression" in params:
+            kwargs["expression"] = selection
+
+        if "color" in params:
+            kwargs["color"] = "element"
+
+        # Prefer keyword arguments when the local signature is identifiable.
+        if kwargs and (
+            any(
+                key in kwargs
+                for key in (
+                    "rep_type",
+                    "representation",
+                    "style",
+                    "representation_type",
+                )
+            )
+            and any(
+                key in kwargs
+                for key in (
+                    "selection",
+                    "target_selection",
+                    "expression",
+                )
+            )
+        ):
+            return tool_show(**kwargs)
+
+        # Conservative positional fallbacks for older local implementations.
+        try:
+            return tool_show(representation, selection)
+        except TypeError:
+            return tool_show(representation, selection, "element")
+
+    # --------------------------------------------------------
+    # Workflow 1:
+    # Load structure -> summarize chains -> visualize one chain
+    # --------------------------------------------------------
+    #
+    # Example:
+    # Load PDB 3PP0, summarize its chains, and show chain A
+    # as ball and stick.
+    pdb_match = re.search(
+        r"\b(?:load|fetch|open)\s+(?:pdb\s+)?([0-9][A-Za-z0-9]{3})\b",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+
+    chain_match = re.search(
+        r"\bchain\s+([A-Za-z0-9]+)\b",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+
+    asks_for_summary = (
+        "chain" in prompt_lower
+        and any(
+            phrase in prompt_lower
+            for phrase in (
+                "summarize",
+                "summary",
+                "describe the chains",
+                "list the chains",
+            )
+        )
+    )
+
+    asks_for_display = (
+        "chain" in prompt_lower
+        and any(
+            word in prompt_lower
+            for word in (
+                "show",
+                "display",
+                "render",
+                "visualize",
+            )
+        )
+    )
+
+    representation_match = re.search(
+        r"\b(?:as|in)\s+"
+        r"(ball(?:\s*(?:and|\+)\s*stick)|cartoon|surface|"
+        r"spacefill|ribbon|licorice|line|point)\b",
+        prompt,
+        flags=re.IGNORECASE,
+    )
+
+    if (
+        pdb_match
+        and chain_match
+        and asks_for_summary
+        and asks_for_display
+    ):
+        pdb_id = pdb_match.group(1).upper()
+        chain = chain_match.group(1).upper()
+
+        requested_representation = (
+            representation_match.group(1).lower()
+            if representation_match
+            else "cartoon"
+        )
+
+        representation_aliases = {
+            "ball and stick": "ball+stick",
+            "ball+stick": "ball+stick",
+            "ball  and  stick": "ball+stick",
+            "licorice": "ball+stick",
+            "ribbon": "cartoon",
+        }
+
+        representation = representation_aliases.get(
+            requested_representation,
+            requested_representation,
+        )
+
+        try:
+            load_result = tool_fetch_structure(pdb_id)
+        except Exception as exc:
+            return (
+                f"Structure loading failed for {pdb_id}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if _result_failed(load_result):
+            return str(load_result)
+
+        try:
+            summary_result = tool_summarize_chains()
+        except Exception as exc:
+            return (
+                f"{load_result}\n\n"
+                f"The structure loaded, but chain summarization failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        try:
+            show_result = _show_chain_compat(
+                representation=representation,
+                chain=chain,
+            )
+        except Exception as exc:
+            return (
+                f"{load_result}\n\n"
+                f"{summary_result}\n\n"
+                f"The analysis completed, but chain visualization failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        return (
+            f"{load_result}\n\n"
+            f"{summary_result}\n\n"
+            f"{show_result}"
+        )
+
+    # --------------------------------------------------------
+    # Workflow 2:
+    # Validate CA atoms -> highlight -> measure angle
+    # --------------------------------------------------------
+    #
+    # Example:
+    # Highlight the CA atoms of residues 50, 51, and 52 in
+    # chain A and measure the angle they form.
+    asks_for_angle = (
+        "angle" in prompt_lower
+        and "dihedral" not in prompt_lower
+    )
+
+    asks_for_ca_atoms = bool(
+        re.search(
+            r"\bca\b|\bc[-\s]?alpha\b|\balpha carbon",
+            prompt_lower,
+        )
+    )
+
+    asks_for_highlight = any(
+        word in prompt_lower
+        for word in (
+            "highlight",
+            "show",
+            "display",
+            "select",
+            "visualize",
+        )
+    )
+
+    if asks_for_angle and asks_for_ca_atoms and asks_for_highlight:
+        angle_chain_match = re.search(
+            r"\bchain\s+([A-Za-z0-9]+)\b",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+
+        residue_section = re.search(
+            r"\bresidues?\s+(.+?)(?:\s+in\s+chain\b|\s+of\s+chain\b|$)",
+            prompt,
+            flags=re.IGNORECASE,
+        )
+
+        if not angle_chain_match:
+            return (
+                "Please specify the chain for the angle workflow, "
+                "for example: chain A."
+            )
+
+        # Restrict number extraction to the residue portion when possible,
+        # preventing a PDB identifier or distance value from being mistaken
+        # for a residue number.
+        number_source = (
+            residue_section.group(1)
+            if residue_section
+            else prompt
+        )
+
+        residue_numbers = re.findall(
+            r"\b\d+\b",
+            number_source,
+        )
+
+        if len(residue_numbers) != 3:
+            return (
+                "Please provide exactly three residue numbers for the "
+                "CA-angle workflow."
+            )
+
+        chain = angle_chain_match.group(1).upper()
+        r1, r2, r3 = residue_numbers
+
+        try:
+            universe = get_universe()
+        except Exception as exc:
+            return (
+                "PARORA could not access the currently loaded structure: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if universe is None:
+            return (
+                "Load a protein structure before highlighting atoms "
+                "or measuring an angle."
+            )
+
+        # PDB files may expose chain labels through either segid
+        # or chainID in MDAnalysis. Resolve the valid form from the
+        # currently loaded structure before building atom selections.
+        chain_selector = None
+
+        for candidate in (
+            f"segid {chain}",
+            f"chainID {chain}",
+        ):
+            try:
+                candidate_atoms = universe.select_atoms(candidate)
+            except Exception:
+                continue
+
+            if len(candidate_atoms) > 0:
+                chain_selector = candidate
+                break
+
+        if chain_selector is None:
+            available_segids = sorted(
+                {
+                    str(value).strip()
+                    for value in getattr(universe.atoms, "segids", [])
+                    if str(value).strip()
+                }
+            )
+
+            available_chainids = sorted(
+                {
+                    str(value).strip()
+                    for value in getattr(universe.atoms, "chainIDs", [])
+                    if str(value).strip()
+                }
+            )
+
+            return (
+                f"Chain {chain} was not found in the currently loaded structure. "
+                f"Available segids: {available_segids or 'none'}; "
+                f"available chainIDs: {available_chainids or 'none'}."
+            )
+
+        atom_selections = [
+            f"{chain_selector} and resid {r1} and name CA",
+            f"{chain_selector} and resid {r2} and name CA",
+            f"{chain_selector} and resid {r3} and name CA",
+        ]
+
+        validation_errors = []
+
+        for resid, selection in zip(
+            (r1, r2, r3),
+            atom_selections,
+        ):
+            try:
+                atoms = universe.select_atoms(selection)
+            except Exception as exc:
+                validation_errors.append(
+                    f"residue {resid}: selection error "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                continue
+
+            if len(atoms) == 0:
+                validation_errors.append(
+                    f"residue {resid}: no CA atom found in chain {chain}"
+                )
+            elif len(atoms) > 1:
+                validation_errors.append(
+                    f"residue {resid}: matched {len(atoms)} CA atoms "
+                    f"in chain {chain}"
+                )
+
+        if validation_errors:
+            return (
+                "The requested angle could not be measured because "
+                "the atom selections were not valid:\n- "
+                + "\n- ".join(validation_errors)
+            )
+
+        highlight_expression = (
+            f"{chain_selector} and "
+            f"(resid {r1} or resid {r2} or resid {r3}) "
+            f"and name CA"
+        )
+
+        selection_name = (
+            f"angle_ca_{chain}_{r1}_{r2}_{r3}"
+        )
+
+        # Change the viewer only after all three atoms pass validation.
+        try:
+            highlight_result = tool_select(
+                name=selection_name,
+                expression=highlight_expression,
+            )
+        except Exception as exc:
+            return (
+                "The atoms were validated, but the viewer highlight failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        try:
+            angle_result = tool_measure_angle(
+                atom_selections[0],
+                atom_selections[1],
+                atom_selections[2],
+            )
+        except Exception as exc:
+            return (
+                f"{highlight_result}\n\n"
+                f"The atoms were highlighted, but angle measurement failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        return (
+            f"{highlight_result}\n\n"
+            f"{angle_result}"
+        )
+
+    # Prompt did not match a deterministic workflow.
+    # Preserve the existing PARORA agent behavior.
+    return None
 
 
 def run_agent(user_prompt: str) -> str:
@@ -1711,6 +2239,55 @@ def run_agent(user_prompt: str) -> str:
     """
     st.session_state.debug_logs.append(f"📨 User: {user_prompt}")
 
+    prompt_lower = user_prompt.lower()
+
+    # Narrow deterministic workflow pre-router.
+    # Unmatched prompts continue through the original PARORA agent.
+    deterministic_result = handle_deterministic_workflow(user_prompt)
+    if deterministic_result is not None:
+        return deterministic_result
+
+
+    # ------------------------------------------------------------
+    # Stage 1A lightweight intent validation
+    # ------------------------------------------------------------
+
+    if "angle" in prompt_lower and "dihedral" not in prompt_lower:
+        residue_numbers = re.findall(r"\b\d+\b", user_prompt)
+
+        if len(residue_numbers) < 3:
+            return (
+                "I need three atoms or residues to measure an angle. "
+                "For example: "
+                "'Measure the angle formed by the CA atoms of residues "
+                "50, 51, and 52 in chain A.'"
+            )
+
+    if "dihedral" in prompt_lower:
+        residue_numbers = re.findall(r"\b\d+\b", user_prompt)
+
+        if len(residue_numbers) < 4:
+            return (
+                "I need four atoms or residues to measure a dihedral angle. "
+                "Please specify the four atoms or residues."
+            )
+
+    if any(x in prompt_lower for x in (
+        "stable",
+        "stability",
+        "folding",
+        "thermostable",
+    )):
+        return (
+            "Protein stability cannot be determined from a single static "
+            "PDB structure alone. Determining stability generally requires "
+            "molecular dynamics simulations, free-energy calculations, "
+            "or experimental measurements. "
+            "I can instead analyze structural contacts, salt bridges, "
+            "hydrogen bonds, B-factors, or prepare the structure for "
+            "simulation."
+        )
+
     messages = [
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": user_prompt}
@@ -1719,7 +2296,6 @@ def run_agent(user_prompt: str) -> str:
     prompt_lower = user_prompt.lower() 
     # Direct deterministic route for explicit MDAnalysis distance prompts
     if "sel1=" in prompt_lower and "sel2=" in prompt_lower:
-        import re
         m1 = re.search(r"sel1=['\"]([^'\"]+)['\"]", user_prompt)
         m2 = re.search(r"sel2=['\"]([^'\"]+)['\"]", user_prompt)
 
@@ -1742,7 +2318,19 @@ def run_agent(user_prompt: str) -> str:
             pdb_match = re.search(r"\b([0-9][A-Za-z0-9]{3})\b", user_prompt)
             if pdb_match:
                 results.append(tool_fetch_structure(pdb_match.group(1)))
-        results.append(tool_detect_salt_bridges())
+        chain_match = re.search(
+            r"\bchain\s+([A-Za-z0-9]+)\b",
+            user_prompt,
+            flags=re.IGNORECASE,
+        )
+        requested_chain = (
+            chain_match.group(1).upper()
+            if chain_match
+            else ""
+        )
+        results.append(
+            tool_detect_salt_bridges(chain=requested_chain)
+        )
         return "Done: " + "; ".join(results)
 
     # Gate: destructive tools only when user explicitly asked for hiding
@@ -1812,6 +2400,22 @@ def run_agent(user_prompt: str) -> str:
             func = tc.get("function", {})
             name = func.get("name", "")
             args = _tc_args(tc)
+
+            # Deterministic fallback for explicitly requested chain scopes.
+            # Local models may select the correct tool but omit the chain
+            # argument even when the user clearly specifies one.
+            if name == "detect_salt_bridges" and not str(args.get("chain", "")).strip():
+                chain_match = re.search(
+                    r"\bchain\s+([A-Za-z0-9]+)\b",
+                    user_prompt,
+                    flags=re.IGNORECASE,
+                )
+                if chain_match:
+                    args["chain"] = chain_match.group(1).upper()
+                    st.session_state.debug_logs.append(
+                        f"🧭 Injected explicit salt-bridge chain scope: "
+                        f"{args['chain']}"
+                    )
 
             # ── Gate: select ────────────────────────────────────────────────
             # Block select when: show-only intent, a show already fired this run,
@@ -1887,16 +2491,35 @@ def run_agent(user_prompt: str) -> str:
             summary_parts.append(f"{name}: {result}")
             tool_results.append({"tool": name, "result": result})
 
-        # Append tool results to the conversation and refresh the system prompt
+        # Terminal analysis tools complete the user's requested operation.
+        # Do not send their results back to the LLM for another reasoning turn,
+        # because that can trigger speculative or unrelated follow-up calls.
+        terminal_results = [
+            item for item in tool_results
+            if item["tool"] in TERMINAL_TOOLS
+        ]
+        if terminal_results:
+            terminal_names = ", ".join(item["tool"] for item in terminal_results)
+            st.session_state.debug_logs.append(
+                f"🛑 Terminal tool completed ({terminal_names}) — ending agent loop"
+            )
+            return "Done: " + "; ".join(summary_parts)
+
+        # Append non-terminal tool results to the conversation and refresh the system prompt
         messages.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": tool_calls})
         results_text = "\n".join(f"[{r['tool']}]: {r['result']}" for r in tool_results)
         messages[0] = {"role": "system", "content": _system_prompt()}
 
-        # After a representation show, request a short confirmation and stop calling tools
+        # After tool execution, strongly prefer summarization over additional tool calls.
         follow_up = (
-            "Representation updated. Reply with one sentence confirming what changed — NO MORE TOOL CALLS."
+            "Representation updated. Reply with one sentence confirming what changed. "
+            "Do not call any more tools."
             if show_rep_fired else
-            "Continue with any remaining steps. When all steps are done, reply with a short plain-text summary — no more tool calls."
+            "Tool execution is complete. "
+            "If the user's request has been satisfied, reply only with a short plain-text summary. "
+            "Do not call additional tools. "
+            "Only call another tool if the previous result explicitly reports missing information "
+            "that prevents completion."
         )
         messages.append({
             "role": "user",

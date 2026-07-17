@@ -28,15 +28,37 @@ def summarize_chains_from_universe(u) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-def list_residues_from_universe(u, max_rows: int = 200) -> pd.DataFrame:
+def list_residues_from_universe(
+    u,
+    chain=None,
+    max_rows: int = 200
+) -> pd.DataFrame:
+    """List residues, optionally restricted to one chain or segment."""
+
+    residues = u.residues
+
+    if chain is not None:
+        chain = str(chain).strip()
+        if chain:
+            residues = [
+                res for res in residues
+                if str(res.segid).strip().upper() == chain.upper()
+            ]
+
     rows = []
-    for res in u.residues[:max_rows]:
+    for res in residues[:max_rows]:
         rows.append({
             "resid": res.resid,
             "resname": res.resname,
             "chain_or_segment": res.segid,
             "n_atoms": len(res.atoms)
         })
+
+    if chain and not rows:
+        return pd.DataFrame([{
+            "error": f"No residues found for chain or segment {chain}"
+        }])
+
     return pd.DataFrame(rows)
 
 def bfactor_summary_from_universe(u) -> pd.DataFrame:
@@ -160,35 +182,99 @@ def contact_detection_from_universe(u, sel1: str = "protein", sel2: str = "prote
                     return pd.DataFrame(pairs)
     return pd.DataFrame(pairs) if pairs else pd.DataFrame([{"result": "No contacts found", "cutoff_A": cutoff}])
 
-def salt_bridge_detection_from_universe(u, cutoff: float = 4.0, max_rows: int = 100) -> pd.DataFrame:
+def salt_bridge_detection_from_universe(
+    u,
+    chain: str | None = None,
+    cutoff: float = 4.0,
+    max_rows: int = 100
+) -> pd.DataFrame:
     """
-    Simple salt-bridge detector:
-    acidic O atoms from ASP/GLU within cutoff of basic N atoms from LYS/ARG/HIS.
+    Detect geometry-based candidate salt bridges.
+
+    Acidic ASP/GLU side-chain oxygen atoms are compared with basic
+    LYS/ARG/HIS side-chain nitrogen atoms.
+
+    When ``chain`` is provided, both interacting residues must belong
+    to that chain or segment.
     """
-    acidic = u.select_atoms("(resname ASP GLU) and (name OD1 OD2 OE1 OE2)")
-    basic = u.select_atoms("(resname LYS ARG HIS HSD HSE HSP) and (name NZ NH1 NH2 NE NE2 ND1)")
+    chain = str(chain).strip() if chain is not None else ""
+
+    acidic_selection = (
+        "(resname ASP GLU) and "
+        "(name OD1 OD2 OE1 OE2)"
+    )
+    basic_selection = (
+        "(resname LYS ARG HIS HSD HSE HSP) and "
+        "(name NZ NH1 NH2 NE NE2 ND1)"
+    )
+
+    if chain:
+        chain_selection = f"segid {chain}"
+        acidic_selection = (
+            f"({chain_selection}) and ({acidic_selection})"
+        )
+        basic_selection = (
+            f"({chain_selection}) and ({basic_selection})"
+        )
+
+    acidic = u.select_atoms(acidic_selection)
+    basic = u.select_atoms(basic_selection)
 
     if len(acidic) == 0 or len(basic) == 0:
-        return pd.DataFrame([{"error": f"Missing acidic/basic atoms: acidic={len(acidic)}, basic={len(basic)}"}])
+        scope = f" in chain {chain}" if chain else ""
+        return pd.DataFrame([{
+            "error": (
+                f"Missing acidic/basic atoms{scope}: "
+                f"acidic={len(acidic)}, basic={len(basic)}"
+            )
+        }])
 
     rows = []
-    for a in acidic:
-        for b in basic:
-            if a.segid == b.segid and a.resid == b.resid:
+
+    for acidic_atom in acidic:
+        for basic_atom in basic:
+            # Exclude atoms belonging to the same residue.
+            if (
+                acidic_atom.segid == basic_atom.segid
+                and acidic_atom.resid == basic_atom.resid
+            ):
                 continue
-            d = float(np.linalg.norm(a.position - b.position))
-            if d <= cutoff:
+
+            distance = float(
+                np.linalg.norm(
+                    acidic_atom.position - basic_atom.position
+                )
+            )
+
+            if distance <= cutoff:
                 rows.append({
-                    "acidic_residue": f"{a.resname}{a.resid}:{a.segid}",
-                    "acidic_atom": a.name,
-                    "basic_residue": f"{b.resname}{b.resid}:{b.segid}",
-                    "basic_atom": b.name,
-                    "distance_A": round(d, 3),
-                    "cutoff_A": cutoff
+                    "acidic_residue": (
+                        f"{acidic_atom.resname}"
+                        f"{acidic_atom.resid}:"
+                        f"{acidic_atom.segid}"
+                    ),
+                    "acidic_atom": acidic_atom.name,
+                    "basic_residue": (
+                        f"{basic_atom.resname}"
+                        f"{basic_atom.resid}:"
+                        f"{basic_atom.segid}"
+                    ),
+                    "basic_atom": basic_atom.name,
+                    "distance_A": round(distance, 3),
+                    "cutoff_A": cutoff,
                 })
+
                 if len(rows) >= max_rows:
                     return pd.DataFrame(rows)
-    return pd.DataFrame(rows) if rows else pd.DataFrame([{"result": "No salt bridges found", "cutoff_A": cutoff}])
+
+    if rows:
+        return pd.DataFrame(rows)
+
+    scope = f" in chain {chain}" if chain else ""
+    return pd.DataFrame([{
+        "result": f"No salt bridges found{scope}",
+        "cutoff_A": cutoff,
+    }])
 
 def hydrogen_bond_detection_from_universe(u, cutoff: float = 3.5, max_rows: int = 100) -> pd.DataFrame:
     """

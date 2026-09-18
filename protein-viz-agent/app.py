@@ -36,7 +36,6 @@ import uuid
 import requests
 from pathlib import Path
 from ollama import Client
-from rcsbapi.search import TextQuery
 from analysis_tools import (
     summarize_chains_from_universe,
     list_residues_from_universe,
@@ -227,6 +226,7 @@ defaults = {
     "label_msg":       None,    # status line from the most recent labelling action
     "active_only":     False,   # draw only the active structure — see _viewer_payload
     "viewer_seq":      0,       # last viewer event applied — see handle_viewer_event
+    "toolbar_open":    None,    # (top, sub) of the open toolbar dialog — see _toolbar_dialog
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -687,26 +687,6 @@ def resolve_selection(sel_name_or_expr: str) -> str:
 # Tool implementations
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def tool_search_pdb(search_term: str) -> str:
-    """
-    Search the RCSB PDB by free-text and return the top-ranked PDB accession.
-
-    Args:
-        search_term: Protein name or descriptive query string.
-
-    Returns:
-        PDB ID string, "No results found", or "Error: <detail>" on failure.
-    """
-    try:
-        query_obj = TextQuery(value=search_term)
-        results = query_obj(rows=1)
-        # rcsbapi may return a list, generator, or Session object
-        pdb_id = next(iter(results), None)
-        return pdb_id if pdb_id else "No results found"
-    except Exception as e:
-        return f"Error: {e}"
-
-
 # ── Protein lookup: name → UniProt → every PDB structure of that protein ─────
 # The PDB's own text search answers "which titles contain these words", which
 # is a different question from "which structures are of this protein" and
@@ -833,6 +813,11 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
     insulin receptor" picks a file the way the Proteins panel would and adds
     it to the scene, rather than making the user find an accession first.
 
+    Falls back to the AlphaFold DB predicted model when the protein has no
+    experimental structure at all (not merely none matching `method`) — most
+    UniProt entries have no PDB deposition, and AlphaFold covers nearly all
+    of them.
+
     Args:
         name    : Protein name, gene symbol or UniProt accession.
         organism: Species. "human" by default.
@@ -847,9 +832,32 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
         return err
     rows = pacc.filter_structures(prof["structures"], method=method, loadable_only=True)
     if not rows:
-        return (f"{prof['protein_name']} ({prof['accession']}) has no structure "
-                f"that can be loaded here"
-                + (f" by {method}." if method else "."))
+        # A method filter narrowing existing structures to zero is a different
+        # situation from the protein having none at all — only the latter
+        # should fall back to a predicted model, or the filter would be
+        # silently ignored.
+        any_rows = (pacc.filter_structures(prof["structures"], loadable_only=True)
+                    if method else rows)
+        if any_rows:
+            return (f"{prof['protein_name']} ({prof['accession']}) has no structure "
+                    f"that can be loaded here by {method}.")
+        dest, af_err = download_alphafold(prof["accession"])
+        if af_err:
+            return (f"{prof['protein_name']} ({prof['accession']}) has no experimental "
+                    f"structure in the PDB, and {af_err[0].lower()}{af_err[1:]}")
+        label = f"AF-{prof['accession']}"
+        first = not structures()
+        note = "" if first else _recolor_for_comparison()
+        register_structure(label, dest, source="alphafold")
+        st.session_state.camera_target = None
+        if first and not st.session_state.representations:
+            st.session_state.representations = [dict(r, id=uuid.uuid4().hex[:8])
+                                                for r in DEFAULT_REPS]
+        return (f"{prof['protein_name']} ({prof['accession']}) has no experimental "
+                f"structure in the PDB — loaded the AlphaFold predicted model "
+                f"({label}) instead. Confidence (pLDDT) varies by residue; treat "
+                f"low-confidence regions as illustrative, not a fitted structure."
+                f"{note}")
     best = pacc.rank_structures(rows, prefer)[0]
     msg = tool_add_structure(best["pdb_id"])
     res = f"{best['resolution']:.2f} Å" if best["resolution"] is not None else "no resolution"
@@ -1261,6 +1269,42 @@ def download_pdb(pdb_id: str):
         return dest, None
     except Exception as e:
         return None, f"Error downloading {pdb_id}: {e}"
+
+
+def download_alphafold(accession: str):
+    """
+    Fetch the AlphaFold DB predicted model for a UniProt accession into
+    STRUCTURES_DIR, reusing the cached copy if present.
+
+    Fallback path for `tool_load_protein` when a protein has no experimental
+    PDB deposition at all — most of UniProt does not. AlphaFold DB covers
+    essentially every UniProt accession with a per-residue confidence
+    (pLDDT) model, so this is the difference between "no structure" and a
+    usable one for the majority of proteins someone might name.
+
+    Returns:
+        (Path, None) on success, or (None, error message).
+    """
+    accession = accession.upper().strip()
+    dest = STRUCTURES_DIR / f"AF_{accession}.pdb"
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest, None
+    try:
+        r = requests.get(f"https://alphafold.ebi.ac.uk/api/prediction/{accession}",
+                         timeout=30)
+        r.raise_for_status()
+        hits = r.json()
+        if not hits:
+            return None, f"AlphaFold DB has no predicted model for {accession}."
+        pdb_url = hits[0].get("pdbUrl")
+        if not pdb_url:
+            return None, f"AlphaFold DB entry for {accession} has no PDB file."
+        r2 = requests.get(pdb_url, timeout=30)
+        r2.raise_for_status()
+        dest.write_bytes(r2.content)
+        return dest, None
+    except Exception as e:
+        return None, f"Error downloading the AlphaFold model for {accession}: {e}"
 
 
 def _recolor_for_comparison() -> str:
@@ -3460,14 +3504,6 @@ def _ngl_to_mda_approx(ngl_sel: str) -> str:
 TOOLS = [
     {
         "type": "function", "function": {
-            "name": "search_pdb",
-            "description": "Search RCSB PDB by protein name and return the top matching PDB ID",
-            "parameters": {"type": "object", "properties": {
-                "search_term": {"type": "string"}}, "required": ["search_term"]}
-        }
-    },
-    {
-        "type": "function", "function": {
             "name": "find_protein",
             "description": (
                 "Identify a protein by name, gene symbol or UniProt accession and "
@@ -3508,8 +3544,9 @@ TOOLS = [
                 "Load the best PDB structure of a protein named in words, when the user "
                 "gives a protein NAME rather than a 4-character PDB id — 'load the human "
                 "insulin receptor', 'show me EGFR', 'open p53'. Picks the file the way "
-                "the Proteins panel would and adds it to the scene. For an actual PDB "
-                "accession use fetch_structure instead."
+                "the Proteins panel would and adds it to the scene. Falls back to the "
+                "AlphaFold predicted model when no experimental structure exists. For "
+                "an actual PDB accession use fetch_structure instead."
             ),
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
@@ -4251,7 +4288,6 @@ TOOL_DISPATCH = {
                              a.get("offset", 0.0)),
     "clear_labels":      lambda a: tool_clear_labels(a.get("text", "")),
     "list_labels":       lambda a: tool_list_labels(),
-    "search_pdb":        lambda a: tool_search_pdb(a.get("search_term", "")),
     "inspect_preparation": lambda a: tool_inspect_preparation(a.get("target", "")),
     "prepare_structure": lambda a: tool_prepare_structure(
         a.get("target", ""), a.get("profile", "amber"), a.get("model", 0),
@@ -4354,8 +4390,8 @@ def _system_prompt() -> str:
         "   giving a 4-character accession — 'the insulin receptor', 'EGFR', 'p53', "
         "   'human hemoglobin': "
         "   - 'load / show / open <protein name>' → ONE `load_protein` call. Do NOT "
-        "     call search_pdb or fetch_structure for a protein name; they guess from "
-        "     entry titles and land on the wrong species or a homologue. "
+        "     call fetch_structure for a protein name; it takes only a 4-character "
+        "     accession and never guesses from a name. "
         "   - 'what structures are there for <protein>', 'how many structures of X', "
         "     'is there a cryo-EM structure of X' → ONE `find_protein` call. "
         "   - 'list the X-ray structures of X', 'which have a ligand bound', "
@@ -4410,7 +4446,7 @@ def _system_prompt() -> str:
         "   `find_interactions` call (pass `target` when they name a residue, ligand or "
         "   chain). 'highlight X', 'show me the binding site' → `highlight`. Report the "
         "   distances the tool gives; never invent an interaction. "
-        "1. Do not call fetch_structure or search_pdb for a structure already in the "
+        "1. Do not call fetch_structure or load_protein for a structure already in the "
         "   scene. Loading a different one is fine and keeps the others. "
         "2. Call the MINIMUM tools needed. Never repeat a tool with the same arguments. "
         "3. Use a short descriptive selection name (e.g. 'nonstandard', 'atp_res', 'chain_a') — never 'sel'. "
@@ -4480,7 +4516,7 @@ def _system_prompt() -> str:
 TOOL_GROUPS = {
     "lookup":   (r"protein|uniprot|gene|structures for|structures of|entries|"
                  r"depositions|search|look up|homolog|species|isoform",
-                 {"search_pdb", "find_protein", "protein_structures", "load_protein"}),
+                 {"find_protein", "protein_structures", "load_protein"}),
     "load":     (r"\bload|fetch|download|open|add\b|remove structure|unload|clear|reset|"
                  r"start over|upload|local file",
                  {"fetch_structure", "load_local", "add_structure", "remove_structure",
@@ -5182,7 +5218,7 @@ def run_agent(user_prompt: str) -> str:
     # "get the contacts" — and letting those re-run the protein lookup is how the
     # working context gets thrown away mid-analysis. So the weak verbs count as a
     # load only when what follows them is not something the open structure contains.
-    LOAD_TOOLS = {"search_pdb", "fetch_structure", "load_local", "load_protein"}
+    LOAD_TOOLS = {"fetch_structure", "load_local", "load_protein"}
     HARD_LOAD = r"\b(?:load|fetch|download|reload|re-load)\b"
     WEAK_LOAD = r"\b(?:open|get|show me|find|search for|look up|look for)\b"
     ANALYSIS_OBJECT = (r"residues?|resid|atoms?|chains?|contacts?|interactions?|"
@@ -5738,6 +5774,13 @@ def handle_viewer_event(event) -> bool:
         })
         return True
 
+    if kind == "toolbar_open":
+        pane = (event.get("top"), event.get("sub"))
+        if pane in TOOLBAR_DISPATCH and st.session_state.toolbar_open != pane:
+            st.session_state.toolbar_open = pane
+            return True
+        return False
+
     return False
 
 
@@ -5792,7 +5835,47 @@ def build_ngl_html() -> str:
     tpl = r"""
     <div id="wrap" tabindex="0" style="position:relative;width:100%;height:680px;
          border:1px solid #555;border-radius:8px;overflow:hidden;background:__BG__;outline:none;">
-
+      <div id="toolbar">
+        <div class="tbgrp">
+          <button data-act="tb-load">Load</button>
+          <div class="tbdrop" data-top="Load" hidden>
+            <button data-act="tb-pick" data-top="Load" data-sub="Loaded">Loaded</button>
+            <button data-act="tb-pick" data-top="Load" data-sub="Find by protein name">Find by protein name</button>
+          </div>
+        </div>
+        <div class="tbgrp">
+          <button data-act="tb-pick" data-top="Prepare">Prepare</button>
+        </div>
+        <div class="tbgrp">
+          <button data-act="tb-style">Style</button>
+          <div class="tbdrop" data-top="Style" hidden>
+            <button data-act="tb-pick" data-top="Style" data-sub="Representations">Representations</button>
+            <button data-act="tb-pick" data-top="Style" data-sub="Labels">Labels</button>
+            <button data-act="tb-pick" data-top="Style" data-sub="Ray-traced figure">Ray-traced figure</button>
+          </div>
+        </div>
+        <div class="tbgrp">
+          <button data-act="tb-analyze">Analyze</button>
+          <div class="tbdrop" data-top="Analyze" hidden>
+            <button data-act="tb-pick" data-top="Analyze" data-sub="Measure">Measure</button>
+            <button data-act="tb-pick" data-top="Analyze" data-sub="Interactions">Interactions</button>
+            <button data-act="tb-pick" data-top="Analyze" data-sub="Highlight">Highlight</button>
+            <button data-act="tb-pick" data-top="Analyze" data-sub="Summary">Summary</button>
+            <button data-act="tb-pick" data-top="Analyze" data-sub="Sequence">Sequence</button>
+          </div>
+        </div>
+        <div class="tbgrp">
+          <button data-act="tb-simulate">Simulate</button>
+          <div class="tbdrop" data-top="Simulate" hidden>
+            <button data-act="tb-pick" data-top="Simulate" data-sub="MD &middot; Amber">MD &middot; Amber</button>
+            <button data-act="tb-pick" data-top="Simulate" data-sub="MD &middot; GROMACS">MD &middot; GROMACS</button>
+            <button data-act="tb-pick" data-top="Simulate" data-sub="MD &middot; Rosetta">MD &middot; Rosetta</button>
+            <button data-act="tb-pick" data-top="Simulate" data-sub="QM">QM</button>
+            <button data-act="tb-pick" data-top="Simulate" data-sub="QM/MM">QM/MM</button>
+            <button data-act="tb-pick" data-top="Simulate" data-sub="Membrane">Membrane</button>
+          </div>
+        </div>
+      </div>
       <div id="viewport" style="width:100%;height:100%;"></div>
 
       <!-- Navigation toolbar: overlays the canvas so the structure can be moved
@@ -5922,7 +6005,22 @@ def build_ngl_html() -> str:
     </div>
 
     <style>
-      #nav{position:absolute;top:8px;left:8px;display:flex;gap:8px;flex-wrap:wrap;
+      #toolbar{position:absolute;top:0;left:0;width:100%;height:34px;z-index:12;
+               display:flex;align-items:center;gap:4px;padding:0 8px;box-sizing:border-box;
+               background:rgba(20,20,24,.85);border-bottom:1px solid rgba(255,255,255,.16);
+               font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
+      #toolbar button{background:transparent;border:1px solid rgba(255,255,255,.22);
+               border-radius:5px;color:#e8e8ea;padding:4px 10px;cursor:pointer;font:inherit;}
+      #toolbar button:hover{background:rgba(255,255,255,.18);}
+      .tbgrp{position:relative;}
+      .tbdrop{position:absolute;top:100%;left:0;z-index:13;display:flex;flex-direction:column;
+              min-width:190px;background:rgba(20,20,24,.94);border:1px solid rgba(255,255,255,.2);
+              border-radius:6px;padding:4px;box-shadow:0 6px 18px rgba(0,0,0,.4);}
+      .tbdrop[hidden]{display:none;}
+      .tbdrop button{background:transparent;border:0;color:#e8e8ea;text-align:left;
+              padding:6px 8px;border-radius:4px;cursor:pointer;font:inherit;white-space:nowrap;}
+      .tbdrop button:hover{background:rgba(255,255,255,.15);}
+      #nav{position:absolute;top:42px;left:8px;display:flex;gap:8px;flex-wrap:wrap;
            font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;z-index:10;}
       #nav .grp{display:flex;background:rgba(20,20,24,.72);border:1px solid rgba(255,255,255,.16);
                 border-radius:7px;overflow:hidden;}
@@ -5931,7 +6029,7 @@ def build_ngl_html() -> str:
       #nav .grp button:last-child{border-right:0;}
       #nav button:hover{background:rgba(255,255,255,.18);}
       #nav button.on{background:#2f6feb;color:#fff;}
-      #penbox,#stylebox{position:absolute;top:44px;left:8px;z-index:20;width:264px;
+      #penbox,#stylebox{position:absolute;top:78px;left:8px;z-index:20;width:264px;
               background:rgba(20,20,24,.94);border:1px solid rgba(255,255,255,.2);
               border-radius:8px;color:#e8e8ea;padding:8px 10px 10px;
               font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
@@ -5962,7 +6060,7 @@ def build_ngl_html() -> str:
       #pen-list .lbl button:hover{color:#fff;}
       #wrap.penning #viewport{cursor:crosshair;}
       #legend .leg.active{outline:2px solid #2f6feb;outline-offset:-2px;}
-      #legend{position:absolute;top:8px;right:8px;z-index:10;display:flex;flex-direction:column;
+      #legend{position:absolute;top:42px;right:8px;z-index:10;display:flex;flex-direction:column;
               gap:4px;align-items:flex-end;
               font:12px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
       #legend .leg{display:flex;align-items:center;gap:7px;cursor:pointer;font:inherit;
@@ -5994,7 +6092,7 @@ def build_ngl_html() -> str:
             background:rgba(20,20,24,.6);padding:4px 8px;border-radius:5px;
             opacity:.85;transition:opacity .6s;}
       #hint.fade{opacity:0;}
-      #helpbox{position:absolute;top:46px;left:8px;z-index:20;max-width:440px;
+      #helpbox{position:absolute;top:80px;left:8px;z-index:20;max-width:440px;
                background:rgba(20,20,24,.94);border:1px solid rgba(255,255,255,.18);
                border-radius:8px;padding:12px 14px;color:#e8e8ea;
                font:12px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
@@ -6099,6 +6197,23 @@ def build_ngl_html() -> str:
         function emit(o){
             if (window.paroraEmit) { window.paroraEmit(o); }
             else { console.warn("PARORA viewer: no bridge; use the side panels."); }
+        }
+
+        // ── In-viewer Load/Prepare/Style/Analyze/Simulate toolbar ─────────────
+        // Mirrors the Streamlit-native toolbar above the viewer: a top-level
+        // click opens its sub-panel dropdown, and picking a sub-item emits the
+        // same (top, sub) pair that toolbar_open holds, so handle_viewer_event
+        // routes it through the identical TOOLBAR_DISPATCH/_toolbar_dialog path
+        // — one dialog, reachable from either toolbar.
+        function closeTbDrops(){
+            wrap.querySelectorAll(".tbdrop").forEach(function(d){ d.hidden = true; });
+        }
+        function toggleTbDrop(top){
+            var drop = wrap.querySelector('.tbdrop[data-top="' + top + '"]');
+            if (!drop) return;
+            var opening = drop.hidden;
+            closeTbDrops();
+            drop.hidden = !opening;
         }
 
         function sidOfComponent(c){
@@ -6316,6 +6431,15 @@ def build_ngl_html() -> str:
                     },
             "snap-close": function(){
                         document.getElementById("snapbox").style.display = "none";
+                    },
+            "tb-load":     function(){ toggleTbDrop("Load"); },
+            "tb-style":    function(){ toggleTbDrop("Style"); },
+            "tb-analyze":  function(){ toggleTbDrop("Analyze"); },
+            "tb-simulate": function(){ toggleTbDrop("Simulate"); },
+            "tb-pick":     function(btn){
+                        closeTbDrops();
+                        emit({kind: "toolbar_open", top: btn.dataset.top,
+                              sub: btn.dataset.sub || null});
                     }
         };
         wrap.addEventListener("click", function(e){
@@ -6323,7 +6447,7 @@ def build_ngl_html() -> str:
             if (!btn || btn.tagName === "A") return;
             e.preventDefault();
             e.stopPropagation();
-            actions[btn.dataset.act]();
+            actions[btn.dataset.act](btn);
             if (["zin", "zout", "fit", "reset"].indexOf(btn.dataset.act) >= 0) {
                 setTimeout(function(){ saveCam(stage); }, 600);
             }
@@ -6570,6 +6694,8 @@ def structure_manager_ui() -> None:
                 label += f" · fitted on {s.get('fit_reference', '?')} — {s['fit']}"
             elif s["source"] == "local":
                 label += " · local file"
+            elif s["source"] == "alphafold":
+                label += " · AlphaFold predicted model"
             st.markdown(label)
         with c2:
             vis = st.checkbox("Visible", value=s["visible"], key=f"svis_{s['sid']}")
@@ -9259,6 +9385,83 @@ with left:
             st.session_state[k] = v
         st.rerun()
 
+
+# ── Toolbar: menu-bar mirror of the Load/Prepare/Style/Analyze/Simulate tabs ──
+# Docked above the viewer rather than replacing the tabs below, so this can be
+# sanity-checked side by side with the proven controls before the tabs go
+# away. Streamlit has no native hover menu, so each top-level item is a
+# click-to-open st.popover listing its sub-panels; picking one opens
+# _toolbar_dialog as a modal, and closing it drops back to a script rerun that
+# rebuilds the viewer from whatever the dialog just changed — the same
+# session-state path the tabs already use, so the reflection in the view is
+# automatic.
+# Old Load/Prepare/Style/Analyze/Simulate tab strip below the viewer, kept
+# only as a disabled sanity-check fallback now that the toolbar above the
+# viewer covers the same panels. Flip to True to bring it back.
+SHOW_LEGACY_TABS = False
+
+TOOLBAR_DISPATCH = {
+    ("Load", "Loaded"):               ("Load — Loaded structures", structure_manager_ui),
+    ("Load", "Find by protein name"): ("Load — Find by protein name", protein_finder_ui),
+    ("Prepare", None):                ("Prepare", prepare_ui),
+    ("Style", "Representations"):     ("Style — Representations", representation_manager_ui),
+    ("Style", "Labels"):              ("Style — Labels", label_ui),
+    ("Style", "Ray-traced figure"):   ("Style — Ray-traced figure", render_ui),
+    ("Analyze", "Measure"):           ("Analyze — Measure", measurement_ui),
+    ("Analyze", "Interactions"):      ("Analyze — Interactions", interactions_ui),
+    ("Analyze", "Highlight"):         ("Analyze — Highlight", highlight_ui),
+    ("Analyze", "Summary"):           ("Analyze — Summary", structure_summary_ui),
+    ("Analyze", "Sequence"):          ("Analyze — Sequence", sequence_browser_ui),
+    ("Simulate", "MD · Amber"):       ("Simulate — MD — Amber", amber_ui),
+    ("Simulate", "MD · GROMACS"):     ("Simulate — MD — GROMACS", gromacs_ui),
+    ("Simulate", "MD · Rosetta"):     ("Simulate — MD — Rosetta", rosetta_ui),
+    ("Simulate", "QM"):               ("Simulate — QM", quantum_ui),
+    ("Simulate", "QM/MM"):            ("Simulate — QM/MM", oniom_ui),
+    ("Simulate", "Membrane"):         ("Simulate — Membrane", membrane_ui),
+}
+
+
+def _forget_toolbar_dialog() -> None:
+    st.session_state.toolbar_open = None
+
+
+@st.dialog("PARORA", width="large", on_dismiss=_forget_toolbar_dialog)
+def _toolbar_dialog() -> None:
+    """
+    The popup for whichever toolbar sub-option was just clicked.
+
+    `on_dismiss` matters here: the dialog's own "x", Escape and click-outside
+    all close it on the frontend only — by default nothing clears
+    `toolbar_open` server-side, so the *next* rerun for any reason at all
+    (even an unrelated button elsewhere on the page, like the light/dark
+    toggle) sees it still set and pops the same dialog back up.
+    """
+    title, render_fn = TOOLBAR_DISPATCH[st.session_state.toolbar_open]
+    st.subheader(title)
+    render_fn()
+    st.divider()
+    if st.button("Close", key="toolbar_dialog_close"):
+        _forget_toolbar_dialog()
+        st.rerun()
+
+
+def _tab_panel(pane: tuple, render_fn) -> None:
+    """
+    Render a tab's body, unless the toolbar dialog for that same pane is open.
+
+    Both entry points call the identical `*_ui()` function, and Streamlit
+    requires every widget key to be unique for the whole script run — calling
+    a panel's function twice in one run (once here, once inside the open
+    dialog) throws StreamlitDuplicateElementKey on its first hardcoded key.
+    Skipping the tab's copy while its dialog twin is open keeps both entry
+    points working without touching the widget keys inside every `*_ui()`.
+    """
+    if st.session_state.toolbar_open == pane:
+        st.caption("Open in the toolbar dialog above.")
+    else:
+        render_fn()
+
+
 with right:
     title_col, btn_col = st.columns([5, 1])
     with title_col:
@@ -9279,6 +9482,13 @@ with right:
             st.rerun()
 
     if structures():
+        # The Load/Prepare/Style/Analyze/Simulate menu now lives inside the
+        # viewer itself (build_ngl_html()'s #toolbar); it emits a "toolbar_open"
+        # event that handle_viewer_event() folds into toolbar_open below, so
+        # this dialog is the only piece of the old outer toolbar left here.
+        if st.session_state.toolbar_open:
+            _toolbar_dialog()
+
         # Reserve the viewer's slot now, but fill it at the end of this run:
         # the panels below mutate the structure registry and the representation
         # stack, and the viewer must be built from their post-edit state, not
@@ -9290,67 +9500,68 @@ with right:
         # that below a 700px viewer there was nothing on screen but headings —
         # a feature nobody scrolls to and expands is a feature that does not
         # exist.
-        st.divider()
-        # Five short labels, not eight with emoji. Streamlit scrolls a tab strip
-        # that overflows its column, behind arrows small enough to miss — which
-        # is exactly how "Interactions" and "Highlight" end up invisible on a
-        # 75%-width column. Everything is one click deep at most.
-        # Three groups rather than one long row: the things you do to a
-        # structure (load it, clean it, style it), the things you measure on
-        # it, and the calculations you set up from it. Every kind of
-        # calculation -- molecular dynamics, quantum, QM/MM, and the membrane
-        # a membrane protein needs before any of them -- lives under Simulate,
-        # so the top row stays short enough to read at a glance instead of
-        # scrolling behind arrows.
-        panels = st.tabs(["Load", "Prepare", "Style", "Analyze", "Simulate"])
-        with panels[0]:
-            loaded_tab, finder_tab = st.tabs(["Loaded", "Find by protein name"])
-            with loaded_tab:
-                structure_manager_ui()
-            with finder_tab:
-                protein_finder_ui()
-        with panels[1]:
-            prepare_ui()
-        with panels[2]:
-            style_tab, label_tab, render_tab = st.tabs(
-                ["Representations", "Labels", "Ray-traced figure"])
-            with style_tab:
-                representation_manager_ui()
-            with label_tab:
-                label_ui()
-            with render_tab:
-                render_ui()
-        with panels[3]:
-            measure_tab, inter_tab, highlight_tab, summary_tab, sequence_tab = st.tabs(
-                ["Measure", "Interactions", "Highlight", "Summary", "Sequence"])
-            with measure_tab:
-                measurement_ui()
-            with inter_tab:
-                interactions_ui()
-            with highlight_tab:
-                highlight_ui()
-            with summary_tab:
-                structure_summary_ui()
-            with sequence_tab:
-                sequence_browser_ui()
-        with panels[4]:
-            md_tab, qm_tab, qmmm_tab, membrane_tab = st.tabs(
-                ["MD", "QM", "QM/MM", "Membrane"])
-            with md_tab:
-                amber_tab, gromacs_tab, rosetta_tab = st.tabs(
-                    ["Amber", "GROMACS", "Rosetta"])
-                with amber_tab:
-                    amber_ui()
-                with gromacs_tab:
-                    gromacs_ui()
-                with rosetta_tab:
-                    rosetta_ui()
-            with qm_tab:
-                quantum_ui()
-            with qmmm_tab:
-                oniom_ui()
-            with membrane_tab:
-                membrane_ui()
+        if SHOW_LEGACY_TABS:
+            st.divider()
+            # Five short labels, not eight with emoji. Streamlit scrolls a tab strip
+            # that overflows its column, behind arrows small enough to miss — which
+            # is exactly how "Interactions" and "Highlight" end up invisible on a
+            # 75%-width column. Everything is one click deep at most.
+            # Three groups rather than one long row: the things you do to a
+            # structure (load it, clean it, style it), the things you measure on
+            # it, and the calculations you set up from it. Every kind of
+            # calculation -- molecular dynamics, quantum, QM/MM, and the membrane
+            # a membrane protein needs before any of them -- lives under Simulate,
+            # so the top row stays short enough to read at a glance instead of
+            # scrolling behind arrows.
+            panels = st.tabs(["Load", "Prepare", "Style", "Analyze", "Simulate"])
+            with panels[0]:
+                loaded_tab, finder_tab = st.tabs(["Loaded", "Find by protein name"])
+                with loaded_tab:
+                    _tab_panel(("Load", "Loaded"), structure_manager_ui)
+                with finder_tab:
+                    _tab_panel(("Load", "Find by protein name"), protein_finder_ui)
+            with panels[1]:
+                _tab_panel(("Prepare", None), prepare_ui)
+            with panels[2]:
+                style_tab, label_tab, render_tab = st.tabs(
+                    ["Representations", "Labels", "Ray-traced figure"])
+                with style_tab:
+                    _tab_panel(("Style", "Representations"), representation_manager_ui)
+                with label_tab:
+                    _tab_panel(("Style", "Labels"), label_ui)
+                with render_tab:
+                    _tab_panel(("Style", "Ray-traced figure"), render_ui)
+            with panels[3]:
+                measure_tab, inter_tab, highlight_tab, summary_tab, sequence_tab = st.tabs(
+                    ["Measure", "Interactions", "Highlight", "Summary", "Sequence"])
+                with measure_tab:
+                    _tab_panel(("Analyze", "Measure"), measurement_ui)
+                with inter_tab:
+                    _tab_panel(("Analyze", "Interactions"), interactions_ui)
+                with highlight_tab:
+                    _tab_panel(("Analyze", "Highlight"), highlight_ui)
+                with summary_tab:
+                    _tab_panel(("Analyze", "Summary"), structure_summary_ui)
+                with sequence_tab:
+                    _tab_panel(("Analyze", "Sequence"), sequence_browser_ui)
+            with panels[4]:
+                md_tab, qm_tab, qmmm_tab, membrane_tab = st.tabs(
+                    ["MD", "QM", "QM/MM", "Membrane"])
+                with md_tab:
+                    amber_tab, gromacs_tab, rosetta_tab = st.tabs(
+                        ["Amber", "GROMACS", "Rosetta"])
+                    with amber_tab:
+                        _tab_panel(("Simulate", "MD · Amber"), amber_ui)
+                    with gromacs_tab:
+                        _tab_panel(("Simulate", "MD · GROMACS"), gromacs_ui)
+                    with rosetta_tab:
+                        _tab_panel(("Simulate", "MD · Rosetta"), rosetta_ui)
+                with qm_tab:
+                    _tab_panel(("Simulate", "QM"), quantum_ui)
+                with qmmm_tab:
+                    _tab_panel(("Simulate", "QM/MM"), oniom_ui)
+                with membrane_tab:
+                    _tab_panel(("Simulate", "Membrane"), membrane_ui)
 
         with viewer_slot:
             # Mounted as a declared component so the toolbar's pen and style

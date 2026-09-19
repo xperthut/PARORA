@@ -3,6 +3,7 @@ uvicorn[standard]
 streamlit
 watchdog   # lets Streamlit use OS file-change events instead of polling for --server.runOnSave
 ollama
+pyyaml   # parses config.yaml (parora_config.py), shared by all three entry points
 rcsb-api
 requests
 MDAnalysis

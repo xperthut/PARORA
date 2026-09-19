@@ -26,6 +26,7 @@ from ollama import Client
 from rcsbapi.search import TextQuery
 
 from parora_logging import setup_logging
+from parora_config import get_config
 
 log = setup_logging("server")
 
@@ -39,9 +40,12 @@ if _LOGO_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(_LOGO_DIR)), name="static")
 templates = Jinja2Templates(directory=str(_HERE / "templates"))
 
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+_CFG = get_config("server")
+OLLAMA_HOST = _CFG["ollama_host"]
+MODEL = _CFG["model"]
+OLLAMA_OPTIONS = {"temperature": _CFG["temperature"], "num_ctx": _CFG["num_ctx"]}
+KEEP_ALIVE = _CFG["keep_alive"]
 ollama_client = Client(host=OLLAMA_HOST)
-MODEL = "qwen2.5:7b"
 
 log.info("PARORA server.py starting -- model=%s ollama_host=%s", MODEL, OLLAMA_HOST)
 
@@ -305,7 +309,8 @@ def run_agent_stream(prompt: str):
     log.info("Chat request: %r", prompt)
     try:
         response = ollama_client.chat(
-            model=MODEL, messages=messages, tools=TOOLS, options={"temperature": 0.0}
+            model=MODEL, messages=messages, tools=TOOLS,
+            options=OLLAMA_OPTIONS, keep_alive=KEEP_ALIVE
         )
     except ConnectionError:
         err = f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama with `ollama serve`."

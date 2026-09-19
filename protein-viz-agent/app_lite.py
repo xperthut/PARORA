@@ -13,7 +13,6 @@
 
 import re
 import streamlit as st
-import os
 import json
 import logging
 from pathlib import Path
@@ -21,6 +20,7 @@ from ollama import Client
 from rcsbapi.search import TextQuery
 
 from parora_logging import setup_logging
+from parora_config import get_config
 
 log = setup_logging("app_lite")
 
@@ -60,10 +60,10 @@ st.markdown(
 
 st.divider()
 
-# ── Ollama host resolution: prefer env var, fall back to Docker bridge ────────
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-if os.path.exists("/.dockerenv"):
-    OLLAMA_HOST = "http://host.docker.internal:11434"
+# ── Model + Ollama host: driven by config.yaml, env vars still win ────────────
+_CFG = get_config("app_lite")
+OLLAMA_HOST = _CFG["ollama_host"]
+model = _CFG["model"]
 ollama_client = Client(host=OLLAMA_HOST)
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -77,8 +77,6 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
-model = "llama3.2:latest"
 
 
 @st.cache_resource(show_spinner=False)
@@ -277,7 +275,8 @@ def run_agent(prompt: str) -> str:
             model=model,
             messages=messages,
             tools=tools,
-            options={"temperature": 0.0}
+            options={"temperature": _CFG["temperature"], "num_ctx": _CFG["num_ctx"]},
+            keep_alive=_CFG["keep_alive"],
         )
     except ConnectionError:
         err = f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama with `ollama serve`."

@@ -117,6 +117,7 @@ import membrane as mem
 import Protein_accession as pacc
 
 from parora_logging import setup_logging
+from parora_config import get_config
 
 log = setup_logging("app")
 
@@ -124,24 +125,22 @@ st.set_page_config(page_title="Molecular Agent", layout="wide")
 st.title("Molecular Agent")
 st.caption("Natural language → Tool-calling agent → Analyze and visualize molecular structures")
 
-# ── Ollama host resolution: prefer env var, fall back to Docker bridge ────────
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-if os.path.exists("/.dockerenv"):
-    OLLAMA_HOST = "http://host.docker.internal:11434"
-ollama_client = Client(host=OLLAMA_HOST)
-MODEL = "llama3.2:latest"
+# ── Model + Ollama host: driven by config.yaml, env vars still win ────────────
+_CFG = get_config("app")
+OLLAMA_HOST = _CFG["ollama_host"]
+MODEL = _CFG["model"]
 
 # Ollama allocates a KV cache for the whole context it is given, and when
-# num_ctx is left unset it uses the model's full trained window — 131,072 for
-# llama3.2. That is ~15 GB of cache for a model with 2 GB of weights, which on
-# a laptop means swapping, and one chat turn taking minutes. 16k is far more
-# than a turn of this app ever uses and costs well under 2 GB.
-NUM_CTX = int(os.environ.get("PARORA_NUM_CTX", "16384"))
-OLLAMA_OPTIONS = {"temperature": 0.0, "num_ctx": NUM_CTX}
+# num_ctx is left unset it uses the model's full trained window (32,768 for
+# qwen2.5:7b). config.yaml's default of 16k is still far more than a turn of
+# this app ever uses and keeps the KV cache modest on top of the model's
+# quantized weights.
+OLLAMA_OPTIONS = {"temperature": _CFG["temperature"], "num_ctx": _CFG["num_ctx"]}
 
 # Hold the model in memory between messages, so a pause in the conversation
 # does not cost a reload from disk on the next one.
-KEEP_ALIVE = os.environ.get("PARORA_KEEP_ALIVE", "30m")
+KEEP_ALIVE = _CFG["keep_alive"]
+ollama_client = Client(host=OLLAMA_HOST)
 
 
 @st.cache_resource(show_spinner=False)
@@ -4559,16 +4558,6 @@ TOOL_GROUPS = {
 # Always offered: orientation, and the escape hatches for a misrouted message.
 CORE_TOOLS = {"describe_structure", "list_structures", "select", "show", "color"}
 
-# Tools whose return string is already the answer a human wants to read. When
-# the model calls exactly one of these and nothing else, the loop returns that
-# text instead of spending a second round trip asking the model to restate it.
-SELF_SUFFICIENT = {
-    "describe_structure", "list_structures", "inspect_preparation", "list_labels",
-    "measure_distance", "measure_angle", "measure_dihedral", "find_contacts",
-    "find_interactions", "find_protein", "protein_structures", "membrane_status",
-}
-
-
 def _route_tools(prompt_lower: str):
     """
     The tool schemas worth sending for this message.
@@ -4626,22 +4615,6 @@ def _tc_args(tc: dict) -> dict:
         except Exception:
             return {}
     return {}
-
-
-TERMINAL_TOOLS = {
-    "summarize_chains",
-    "list_residues",
-    "bfactor_summary",
-    "measure_mda_distance",
-    "measure_mda_angle",
-    "measure_mda_dihedral",
-    "select_within",
-    "nearby_residues",
-    "detect_contacts",
-    "detect_hydrogen_bonds",
-    "detect_salt_bridges",
-}
-
 
 
 # ============================================================
@@ -5251,12 +5224,10 @@ def run_agent(user_prompt: str) -> str:
         and not any(w in prompt_lower for w in {"save", "write", "load", "fetch", "download"})
     )
 
-    # Each turn is a full round trip to the model. With the routed tool list
-    # and the direct return above, a single-tool request now costs one turn and
-    # a load-then-style request two; 12 only ever bought runs that had already
-    # gone wrong. Back to 8, which is still generous for a real multi-step task.
+    # Each turn is a full round trip to the model: one to pick tools, one more
+    # to read their results and either summarize or call more. A single-tool
+    # request now costs two turns and a load-then-style request four.
     MAX_TURNS = 8
-    answered_with: list[str] = []          # tools that have already run this message
     summary_parts = []
     called_sigs: set[str] = set()          # Tracks (name, args) pairs to avoid exact repeats
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight
@@ -5420,36 +5391,7 @@ def run_agent(user_prompt: str) -> str:
             summary_parts.append(f"{name}: {result}")
             tool_results.append({"tool": name, "result": result})
 
-        # Terminal analysis tools complete the user's requested operation.
-        # Do not send their results back to the LLM for another reasoning turn,
-        # because that can trigger speculative or unrelated follow-up calls.
-        terminal_results = [
-            item for item in tool_results
-            if item["tool"] in TERMINAL_TOOLS
-        ]
-        if terminal_results:
-            terminal_names = ", ".join(item["tool"] for item in terminal_results)
-            _log(
-                f"🛑 Terminal tool completed ({terminal_names}) — ending agent loop"
-            )
-            return "Done: " + "; ".join(summary_parts)
-
         results_text = "\n".join(f"[{r['tool']}]: {r['result']}" for r in tool_results)
-
-        # One read-only tool, nothing before it, and it came back clean: its
-        # report *is* the answer. Going back to the model to have it restated
-        # doubles the cost of the commonest kind of request — "what ligands are
-        # in this", "how far is X from Y" — and usually makes it worse, since a
-        # 3B model paraphrasing a table tends to drop or invent numbers.
-        if (len(tool_results) == 1 and not answered_with
-                and tool_results[0]["tool"] in SELF_SUFFICIENT):
-            only = tool_results[0]["result"]
-            if not only.lower().startswith(("error", "blocked", "tool error")):
-                _log(
-                    f"⏎ Returned {tool_results[0]['tool']} directly — no summary turn")
-                return only
-
-        answered_with.extend(r["tool"] for r in tool_results)
 
         # Append tool results to the conversation. The system message is left
         # alone; the refreshed scene rides along with the results instead.

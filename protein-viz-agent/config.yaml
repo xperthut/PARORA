@@ -1,0 +1,35 @@
+# PARORA local-model configuration.
+#
+# Every entry point (server.py, app_lite.py, app.py) reads this through
+# parora_config.py instead of hardcoding a model name. Change the model an
+# entry point drives by editing its line below -- no code change needed.
+#
+# Environment variables still win over this file when set, matching every
+# other override already in this repo (see CLAUDE.md):
+#   OLLAMA_HOST         -- Ollama server address (all entry points)
+#   PARORA_TEMPERATURE  -- sampling temperature (all entry points)
+#   PARORA_NUM_CTX      -- context window tokens (all entry points)
+#   PARORA_KEEP_ALIVE   -- how long Ollama keeps the model loaded (all entry points)
+#   PARORA_MODEL_SERVER / PARORA_MODEL_APP_LITE / PARORA_MODEL_APP
+#                       -- per-entry-point model override
+#
+# This project runs local models only (see CLAUDE.md: "No cloud API keys --
+# inference runs on-device"). A model name here must already be pulled --
+# check with `ollama list`, pull with `ollama pull <name>` (see ollama.sh)
+# -- or the entry point will fail to reach it at chat time.
+
+ollama_host: http://localhost:11434
+
+defaults:
+  temperature: 0.0
+  num_ctx: 16384
+  keep_alive: 30m
+
+server:
+  model: qwen2.5:7b
+
+app_lite:
+  model: llama3.2:latest
+
+app:
+  model: qwen2.5:7b

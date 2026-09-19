@@ -5177,7 +5177,7 @@ def run_agent(user_prompt: str) -> str:
         {"role": "user", "content": f"{_state_block()}\n\n{user_prompt}"}
     ]
 
-    active_tools, tools_are_subset = _route_tools(prompt_lower)
+    active_tools, tools_are_subset = TOOLS, False
     _log(
         f"🧰 {len(active_tools)}/{len(TOOLS)} tool schemas sent")
 

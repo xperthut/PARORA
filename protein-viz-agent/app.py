@@ -5227,7 +5227,7 @@ def run_agent(user_prompt: str) -> str:
     # Each turn is a full round trip to the model: one to pick tools, one more
     # to read their results and either summarize or call more. A single-tool
     # request now costs two turns and a load-then-style request four.
-    MAX_TURNS = 8
+    MAX_TURNS = 16
     summary_parts = []
     called_sigs: set[str] = set()          # Tracks (name, args) pairs to avoid exact repeats
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight

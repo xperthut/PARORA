@@ -118,6 +118,7 @@ import Protein_accession as pacc
 
 from parora_logging import setup_logging
 from parora_config import get_config
+from rag_grounding import format_grounding
 
 log = setup_logging("app")
 
@@ -4628,7 +4629,6 @@ def _tc_args(tc: dict) -> dict:
 # This function is intentionally narrow so unrelated PARORA functions
 # continue through the original LLM/tool-calling pathway unchanged.
 def handle_deterministic_workflow(user_prompt):
-    import inspect
     import re
 
     prompt = str(user_prompt or "").strip()
@@ -4637,201 +4637,14 @@ def handle_deterministic_workflow(user_prompt):
     if not prompt:
         return None
 
-    def _result_failed(result):
-        result_lower = str(result).lower()
-        return any(
-            token in result_lower
-            for token in (
-                "error",
-                "failed",
-                "failure",
-                "not found",
-                "could not load",
-                "unable to load",
-            )
-        )
-
-    def _show_chain_compat(representation, chain):
-        """
-        Call the existing tool_show function without forcing one exact
-        parameter naming convention.
-        """
-        selection = f"chain {chain}"
-
-        try:
-            params = inspect.signature(tool_show).parameters
-        except (TypeError, ValueError):
-            params = {}
-
-        kwargs = {}
-
-        if "rep_type" in params:
-            kwargs["rep_type"] = representation
-        elif "representation" in params:
-            kwargs["representation"] = representation
-        elif "style" in params:
-            kwargs["style"] = representation
-        elif "representation_type" in params:
-            kwargs["representation_type"] = representation
-
-        if "selection" in params:
-            kwargs["selection"] = selection
-        elif "target_selection" in params:
-            kwargs["target_selection"] = selection
-        elif "expression" in params:
-            kwargs["expression"] = selection
-
-        if "color" in params:
-            kwargs["color"] = "element"
-
-        # Prefer keyword arguments when the local signature is identifiable.
-        if kwargs and (
-            any(
-                key in kwargs
-                for key in (
-                    "rep_type",
-                    "representation",
-                    "style",
-                    "representation_type",
-                )
-            )
-            and any(
-                key in kwargs
-                for key in (
-                    "selection",
-                    "target_selection",
-                    "expression",
-                )
-            )
-        ):
-            return tool_show(**kwargs)
-
-        # Conservative positional fallbacks for older local implementations.
-        try:
-            return tool_show(representation, selection)
-        except TypeError:
-            return tool_show(representation, selection, "element")
-
-    # --------------------------------------------------------
-    # Workflow 1:
-    # Load structure -> summarize chains -> visualize one chain
-    # --------------------------------------------------------
-    #
-    # Example:
-    # Load PDB 3PP0, summarize its chains, and show chain A
-    # as ball and stick.
-    pdb_match = re.search(
-        r"\b(?:load|fetch|open)\s+(?:pdb\s+)?([0-9][A-Za-z0-9]{3})\b",
-        prompt,
-        flags=re.IGNORECASE,
-    )
-
-    chain_match = re.search(
-        r"\bchain\s+([A-Za-z0-9]+)\b",
-        prompt,
-        flags=re.IGNORECASE,
-    )
-
-    asks_for_summary = (
-        "chain" in prompt_lower
-        and any(
-            phrase in prompt_lower
-            for phrase in (
-                "summarize",
-                "summary",
-                "describe the chains",
-                "list the chains",
-            )
-        )
-    )
-
-    asks_for_display = (
-        "chain" in prompt_lower
-        and any(
-            word in prompt_lower
-            for word in (
-                "show",
-                "display",
-                "render",
-                "visualize",
-            )
-        )
-    )
-
-    representation_match = re.search(
-        r"\b(?:as|in)\s+"
-        r"(ball(?:\s*(?:and|\+)\s*stick)|cartoon|surface|"
-        r"spacefill|ribbon|licorice|line|point)\b",
-        prompt,
-        flags=re.IGNORECASE,
-    )
-
-    if (
-        pdb_match
-        and chain_match
-        and asks_for_summary
-        and asks_for_display
-    ):
-        pdb_id = pdb_match.group(1).upper()
-        chain = chain_match.group(1).upper()
-
-        requested_representation = (
-            representation_match.group(1).lower()
-            if representation_match
-            else "cartoon"
-        )
-
-        representation_aliases = {
-            "ball and stick": "ball+stick",
-            "ball+stick": "ball+stick",
-            "ball  and  stick": "ball+stick",
-            "licorice": "ball+stick",
-            "ribbon": "cartoon",
-        }
-
-        representation = representation_aliases.get(
-            requested_representation,
-            requested_representation,
-        )
-
-        try:
-            load_result = tool_fetch_structure(pdb_id)
-        except Exception as exc:
-            return (
-                f"Structure loading failed for {pdb_id}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        if _result_failed(load_result):
-            return str(load_result)
-
-        try:
-            summary_result = tool_summarize_chains()
-        except Exception as exc:
-            return (
-                f"{load_result}\n\n"
-                f"The structure loaded, but chain summarization failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        try:
-            show_result = _show_chain_compat(
-                representation=representation,
-                chain=chain,
-            )
-        except Exception as exc:
-            return (
-                f"{load_result}\n\n"
-                f"{summary_result}\n\n"
-                f"The analysis completed, but chain visualization failed: "
-                f"{type(exc).__name__}: {exc}"
-            )
-
-        return (
-            f"{load_result}\n\n"
-            f"{summary_result}\n\n"
-            f"{show_result}"
-        )
+    # Workflow 1 (load structure -> summarize chains -> visualize one
+    # chain) used to live here as hard-coded regex + a tool_show
+    # compatibility shim (P4 in todo.txt). Retired: with the workflow
+    # disabled, qwen2.5:7b + the full tool schema list correctly sequences
+    # fetch_structure -> summarize_chains -> show on its own, and even
+    # handles a nonexistent chain better than the old code did (says so,
+    # instead of calling tool_show blindly with no such check) — verified
+    # against real Ollama before removal.
 
     # --------------------------------------------------------
     # Workflow 2:
@@ -5094,18 +4907,21 @@ def run_agent(user_prompt: str) -> str:
     # ------------------------------------------------------------
     # Stage 1A lightweight intent validation
     # ------------------------------------------------------------
-
-    if "angle" in prompt_lower and "dihedral" not in prompt_lower:
-        residue_numbers = re.findall(r"\b\d+\b", user_prompt)
-
-        if len(residue_numbers) < 3:
-            return (
-                "I need three atoms or residues to measure an angle. "
-                "For example: "
-                "'Measure the angle formed by the CA atoms of residues "
-                "50, 51, and 52 in chain A.'"
-            )
-
+    # The angle atom-count check, the sel1=/sel2= MDAnalysis-distance
+    # shortcut, and the salt-bridge shortcut used to live here as hard-coded
+    # regex (P4 in todo.txt). They're retired in favor of retrieved few-shot
+    # grounding (rag_grounding.py) showing the model the same cases —
+    # verified against the real qwen2.5:7b + full tool schemas before removal:
+    # given an ambiguous 2-residue "angle between X and Y" prompt, the model
+    # consistently asks for the missing vertex instead of inventing one.
+    #
+    # The dihedral atom-count check stays, unlike its angle counterpart:
+    # the same test showed qwen2.5:7b reliably invents the two missing
+    # residues for an underspecified "dihedral between X and Y" prompt
+    # (e.g. treating "between 5 and 8" as the range 5,6,7,8) and reports a
+    # confident-sounding but fabricated angle, even with an exact-match
+    # grounding example present. Revisit only with evidence this stops
+    # happening — a hallucinated number is worse than a blocked call.
     if "dihedral" in prompt_lower:
         residue_numbers = re.findall(r"\b\d+\b", user_prompt)
 
@@ -5115,6 +4931,17 @@ def run_agent(user_prompt: str) -> str:
                 "Please specify the four atoms or residues."
             )
 
+    # Kept, with evidence (P4 in todo.txt): tested removing this in favor of
+    # the system prompt + RAG grounding (rag_grounding.py has two stability
+    # examples) alone. Most phrasings degraded gracefully, but "what's the
+    # folding stability of this protein" made qwen2.5:7b tally salt
+    # bridges/H-bonds/disulfides via find_interactions and conclude "1CRN
+    # appears structurally robust" — exactly the overconfident static-
+    # structure stability verdict this message exists to prevent, its own
+    # hedge about needing MD simulations notwithstanding. A single bad
+    # phrasing producing a false claim of assessed stability is worse than
+    # every phrasing correctly triggering a hard-coded refusal, so this
+    # stays a keyword gate rather than a prompt-only rule.
     if any(x in prompt_lower for x in (
         "stable",
         "stability",
@@ -5131,50 +4958,15 @@ def run_agent(user_prompt: str) -> str:
             "simulation."
         )
 
-    # Direct deterministic route for explicit MDAnalysis distance prompts
-    if "sel1=" in prompt_lower and "sel2=" in prompt_lower:
-        m1 = re.search(r"sel1=['\"]([^'\"]+)['\"]", user_prompt)
-        m2 = re.search(r"sel2=['\"]([^'\"]+)['\"]", user_prompt)
-
-        if m1 and m2:
-            sel1 = m1.group(1)
-            sel2 = m2.group(1)
-
-            results = []
-            if st.session_state.pdb_id is None:
-                pdb_match = re.search(r"\b([0-9][A-Za-z0-9]{3})\b", user_prompt)
-                if pdb_match:
-                    results.append(tool_fetch_structure(pdb_match.group(1)))
-
-            results.append(tool_measure_mda_distance(sel1, sel2))
-            return "Done: " + "; ".join(results)
-
-    if "salt bridge" in prompt_lower or "salt bridges" in prompt_lower:
-        results = []
-        if st.session_state.pdb_id is None:
-            pdb_match = re.search(r"\b([0-9][A-Za-z0-9]{3})\b", user_prompt)
-            if pdb_match:
-                results.append(tool_fetch_structure(pdb_match.group(1)))
-        chain_match = re.search(
-            r"\bchain\s+([A-Za-z0-9]+)\b",
-            user_prompt,
-            flags=re.IGNORECASE,
-        )
-        requested_chain = (
-            chain_match.group(1).upper()
-            if chain_match
-            else ""
-        )
-        results.append(
-            tool_detect_salt_bridges(chain=requested_chain)
-        )
-        return "Done: " + "; ".join(results)
-
     # The system message is built once and never touched again — see
-    # _state_block() for why that matters to the prefill cost.
+    # _state_block() for why that matters to the prefill cost. Retrieved
+    # few-shot grounding (rag_grounding.py) rides in the volatile user
+    # message alongside the scene state, same reasoning as _state_block().
+    grounding = format_grounding(user_prompt)
+    grounding_block = f"{grounding}\n\n" if grounding else ""
     messages = [
         {"role": "system", "content": _system_prompt()},
-        {"role": "user", "content": f"{_state_block()}\n\n{user_prompt}"}
+        {"role": "user", "content": f"{_state_block()}\n\n{grounding_block}{user_prompt}"}
     ]
 
     active_tools, tools_are_subset = TOOLS, False

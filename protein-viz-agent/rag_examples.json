@@ -1,0 +1,102 @@
+[
+  {
+    "prompt": "measure the angle formed by the CA atoms of residues 50, 51, and 52 in chain A",
+    "grounding": "Call measure_angle(a='A/50', b='A/51', c='A/52') — exactly three residues named, the middle one (51) is the vertex. Use the same chain/residue spec syntax for all three."
+  },
+  {
+    "prompt": "what angle do residues 12 and 40 make",
+    "grounding": "Only two residues are named but an angle needs three (a vertex plus two others). Do not call measure_angle or invent a third residue — ask the user which residue is the vertex, or for the missing third point."
+  },
+  {
+    "prompt": "measure the angle between residues 20 and 30",
+    "grounding": "Only two residues are named but an angle needs three (a vertex plus two others). Do not call measure_angle or invent a third residue — ask the user for the missing vertex/third residue instead."
+  },
+  {
+    "prompt": "measure the angle at residue 88",
+    "grounding": "Only one residue is named but an angle needs three points. Ask for the other two residues instead of calling measure_angle."
+  },
+  {
+    "prompt": "measure the dihedral angle through residues 10, 11, 12 and 13",
+    "grounding": "Call measure_dihedral(a='10', b='11', c='12', d='13') — four residues in order along the torsion axis."
+  },
+  {
+    "prompt": "what's the phi angle for residue 57",
+    "grounding": "Phi is a dihedral and needs four atoms even though only one residue number was given: call measure_dihedral(a='56.C', b='57.N', c='57.CA', d='57.C') — phi runs from the previous residue's carbonyl carbon through the current residue's N, CA, C."
+  },
+  {
+    "prompt": "measure the dihedral between residues 5 and 8",
+    "grounding": "Only two residues are named but a dihedral needs four atoms/points. Ask the user for the remaining two instead of guessing them."
+  },
+  {
+    "prompt": "detect salt bridges in chain B",
+    "grounding": "Call detect_salt_bridges(chain='B') — the user named an explicit chain, so scope the search to it rather than the whole structure."
+  },
+  {
+    "prompt": "are there any salt bridges in this structure",
+    "grounding": "Call detect_salt_bridges() with no chain argument — no chain was named, so search the whole loaded structure."
+  },
+  {
+    "prompt": "find salt bridges between chain A and chain A only",
+    "grounding": "Call detect_salt_bridges(chain='A') — both interacting residues must belong to the named chain."
+  },
+  {
+    "prompt": "measure the distance between sel1='segid A and resid 50 and name CA' and sel2='segid A and resid 88 and name CA'",
+    "grounding": "The user gave exact MDAnalysis selection syntax with sel1=/sel2=. Call measure_mda_distance(sel1='segid A and resid 50 and name CA', sel2='segid A and resid 88 and name CA') verbatim — do not reinterpret or simplify the selections."
+  },
+  {
+    "prompt": "distance between sel1=\"resname ATP\" and sel2=\"resid 120\"",
+    "grounding": "Explicit sel1=/sel2= syntax again — pass the two strings through unchanged to measure_mda_distance(sel1=..., sel2=...) rather than converting them to the simpler residue-spec syntax measure_distance expects."
+  },
+  {
+    "prompt": "how far apart are residues 10 and 50",
+    "grounding": "Plain residue numbers with no explicit MDAnalysis syntax and no chain given: call measure_distance(a='10', b='50') — the simpler residue-spec tool, not measure_mda_distance."
+  },
+  {
+    "prompt": "distance from A/12 to ARG88",
+    "grounding": "Residue specs come in different written forms — call measure_distance(a='A/12', b='ARG88') exactly as given; the residue-spec parser accepts 'A/12', 'ARG12' and '12.CA' forms without needing them normalized first."
+  },
+  {
+    "prompt": "distance between the CA of residue 40 and the ligand ATP",
+    "grounding": "Call measure_distance(a='40.CA', b='ATP') — a specific atom on one side ('40.CA') and a ligand code on the other are both valid residue-spec forms for measure_distance."
+  },
+  {
+    "prompt": "is this protein stable",
+    "grounding": "Protein stability cannot be determined from a single static PDB structure. Do not call a tool for this — explain that stability needs molecular dynamics, free-energy calculations, or experiments, and offer structural contacts, salt bridges, hydrogen bonds, or B-factor analysis instead."
+  },
+  {
+    "prompt": "will this protein fold correctly",
+    "grounding": "Folding/stability questions are not answerable from a static structure alone. Do not call a tool — explain the limitation and offer the structural analyses that are available instead (contacts, salt bridges, H-bonds, B-factors, or preparing the structure for simulation)."
+  },
+  {
+    "prompt": "what ligands are in 1CRN",
+    "grounding": "Call fetch_structure(pdb_id='1CRN') first if 1CRN is not already loaded, then describe_structure(target='1CRN') to report ligands/non-standard residues."
+  },
+  {
+    "prompt": "load 1CRN, remove solvent, then show cartoon colored by chain",
+    "grounding": "Three steps in order: fetch_structure(pdb_id='1CRN'), then remove_solvent(), then show(rep_type='cartoon', selection='chain', color='chainindex')."
+  },
+  {
+    "prompt": "hide everything",
+    "grounding": "The user explicitly asked to hide/clear the scene — call hide_all()."
+  },
+  {
+    "prompt": "find the hidden binding pocket",
+    "grounding": "This is an analysis request, not a request to hide anything — 'hidden' describes the pocket, not an instruction. Do not call hide or hide_all; call find_contacts or find_interactions to locate the pocket instead."
+  },
+  {
+    "prompt": "what structures are there for TP53",
+    "grounding": "Call find_protein(name='TP53') — the user is asking what structures exist, not asking to load one."
+  },
+  {
+    "prompt": "load the human insulin receptor",
+    "grounding": "Call load_protein(name='insulin receptor', organism='human') — a protein named in words, not a 4-character PDB id, so load_protein picks the best structure automatically rather than fetch_structure."
+  },
+  {
+    "prompt": "make color red",
+    "grounding": "Call color(color='red', selection='protein') when no selection is named — default to the whole protein."
+  },
+  {
+    "prompt": "what is the distance between label A and B in this protein chain",
+    "grounding": "Named labels refer to selections already made in this session — call list_labels() first to resolve what 'A' and 'B' refer to before measuring a distance between them."
+  }
+]

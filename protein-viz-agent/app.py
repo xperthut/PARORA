@@ -804,6 +804,44 @@ def tool_protein_structures(name: str = "", method: str = "",
     return "\n".join(out)
 
 
+def tool_protein_function(name: str = "") -> str:
+    """
+    Report a protein's biological role from UniProt's curated annotation.
+
+    Answers "what does X do", "what is X's function", "what does X interact
+    with" — biological role, not structure composition (that's
+    describe_structure) and not structure availability (that's
+    find_protein). Uses the FUNCTION and SUBUNIT comments UniProt curators
+    wrote for this entry; never invents a role from the protein's name.
+
+    Args:
+        name: Protein name, gene symbol or UniProt accession. Empty reuses
+              the last lookup, so this can follow a find_protein call
+              without re-naming the protein.
+
+    Returns:
+        The FUNCTION and SUBUNIT text UniProt has on file, or a plain
+        statement that UniProt has no function annotation for this entry —
+        never a guess assembled from the name alone.
+    """
+    prof = st.session_state.protein_profile
+    if name or prof is None:
+        prof, err = resolve_protein(name or st.session_state.protein_query)
+        if err:
+            return err
+    lines = [f"{prof['protein_name']} ({prof['accession']})"]
+    if prof["function"]:
+        lines.append("Function: " + prof["function"])
+    if prof["subunit"]:
+        lines.append("Subunit structure: " + prof["subunit"])
+    if not prof["function"] and not prof["subunit"]:
+        lines.append(
+            "UniProt has no curated function or subunit annotation for this "
+            "entry — this protein may be uncharacterized or under-studied."
+        )
+    return "\n".join(lines)
+
+
 def tool_load_protein(name: str, organism: str = "human", prefer: str = "balanced",
                       method: str = "") -> str:
     """
@@ -3539,6 +3577,23 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "protein_function",
+            "description": (
+                "Report a protein's biological role from UniProt's curated FUNCTION "
+                "and SUBUNIT annotation — 'what does X do', 'what is the function of X', "
+                "'what does X interact with', 'what is its subunit structure'. This is "
+                "biological role, not structure composition (use describe_structure for "
+                "ligands/chains/residues) and not structure availability (use "
+                "find_protein for what depositions exist). Report exactly what UniProt "
+                "says; never invent a function from the protein's name alone."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Protein name or accession; empty reuses the last lookup"}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "load_protein",
             "description": (
                 "Load the best PDB structure of a protein named in words, when the user "
@@ -4308,6 +4363,7 @@ TOOL_DISPATCH = {
     "protein_structures": lambda a: tool_protein_structures(
         a.get("name", ""), a.get("method", ""), a.get("max_resolution", 0.0),
         bool(a.get("ligands_only", False)), a.get("limit", 10)),
+    "protein_function":  lambda a: tool_protein_function(a.get("name", "") or a.get("protein", "")),
     "load_protein":      lambda a: tool_load_protein(a.get("name", "") or a.get("protein", ""),
                                                      a.get("organism", "human"),
                                                      a.get("prefer", "balanced"),
@@ -4412,6 +4468,13 @@ def _system_prompt() -> str:
         "   same way UniProt does. If the user asks about residues the loaded entry does "
         "   not cover, say what it does cover and stop — never silently shift the range "
         "   or select a different stretch instead. "
+        "0a3. Biological role — 'what does X do', 'what is the function of X', 'what "
+        "   does X interact with', 'what is its subunit structure' → ONE `protein_function` "
+        "   call. This is UniProt's curated FUNCTION/SUBUNIT text, not structure data — "
+        "   do NOT answer these from describe_structure (that reports composition: "
+        "   ligands, chains, residues, not biological role) and do NOT invent a function "
+        "   from the protein's name or general knowledge. If `protein_function` reports no "
+        "   annotation on file, say so; do not fill the gap with a guess. "
         "0d2. Preparing a structure — 'keep only one state', 'remove the other "
         "   models', 'this NMR structure has 20 states', 'clean it up', 'add "
         "   hydrogens', 'get it ready for Amber / Rosetta / simulation' → ONE "

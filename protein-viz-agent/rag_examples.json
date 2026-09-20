@@ -1,5 +1,13 @@
 [
   {
+    "prompt": "highlight residue 20",
+    "grounding": "Call select(name='residue_20', expression='resi 20') or highlight(target='20') using the exact residue number from this prompt — do not reuse a number from any other example."
+  },
+  {
+    "prompt": "select the ligand and color it red",
+    "grounding": "Call select(name='ligand', expression='ligand'), then color(color='red', selection='ligand')."
+  },
+  {
     "prompt": "measure the angle formed by the CA atoms of residues 50, 51, and 52 in chain A",
     "grounding": "Call measure_angle(a='A/50', b='A/51', c='A/52') — exactly three residues named, the middle one (51) is the vertex. Use the same chain/residue spec syntax for all three."
   },

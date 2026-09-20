@@ -4436,7 +4436,7 @@ def _system_prompt() -> str:
         "   description, answer in one or two sentences drawn from the brief report — do "
         "   not paste the whole thing back. "
         "0c. Measurements — 'distance between residue 1 and 5', 'how far is X from Y', "
-        "   'what contacts the ligand', 'angle at residue 57' — are answered by "
+        "   'what contacts the ligand', 'angle at residue 133' — are answered by "
         "   `measure_distance`, `find_contacts`, `measure_angle` or `measure_dihedral`. Pass the residues "
         "   through exactly as the user wrote them ('12', 'A/12', 'ARG12', 'BEN'); the "
         "   tool understands those spellings. Never compute or estimate a distance "
@@ -4977,43 +4977,18 @@ def run_agent(user_prompt: str) -> str:
     DESTRUCTIVE_TOOLS = {"hide_all", "hide"}
     hide_requested = any(w in prompt_lower for w in {"hide", "clear", "remove", "delete", "clean", "erase", "reset"})
 
-    # Gate: load/search tools only when the user is actually asking for a structure.
-    # "find", "get", "open" and "show me" introduce an analysis of what is already
-    # open at least as often as they introduce a search — "find residues 1-500",
-    # "get the contacts" — and letting those re-run the protein lookup is how the
-    # working context gets thrown away mid-analysis. So the weak verbs count as a
-    # load only when what follows them is not something the open structure contains.
-    LOAD_TOOLS = {"fetch_structure", "load_local", "load_protein"}
-    HARD_LOAD = r"\b(?:load|fetch|download|reload|re-load)\b"
-    WEAK_LOAD = r"\b(?:open|get|show me|find|search for|look up|look for)\b"
-    ANALYSIS_OBJECT = (r"residues?|resid|atoms?|chains?|contacts?|interactions?|"
-                       r"distances?|angles?|dihedrals?|ligands?|waters?|cofactors?|"
-                       r"h-?bonds?|hydrogen bonds?|salt bridges?|disulfides?|clashes|"
-                       r"pockets?|hotspots?|sequence|secondary structure|"
-                       r"(?:binding |active )?site|surface|composition")
-    # Asking what exists for a protein is a lookup however it is phrased —
-    # "what structures are there for TP53" carries no load verb at all. Plural
-    # only, so "the secondary structure of chain A" is not mistaken for one.
-    NEW_SUBJECT = r"\b(?:structures|entries|depositions)\b[^.?]{0,24}?\b(?:of|for)\b"
-    analysis_sense = re.search(
-        rf"{WEAK_LOAD}\s+(?:me\s+|the\s+|all\s+|any\s+|its\s+|every\s+)*"
-        rf"(?:{ANALYSIS_OBJECT})\b", prompt_lower)
-    load_requested = (
-        st.session_state.pdb_id is None
-        or bool(re.search(HARD_LOAD, prompt_lower))
-        or bool(re.search(NEW_SUBJECT, prompt_lower))
-        or (bool(re.search(WEAK_LOAD, prompt_lower)) and not analysis_sense)
-    )
-
     # Gate: write/side-effect tools only when explicitly requested by the user
     WRITE_TOOLS = {"save_structure", "remove_solvent", "align_structures"}
-    write_requested = any(w in prompt_lower for w in {"save", "write", "align", "remove solvent", "remove water", "no water"})
-
-    # Intent: purely a representation command → block all select calls for the entire run
-    show_only_intent = (
-        any(w in prompt_lower for w in {"show", "display", "render", "visualize", "view"})
-        and not any(w in prompt_lower for w in {"select", "highlight", "find", "identify", "pick"})
-        and not any(w in prompt_lower for w in {"save", "write", "load", "fetch", "download"})
+    # "remove solvent"/"remove water" as exact phrases missed the equally
+    # natural "remove the solvent" / "remove all water" — found while
+    # testing this gate for P5 (todo.txt): match the action verb and the
+    # object as separate words instead of one rigid phrase.
+    write_requested = (
+        any(w in prompt_lower for w in {"save", "write", "align", "no water"})
+        or (
+            any(v in prompt_lower for v in {"remove", "strip"})
+            and any(o in prompt_lower for o in {"solvent", "water"})
+        )
     )
 
     # Each turn is a full round trip to the model: one to pick tools, one more
@@ -5093,9 +5068,14 @@ def run_agent(user_prompt: str) -> str:
                     )
 
             # ── Gate: select ────────────────────────────────────────────────
-            # Block select when: show-only intent, a show already fired this run,
-            # or a rep-type show is in the same batch.
-            if name == "select" and (show_only_intent or show_rep_fired or batch_has_rep_show):
+            # Block select when: a show already fired this run, or a
+            # rep-type show is in the same batch. The former third
+            # condition — a keyword-based "show-only intent" guess — was
+            # retired (P5 in todo.txt): the system prompt now states the
+            # same rule directly and qwen2.5:7b follows it without a
+            # hard block, verified across pure-"show" prompts, mixed
+            # show+highlight prompts, and a "show the ligand" case.
+            if name == "select" and (show_rep_fired or batch_has_rep_show):
                 _log(
                     f"🚫 Blocked 'select' — representation command; no highlight needed"
                 )
@@ -5108,17 +5088,15 @@ def run_agent(user_prompt: str) -> str:
                 tool_results.append({"tool": name, "result": "Blocked — user did not request hiding."})
                 continue
 
-            # ── Gate: load/search ───────────────────────────────────────────
-            if name in LOAD_TOOLS and not load_requested:
-                _log(
-                    f"🚫 Blocked '{name}' — analysis of what is already loaded, not a new search")
-                f = st.session_state.focus
-                tool_results.append({"tool": name, "result": (
-                    f"Blocked — this is a request about {st.session_state.pdb_id}, which is "
-                    "already loaded"
-                    + (f" (working context: {f['protein_name']}, {f['accession']})" if f else "")
-                    + ". Answer it with the analysis tools; do not search or load again.")})
-                continue
+            # The load/search gate (LOAD_TOOLS + a regex classifier for
+            # "does this ambiguous verb mean load or analyze") was retired
+            # (P5 in todo.txt): the system prompt's rule 0a1 (STAY ON THE
+            # WORKING CONTEXT) already states this directly, and
+            # qwen2.5:7b followed it without the regex backing it up —
+            # verified across "find residues 1-500", "get the contacts",
+            # "show me the binding site", "look up the salt bridges",
+            # "search for hydrogen bonds" (none re-fetched the loaded
+            # structure) and "load PDB 4HHB" (still loaded correctly).
 
             # ── Gate: write/side-effect ─────────────────────────────────────
             if name in WRITE_TOOLS and not write_requested:

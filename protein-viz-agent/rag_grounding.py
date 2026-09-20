@@ -41,6 +41,11 @@ _STOPWORDS = frozenset({
 # padding the context with noise.
 _MIN_SCORE = 0.15
 
+# An example scoring below this fraction of the top hit's score is treated
+# as noise relative to that hit, not a second relevant pattern — see the
+# comment in _TfidfIndex.query for the failure this prevents.
+_RELATIVE_FLOOR = 0.5
+
 
 def _tokenize(text: str) -> list:
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS]
@@ -94,6 +99,23 @@ class _TfidfIndex:
                 scored.append((sim, i))
 
         scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        # A weak match riding along next to a strong one is worse than no
+        # match at all: it doesn't add a second relevant pattern, it adds
+        # an unrelated example's numbers to the context. One dominant hit
+        # (e.g. an exact-prompt match) should stand alone; several
+        # comparably-strong hits (e.g. two salt-bridge phrasings) should
+        # all survive. Cutting anything under half the top score gets both
+        # right — confirmed against this store's own examples, not just
+        # reasoned about: "highlight residue 5" kept only its one genuine
+        # match once this was added, instead of also dragging in an
+        # unrelated dihedral example that happened to repeat "57" four
+        # times and which qwen2.5:7b then echoed into a real tool call
+        # instead of the "5" actually in the prompt.
+        if scored:
+            floor = max(_MIN_SCORE, scored[0][0] * _RELATIVE_FLOOR)
+            scored = [pair for pair in scored if pair[0] >= floor]
+
         return [self.examples[i] for _, i in scored[:k]]
 
 
@@ -128,7 +150,11 @@ def format_grounding(prompt: str, k: int = 4) -> str:
     examples = retrieve_examples(prompt, k=k)
     if not examples:
         return ""
-    lines = ["Similar past requests and the correct way to handle them:"]
+    lines = [
+        "Similar past requests and the correct way to handle them (for the "
+        "pattern only — always use the exact residue numbers, chains and "
+        "names from THIS prompt, never a number from one of these examples):"
+    ]
     for ex in examples:
         lines.append(f"- \"{ex['prompt']}\" -> {ex['grounding']}")
     return "\n".join(lines)

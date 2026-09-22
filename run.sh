@@ -86,6 +86,31 @@ else
     echo "  conda create -n $AMBERTOOLS_ENV --override-channels -c conda-forge ambertools -y"
 fi
 
+# ── 3.5. DSSP discovery (optional: describe_fold's computed topology) ──────────
+# mkdssp is a single static binary, so this is a plain PATH/conda-env-name scan
+# like AmberTools' packmol-memgen, not the whole-interpreter scan PyMOL needs.
+if [ -z "${DSSP_BIN:-}" ]; then
+    if command -v mkdssp >/dev/null 2>&1; then
+        export DSSP_BIN="$(command -v mkdssp)"
+    else
+        DSSP_ENV_PATH=$(conda env list | awk '$1 ~ /dssp/ {print $NF; exit}')
+        if [ -n "$DSSP_ENV_PATH" ] && [ -x "$DSSP_ENV_PATH/bin/mkdssp" ]; then
+            export DSSP_BIN="$DSSP_ENV_PATH/bin/mkdssp"
+        fi
+    fi
+fi
+if [ -n "${DSSP_BIN:-}" ]; then
+    echo "DSSP found -- DSSP_BIN=$DSSP_BIN"
+else
+    echo "DSSP not found -- describe_fold's computed topology will report"
+    echo "unavailable rather than fail (its CATH/SCOP lookup is unaffected, since"
+    echo "that's a network call, not a DSSP one). Set up with:"
+    echo "  conda create -n dssp -c conda-forge dssp"
+    echo "  NOTE: conda-forge's dssp 4.x segfaults unpredictably on at least one"
+    echo "  arm64 macOS machine this was tested on; dssp=3.1.4 was stable there"
+    echo "  (conda install -n dssp -c conda-forge \"dssp=3\" if 4.x misbehaves)."
+fi
+
 # ── 4. PyMOL discovery (optional: render_image) ────────────────────────────────
 PYMOL_ENV_PATH=$(conda env list | awk '$1 ~ /pymol/ {print $NF; exit}')
 if [ -z "${PYMOL_PYTHON:-}" ] && [ -n "$PYMOL_ENV_PATH" ] && [ -x "$PYMOL_ENV_PATH/bin/python" ]; then

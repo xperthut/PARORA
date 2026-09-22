@@ -82,6 +82,10 @@ import structure_report as srep
 # disulfides, stacking, cation-pi, metal coordination.
 import interactions as ixn
 
+# Secondary structure (DSSP, optional external binary) and fold/topology
+# classification (CATH/SCOP via PDBe's SIFTS REST API).
+import topology as topo
+
 # Geometric measurement — distances, angles, contact shells. Reads coordinates
 # from the PDB records directly, so it works without MDAnalysis.
 import measure as mz
@@ -1573,6 +1577,124 @@ def tool_describe_structure(target: str = "", detail: str = "brief") -> str:
     if (detail or "brief").lower() in ("full", "detailed", "long", "all"):
         return srep.as_text(summary)
     return srep.as_brief(summary)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _cached_classification(pdb_id: str, schema: int):
+    """
+    Look up and cache a PDB entry's CATH/SCOP classification (PDBe SIFTS).
+
+    ttl caps how long a transient SIFTS outage would otherwise be remembered
+    as "no classification" — same reasoning as _cached_protein_profile's ttl.
+    """
+    return topo.lookup_classification(pdb_id)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_dssp(path: str, mtime: float, schema: int):
+    """Run and cache DSSP on a structure; mtime and schema bust the cache."""
+    return topo.run_dssp(path)
+
+
+def tool_describe_fold(chain: str = "") -> str:
+    """
+    Report a structure's fold/topology — real, sourced data, never a guess.
+
+    Two independent sources, reported separately: an existing CATH/SCOP
+    classification (a database lookup via PDBe SIFTS, used when the entry
+    has one — more accurate than anything computed) and a DSSP-computed
+    secondary-structure topology string from this structure's own
+    coordinates (attempted always, and the fallback when no classification
+    exists — e.g. an AlphaFold model, which has no PDB accession for SIFTS
+    to key on). This is fold/topology, not composition — use
+    describe_structure for ligands, chains and residues — and never a
+    model-guessed fold name assembled from the structure's name.
+
+    Args:
+        chain: Restrict to one chain, e.g. "A". Empty covers every chain,
+               grouping identical folds together (e.g. hemoglobin's A/C and
+               B/D) instead of repeating them.
+
+    Returns:
+        A plain-text report, or an honest statement that neither source has
+        anything for this structure — never an invented fold name.
+    """
+    entry = active_structure()
+    if not entry:
+        return "No structure is loaded — fetch one first."
+
+    atoms = _atoms_of(entry)
+    chains = atoms["chains_present"]
+    wanted_chain = ""
+    if (chain or "").strip():
+        wanted_chain = chain.strip().upper().replace("CHAIN", "").strip()
+        if wanted_chain not in chains:
+            return (f"Chain {wanted_chain} is not in {entry['pdb_id']}. "
+                    f"Chains present: {', '.join(chains)}")
+        chains = [wanted_chain]
+
+    lines = [f"Fold/topology for {entry['pdb_id']}"
+            + (f", chain {wanted_chain}" if wanted_chain else "")]
+
+    # 1. Existing classification, only meaningful for a real PDB accession.
+    classification = {}
+    if entry.get("source") == "rcsb":
+        classification = _cached_classification(entry["pdb_id"], topo.SCHEMA_VERSION)
+        groups = {}
+        for ch in chains:
+            c = classification.get(ch)
+            if not c:
+                continue
+            key = (c["source"], c.get("cath_id") or c.get("sunid"), c["name"])
+            groups.setdefault(key, {"info": c, "chains": []})["chains"].append(ch)
+        if groups:
+            lines.append("Existing classification (CATH/SCOP):")
+            for (src, _id, _name), g in groups.items():
+                c, chain_label = g["info"], ", ".join(g["chains"])
+                if src == "CATH":
+                    lines.append(
+                        f"  chain {chain_label}: CATH {c['cath_id']} — {c['name']} "
+                        f"({c['class']} / {c['architecture']} / {c['topology']} / "
+                        f"{c['homology']})")
+                else:
+                    lines.append(
+                        f"  chain {chain_label}: SCOP — {c['name']} "
+                        f"({c['class']} / fold: {c['fold']} / "
+                        f"superfamily: {c['superfamily']})")
+        else:
+            lines.append("No CATH/SCOP classification on file for this entry.")
+    else:
+        lines.append(
+            f"No CATH/SCOP lookup attempted — {entry['pdb_id']} is "
+            + ("an AlphaFold predicted model" if entry.get("source") == "alphafold"
+               else "a local file")
+            + ", not a PDB accession SIFTS can classify.")
+
+    # 2. DSSP-computed topology, attempted regardless — corroborates a
+    #    database hit, or stands in when there isn't one.
+    if topo.dssp_available():
+        ok, msg, per_residue = _cached_dssp(
+            entry["path"], Path(entry["path"]).stat().st_mtime, topo.SCHEMA_VERSION)
+        if ok:
+            seen = {}
+            for ch in chains:
+                s = topo.topology_string(per_residue, ch)
+                if s:
+                    seen.setdefault(s, []).append(ch)
+            if seen:
+                lines.append("Computed topology (DSSP, this structure's own coordinates):")
+                for s, chs in seen.items():
+                    lines.append(f"  chain {', '.join(chs)}: {s}")
+            else:
+                lines.append("DSSP found no helix or strand content for the requested chain(s).")
+        else:
+            lines.append(msg)
+    else:
+        lines.append(
+            "DSSP not installed — computed topology unavailable. Set DSSP_BIN "
+            "or install: conda create -n dssp -c conda-forge dssp")
+
+    return "\n".join(lines)
 
 
 def tool_list_structures() -> str:
@@ -3956,6 +4078,26 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "describe_fold",
+            "description": (
+                "Report a structure's fold/topology — 'what fold is this', 'describe "
+                "the topology of chain A', 'is this a beta barrel', 'what is the "
+                "secondary structure'. Reports an existing CATH/SCOP classification "
+                "when the entry has one (a database lookup, more accurate than any "
+                "guess) and a DSSP-computed secondary-structure topology string from "
+                "this structure's own coordinates. This is fold/topology, not "
+                "composition — use describe_structure for ligands/chains/residues — "
+                "and never invent a fold name; report exactly what this tool returns, "
+                "including when it says no classification is available."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "chain": {"type": "string",
+                          "description": "Restrict to one chain, e.g. 'A'; omit for all chains"}
+            }}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "list_structures",
             "description": "List the structures currently in the scene and how they are placed",
             "parameters": {"type": "object", "properties": {}}
@@ -4401,6 +4543,7 @@ TOOL_DISPATCH = {
     "list_structures":   lambda _: tool_list_structures(),
     "describe_structure": lambda a: tool_describe_structure(a.get("target", ""),
                                                             a.get("detail", "brief")),
+    "describe_fold":     lambda a: tool_describe_fold(a.get("chain", "")),
     "superpose_structures": lambda a: tool_superpose(
         a.get("mobile", ""), a.get("reference", ""),
         a.get("method", "auto"),
@@ -4475,6 +4618,13 @@ def _system_prompt() -> str:
         "   ligands, chains, residues, not biological role) and do NOT invent a function "
         "   from the protein's name or general knowledge. If `protein_function` reports no "
         "   annotation on file, say so; do not fill the gap with a guess. "
+        "0a4. Fold/topology — 'what fold is this', 'describe the topology of chain A', "
+        "   'is this a beta barrel', 'what is the secondary structure' → ONE "
+        "   `describe_fold` call. This is fold/topology classification — do NOT answer "
+        "   these from describe_structure (that reports composition, not fold) and do "
+        "   NOT invent a fold name from the protein's name or general knowledge. Report "
+        "   exactly what `describe_fold` returns, including when it says no "
+        "   classification is available. "
         "0d2. Preparing a structure — 'keep only one state', 'remove the other "
         "   models', 'this NMR structure has 20 states', 'clean it up', 'add "
         "   hydrogens', 'get it ready for Amber / Rosetta / simulation' → ONE "
@@ -5005,10 +5155,20 @@ def run_agent(user_prompt: str) -> str:
     # phrasing producing a false claim of assessed stability is worse than
     # every phrasing correctly triggering a hard-coded refusal, so this
     # stays a keyword gate rather than a prompt-only rule.
-    if any(x in prompt_lower for x in (
+    # P8 fix (todo.txt): the bare word "folding" wrongly caught classification
+    # questions like "describe the folding topology of this domain" (confirmed
+    # by direct test) — a describe_fold question, not a dynamics question.
+    # Narrowed to require a dynamics-flavored word nearby, so it no longer
+    # collides with the refusal this gate exists for; "stable"/"stability"/
+    # "thermostable" stay unconditional triggers exactly as P4 proved they
+    # need to be — only "folding" was ever the false-positive-prone one.
+    folding_is_dynamics = "folding" in prompt_lower and any(
+        w in prompt_lower for w in
+        ("correctly", "properly", "will", "process", "pathway")
+    )
+    if folding_is_dynamics or any(x in prompt_lower for x in (
         "stable",
         "stability",
-        "folding",
         "thermostable",
     )):
         return (

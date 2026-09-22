@@ -42,3 +42,14 @@ biopython
 # it the fallback is `reduce`, which places hydrogens from idealised geometry
 # and can leave a molecule chemically incomplete.
 rdkit
+
+# Secondary-structure/topology computation (topology.py, describe_fold's
+# computed-topology half). NOT a pip dependency -- `mkdssp` is a single
+# external binary, discovered at runtime via the DSSP_BIN environment
+# variable or PATH. Its fold/topology database lookup half (CATH/SCOP via
+# PDBe's SIFTS API) needs no extra dependency at all -- just `requests`,
+# already above. Set up DSSP with:
+#     conda create -n dssp -c conda-forge dssp
+# conda-forge's dssp 4.x has been observed to segfault unpredictably on at
+# least one arm64 macOS machine; dssp=3.1.4 was stable there
+# (conda install -n dssp -c conda-forge "dssp=3" if 4.x misbehaves).

@@ -126,9 +126,44 @@ from rag_grounding import format_grounding
 
 log = setup_logging("app")
 
-st.set_page_config(page_title="Molecular Agent", layout="wide")
-st.title("Molecular Agent")
-st.caption("Natural language → Tool-calling agent → Analyze and visualize molecular structures")
+# ── Asset resolution: works in both Docker (/app/logo/) and local dev (../logo/)
+_HERE = Path(__file__).parent
+_LOGO_NOTEXT = _HERE / "logo" / "logo_notext.png"
+if not _LOGO_NOTEXT.exists():
+    _LOGO_NOTEXT = _HERE.parent / "logo" / "logo_notext.png"
+_LOGO = _HERE / "logo" / "logo.png"
+if not _LOGO.exists():
+    _LOGO = _HERE.parent / "logo" / "logo.png"
+
+st.set_page_config(
+    page_title="Molecular Agent",
+    page_icon=str(_LOGO_NOTEXT) if _LOGO_NOTEXT.exists() else "🧬",
+    layout="wide",
+)
+
+st.markdown(
+    "<style>"
+    "[data-testid='stToolbar'] { display: none; }"
+    "section.main > div.block-container { padding-top: 1rem; }"
+    "</style>",
+    unsafe_allow_html=True,
+)
+
+# ── Compact header: logo + product name + one-line description ────────────────
+col_logo, col_title = st.columns([1, 10])
+with col_logo:
+    if _LOGO.exists():
+        st.image(str(_LOGO), width=48)
+with col_title:
+    st.markdown(
+        "<div style='display:flex; flex-direction:column; justify-content:center; height:48px;'>"
+        "<span style='font-size:1.6rem; font-weight:700; line-height:1.2;'>Molecular Agent</span>"
+        "<span style='font-size:0.85rem; color:#888;'>Natural language → Tool-calling agent → Analyze and visualize molecular structures</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+st.divider()
 
 # ── Model + Ollama host: driven by config.yaml, env vars still win ────────────
 _CFG = get_config("app")
@@ -5716,6 +5751,11 @@ def handle_viewer_event(event) -> bool:
             return True
         return False
 
+    if kind == "toggle_bg":
+        st.session_state.background = (
+            "white" if st.session_state.background == "black" else "black")
+        return True
+
     return False
 
 
@@ -5747,6 +5787,7 @@ def build_ngl_html() -> str:
 
     cfg = _viewer_payload()
     bg = cfg["bg"]
+    bg_label = "☀️ Light" if bg == "black" else "\U0001f319 Dark"
     # "</" inside a <script> would end the block early, whatever the JSON says.
     cfg_json = json.dumps(cfg).replace("</", "<\\/")
 
@@ -5809,6 +5850,9 @@ def build_ngl_html() -> str:
             <button data-act="tb-pick" data-top="Simulate" data-sub="QM/MM">QM/MM</button>
             <button data-act="tb-pick" data-top="Simulate" data-sub="Membrane">Membrane</button>
           </div>
+        </div>
+        <div class="tbgrp tbgrp-right">
+          <button data-act="tb-bg" title="Switch the viewer background">__BG_LABEL__</button>
         </div>
       </div>
       <div id="viewport" style="width:100%;height:100%;"></div>
@@ -5948,6 +5992,7 @@ def build_ngl_html() -> str:
                border-radius:5px;color:#e8e8ea;padding:4px 10px;cursor:pointer;font:inherit;}
       #toolbar button:hover{background:rgba(255,255,255,.18);}
       .tbgrp{position:relative;}
+      .tbgrp-right{margin-left:auto;}
       .tbdrop{position:absolute;top:100%;left:0;z-index:13;display:flex;flex-direction:column;
               min-width:190px;background:rgba(20,20,24,.94);border:1px solid rgba(255,255,255,.2);
               border-radius:6px;padding:4px;box-shadow:0 6px 18px rgba(0,0,0,.4);}
@@ -6375,7 +6420,8 @@ def build_ngl_html() -> str:
                         closeTbDrops();
                         emit({kind: "toolbar_open", top: btn.dataset.top,
                               sub: btn.dataset.sub || null});
-                    }
+                    },
+            "tb-bg":       function(){ emit({kind: "toggle_bg"}); }
         };
         wrap.addEventListener("click", function(e){
             var btn = e.target.closest("[data-act]");
@@ -6523,6 +6569,7 @@ def build_ngl_html() -> str:
 
     return (tpl
             .replace("__BG__",     bg)
+            .replace("__BG_LABEL__", bg_label)
             .replace("__LEGEND__", legend_rows)
             .replace("__IXNKEY__", ixn_key)
             .replace("__CFG__",    cfg_json))
@@ -9398,23 +9445,15 @@ def _tab_panel(pane: tuple, render_fn) -> None:
 
 
 with right:
-    title_col, btn_col = st.columns([5, 1])
-    with title_col:
-        st.subheader("Interactive 3D Viewer")
-        if structures():
-            st.caption("**Load** a structure or find one by protein name, "
-                       "**Prepare** it for calculation, **Style** the picture; "
-                       "**Analyze** measures distances, interactions, composition "
-                       "and sequence; **Simulate** sets up **MD** (Amber, GROMACS, "
-                       "Rosetta), **QM**, **QM/MM** and the **Membrane** a "
-                       "membrane protein needs first.")
-    with btn_col:
-        # Toggle button label reflects the current background state
-        is_dark = st.session_state.background == "black"
-        label = "☀️ Light" if is_dark else "🌙 Dark"
-        if st.button(label, key="bg_toggle"):
-            st.session_state.background = "white" if is_dark else "black"
-            st.rerun()
+    st.subheader("Interactive 3D Viewer")
+    if structures():
+        st.caption("**Load** a structure or find one by protein name, "
+                   "**Prepare** it for calculation, **Style** the picture; "
+                   "**Analyze** measures distances, interactions, composition "
+                   "and sequence; **Simulate** sets up **MD** (Amber, GROMACS, "
+                   "Rosetta), **QM**, **QM/MM** and the **Membrane** a "
+                   "membrane protein needs first. The button at the right of "
+                   "the viewer's own toolbar switches the background.")
 
     if structures():
         # The Load/Prepare/Style/Analyze/Simulate menu now lives inside the

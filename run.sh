@@ -84,6 +84,7 @@ else
     echo "AmberTools env '$AMBERTOOLS_ENV' not found -- prepare/membrane/simulation/QM tools will report"
     echo "unavailable rather than fail. Set it up with:"
     echo "  conda create -n $AMBERTOOLS_ENV --override-channels -c conda-forge ambertools -y"
+    echo "or run 'bash setup_tools.sh' to be walked through installing this (and PyMOL/DSSP) interactively."
 fi
 
 # ── 3.5. DSSP discovery (optional: describe_fold's computed topology) ──────────
@@ -109,15 +110,27 @@ else
     echo "  NOTE: conda-forge's dssp 4.x segfaults unpredictably on at least one"
     echo "  arm64 macOS machine this was tested on; dssp=3.1.4 was stable there"
     echo "  (conda install -n dssp -c conda-forge \"dssp=3\" if 4.x misbehaves)."
+    echo "or run 'bash setup_tools.sh', which tries 4.x and falls back to 3.x for you"
+    echo "if the smoke test fails on this machine."
 fi
 
 # ── 4. PyMOL discovery (optional: render_image) ────────────────────────────────
 PYMOL_ENV_PATH=$(conda env list | awk '$1 ~ /pymol/ {print $NF; exit}')
+PYMOL_FOUND=false
 if [ -z "${PYMOL_PYTHON:-}" ] && [ -n "$PYMOL_ENV_PATH" ] && [ -x "$PYMOL_ENV_PATH/bin/python" ]; then
     if "$PYMOL_ENV_PATH/bin/python" -c "import pymol2" >/dev/null 2>&1; then
         export PYMOL_PYTHON="$PYMOL_ENV_PATH/bin/python"
         echo "PyMOL found -- PYMOL_PYTHON=$PYMOL_PYTHON"
+        PYMOL_FOUND=true
     fi
+elif [ -n "${PYMOL_PYTHON:-}" ]; then
+    PYMOL_FOUND=true
+fi
+if ! $PYMOL_FOUND; then
+    echo "PyMOL not found -- render_image will report unavailable rather than fail."
+    echo "Set it up with:"
+    echo "  conda create -n pymol-render -c conda-forge pymol-open-source -y"
+    echo "or run 'bash setup_tools.sh' to be walked through installing this (and AmberTools/DSSP) interactively."
 fi
 
 # ── 5. Run the full agent ──────────────────────────────────────────────────────

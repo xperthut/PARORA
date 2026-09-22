@@ -15,13 +15,17 @@ The production server streams each action to the browser as an SSE event, so the
 - [Features](#features)
 - [Architecture](#architecture)
 - [Tech Stack](#tech-stack)
-- [Prerequisites](#prerequisites) *(macOS & Windows)*
+- [Platform Support](#platform-support) *(macOS, Linux/servers, Windows)*
+- [Prerequisites](#prerequisites)
   - [1. Docker](#1-docker-for-containerized-deployment)
   - [2. Ollama](#2-ollama-local-llm-runtime)
-  - [3. Python 3.12](#3-python-312-for-local-development-only) *(local dev only)*
+  - [3. Conda](#3-conda-for-runsh-the-recommended-local-path) *(for `run.sh`, the recommended local path)*
+  - [4. Python 3.12](#4-python-312-for-fully-manual-local-dev-only) *(fully manual local dev only)*
+  - [5. Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp) *(AmberTools / PyMOL / DSSP)*
 - [Getting Started](#getting-started)
-  - [Option A: Docker (Recommended)](#option-a-docker-recommended)
-  - [Option B: Local Development](#option-b-local-development)
+  - [Option A: Docker (Recommended for most users)](#option-a-docker-recommended-for-most-users)
+  - [Option B: `run.sh` (Recommended for local development)](#option-b-runsh-recommended-for-local-development)
+  - [Option C: Fully manual](#option-c-fully-manual)
 - [App Variants](#app-variants)
 - [Agent Tools Reference](#agent-tools-reference)
   - [Data Loading](#data-loading)
@@ -63,24 +67,38 @@ The production server streams each action to the browser as an SSE event, so the
 | --- | --- |
 | Backend | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) |
 | Frontend | Vanilla JS + NGL.js (single-page, no framework) |
-| LLM Runtime | [Ollama](https://ollama.com/) with `qwen2.5:7b` |
-| Structural Analysis | [MDAnalysis](https://www.mdanalysis.org/) |
+| LLM Runtime | [Ollama](https://ollama.com/) — `qwen2.5:7b` (`server.py`, `app.py`) and `llama3.2` (`app_lite.py`) |
+| Structural Analysis | [MDAnalysis](https://www.mdanalysis.org/), plus optional [AmberTools](https://ambermd.org/AmberTools.php) / [PyMOL](https://pymol.org/) / [DSSP](https://swift.cmbi.umcn.nl/gv/dssp/) |
 | 3D Visualization | [NGL.js v2](https://nglviewer.org/) (WebGL via CDN) |
-| PDB Data Source | [RCSB PDB API](https://www.rcsb.org/) (`rcsb-api`) |
+| PDB Data Source | [RCSB PDB API](https://www.rcsb.org/) (`rcsb-api`), [UniProt](https://www.uniprot.org/), [PDBe SIFTS](https://www.ebi.ac.uk/pdbe/docs/sifts/) |
 | Language | Python 3.12 |
-| Deployment | Docker |
+| Deployment | Docker, or natively via conda (`run.sh`) — see [Platform Support](#platform-support) |
+
+---
+
+## Platform Support
+
+| Platform | Docker path | Local (`run.sh` / manual) path |
+| --- | --- | --- |
+| **macOS** | ✅ Fully supported (Docker Desktop) | ✅ Fully supported |
+| **Linux (incl. servers)** | ✅ Fully supported | ✅ Fully supported — this is the actual production/server path |
+| **Windows** | ✅ Supported via Docker Desktop (requires WSL 2) | ⚠️ Only via WSL 2 — see below |
+
+`run.sh`, `deploy.sh`, `ollama.sh`, and `setup_tools.sh` are all `#!/bin/bash` scripts — there is no native `.bat`/`.ps1` equivalent for any of them. On Windows, either use the Docker path (which runs Linux inside a container regardless of the host OS) or open a WSL 2 terminal and treat it as Linux for everything else in this README.
+
+The three optional structural-biology tools ([AmberTools / PyMOL / DSSP](#5-optional-structural-biology-tools-ambertools--pymol--dssp)) are auto-discovered from conda environments in Unix-style locations (`~/miniconda3`, `/opt/...`, and — for PyMOL only — `/Applications/PyMOL.app` on macOS). This works on macOS, Linux, and inside WSL 2; on native Windows you would need to set `PACKMOL_MEMGEN` / `PYMOL_PYTHON` / `DSSP_BIN` by hand if you have them installed there.
 
 ---
 
 ## Prerequisites
 
-Before running PARORA, ensure the following are installed on your system.
+Before running PARORA, ensure the following are installed on your system. Which of these you actually need depends on which [Getting Started](#getting-started) option you pick — Docker only needs #1 and #2; the recommended local path (`run.sh`) needs #2 and #3; a fully manual setup needs #2 and #4. #5 is optional everywhere.
 
 ---
 
 ### 1. Docker (for containerized deployment)
 
-Docker is required only if you plan to run PARORA via the Docker option.
+Docker is required only if you plan to run PARORA via the Docker option. The Docker image builds and runs **`app.py`**, the full 54-tool Streamlit agent, on **port 8501** — not the lighter FastAPI `server.py` on port 8000.
 
 **macOS** — Download and install **Docker Desktop for Mac** (supports both Intel and Apple Silicon):
 [https://www.docker.com/products/docker-desktop/](https://www.docker.com/products/docker-desktop/)
@@ -95,6 +113,8 @@ After installation, launch Docker Desktop from your Applications folder and wait
 > ```powershell
 > wsl --install
 > ```
+
+**Linux** — Install Docker Engine via your distribution's package manager or the [official instructions](https://docs.docker.com/engine/install/). This is the standard way to run PARORA on a Linux server.
 
 **Verify:**
 
@@ -114,39 +134,66 @@ Alternatively, install via Homebrew:
 brew install ollama
 ```
 
-**Windows** — Download the `.exe` installer from [https://ollama.com/download](https://ollama.com/download) and run it. Ollama installs as a background Windows service and appears in the system tray.
-
-**Pull the required model (both platforms)** — after installation, open a terminal and run:
+**Linux** — Install with the official script, then it runs as a systemd service:
 
 ```bash
-ollama pull qwen2.5:7b
+curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-On macOS you can also use the provided script:
+**Windows** — Download the `.exe` installer from [https://ollama.com/download](https://ollama.com/download) and run it. Ollama installs as a background Windows service and appears in the system tray.
+
+**Pull the required models (all platforms)** — after installation, open a terminal and run:
+
+```bash
+ollama pull qwen2.5:7b   # used by server.py and app.py
+ollama pull llama3.2     # used by app_lite.py
+```
+
+Or use the provided script, which pulls both (works on macOS/Linux/WSL):
 
 ```bash
 bash ollama.sh
 ```
 
+`run.sh` also pulls whichever of these two isn't already present, so this step is optional if you're using the `run.sh` path below.
+
 **Verify:**
 
 ```bash
-ollama list   # should show qwen2.5:7b
+ollama list   # should show qwen2.5:7b and llama3.2
 ```
 
-> **Note:** The model download is approximately 4.7 GB. A one-time internet connection is required for this step only. All subsequent inference runs entirely offline.
+> **Note:** `qwen2.5:7b` is ~4.7 GB and `llama3.2` is ~2.0 GB. A one-time internet connection is required for this step (and for `run.sh`'s conda/pip setup, and for `describe_fold`'s CATH/SCOP lookup at runtime). Structure search and everything else runs entirely offline once models are pulled — no API keys, nothing sent to a cloud LLM provider.
 
 ---
 
-### 3. Python 3.12 (for local development only)
+### 3. Conda (for `run.sh`, the recommended local path)
 
-Python is only required if you are running PARORA outside of Docker.
+`run.sh` (repo root) is the preferred way to run the full `app.py` agent outside Docker — it creates a `parora` conda environment from `parora.yml`, installs everything in `requirements.txt` into it, pulls the required Ollama models, auto-discovers the optional tools below, and launches Streamlit — all in one command. It needs a conda installation already present; it does **not** install conda itself.
+
+**macOS / Linux** — install [Miniconda](https://docs.conda.io/en/latest/miniconda.html), [Miniforge](https://github.com/conda-forge/miniforge), or Anaconda. `run.sh` looks for it at `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, or (macOS Homebrew cask / common system paths) `/opt/homebrew/Caskroom/miniconda/base`, `/opt/anaconda3`, `/opt/miniconda3` — any of these work.
+
+**Windows** — use WSL 2 and follow the Linux instructions inside it; `run.sh` is a bash script (see [Platform Support](#platform-support)).
+
+**Verify:**
+
+```bash
+conda --version
+```
+
+---
+
+### 4. Python 3.12 (for fully manual local dev only)
+
+Only needed if you'd rather skip conda entirely and manage a plain virtualenv/pip install yourself (Option C below).
 
 **macOS** — Download from [https://www.python.org/downloads/](https://www.python.org/downloads/) and run the `.pkg`, or install via Homebrew:
 
 ```bash
 brew install python@3.12
 ```
+
+**Linux** — Install via your distribution's package manager, e.g. `sudo apt install python3.12 python3.12-venv` (Debian/Ubuntu), or from [python.org](https://www.python.org/downloads/).
 
 **Windows** — Download the installer from [https://www.python.org/downloads/](https://www.python.org/downloads/) and run the `.exe`.
 
@@ -155,46 +202,86 @@ brew install python@3.12
 **Verify:**
 
 ```bash
-# macOS
+# macOS / Linux
 python3 --version
 
 # Windows
 python --version
 ```
 
-Both should report `3.12.x`.
+Should report `3.12.x`.
+
+---
+
+### 5. Optional structural-biology tools (AmberTools / PyMOL / DSSP)
+
+The full `app.py` agent has three features that depend on external tools it does **not** bundle and does **not** require — without them, the agent still runs, and the tools that need them just report "unavailable" instead of failing:
+
+| Tool | Unlocks | Without it |
+| --- | --- | --- |
+| **AmberTools** | Hydrogen addition, membrane building, MD/QM input generation (`prepare_structure`, `build_membrane`, simulation/quantum/oniom tools) | Those specific tools report unavailable; everything else works |
+| **PyMOL** (open-source build) | Ray-traced publication-quality figure rendering (`render_image`) | That tool reports unavailable |
+| **DSSP** | Computed secondary-structure topology strings in `describe_fold` | `describe_fold` still returns CATH/SCOP fold classification (a network lookup, no dependency needed) — just not the computed topology half |
+
+These only matter for the full `app.py` agent; `server.py` and `app_lite.py` never use them.
+
+**Easiest way to set these up** — from the repo root, after conda is installed:
+
+```bash
+bash setup_tools.sh              # checks each tool, asks before installing anything missing
+bash setup_tools.sh --yes        # installs whatever's missing without asking
+bash setup_tools.sh --check-only # just reports what's found, installs nothing
+```
+
+It only touches its own conda environments (`ambertools`, `pymol-render`, `dssp`) and never installs anything without asking, unless you pass `--yes`.
+
+> **Known issue:** conda-forge's `dssp` package (4.x) has been observed to crash unpredictably on at least one arm64 macOS machine. `setup_tools.sh` installs the current version first, actually tests it, and automatically falls back to `dssp=3` if the test fails — so this is handled for you either way.
+
+`run.sh` auto-discovers all three by conda environment name every time it starts the app, so once installed (by `setup_tools.sh` or manually), no further configuration is needed. To point at a non-standard install location instead, set `PACKMOL_MEMGEN` / `PYMOL_PYTHON` / `DSSP_BIN` yourself (see [Environment Variables](#environment-variables)).
 
 ---
 
 ## Getting Started
 
-### Option A: Docker (Recommended)
+### Option A: Docker (Recommended for most users)
 
-Requires Docker and Ollama installed (see Prerequisites above).
+Requires [Docker](#1-docker-for-containerized-deployment) and [Ollama](#2-ollama-local-llm-runtime) installed. Runs the full `app.py` agent — AmberTools/PyMOL stay optional and are not bundled in the image (see [Environment Variables](#environment-variables) if you want to point the container at env-based tools running on the host).
 
-**Step 1** — Pull the LLM model (first time only):
+**Step 1** — Pull the LLM models (first time only):
 
 ```bash
 bash ollama.sh
 ```
 
-**Step 2** — Build and run the container:
+**Step 2** — Build and run the container, from the repo root:
 
 ```bash
 bash deploy.sh
 ```
 
-**Step 3** — Open your browser at `http://localhost:8000`.
+**Step 3** — Open your browser at `http://localhost:8501`.
 
-The script automatically removes any previous container, rebuilds the image, and mounts a local `structures/` directory so downloaded PDB files persist between runs.
+The script automatically removes any previous container, rebuilds the image, and mounts local `structures/`, `membranes/`, `prepared/`, and `logs/` directories so downloaded/generated files persist between runs.
 
 ---
 
-### Option B: Local Development
+### Option B: `run.sh` (Recommended for local development)
 
-Requires Python 3.12 and Ollama installed (see Prerequisites above).
+The preferred way to run the full agent **outside** Docker — one command sets up the conda environment, installs Python dependencies, pulls Ollama models, auto-discovers optional tools, and launches Streamlit. Requires [Ollama](#2-ollama-local-llm-runtime) and [conda](#3-conda-for-runsh-the-recommended-local-path) installed (macOS/Linux, or WSL 2 on Windows — see [Platform Support](#platform-support)).
 
-**Step 1** — Pull the LLM model (first time only):
+```bash
+bash run.sh
+```
+
+That's it — open your browser at `http://localhost:8501` once it prints the Streamlit URL. Optionally, run `bash setup_tools.sh` first if you also want AmberTools/PyMOL/DSSP (see [Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp)) — `run.sh` will pick them up automatically either way, before or after.
+
+---
+
+### Option C: Fully manual
+
+Requires [Python 3.12](#4-python-312-for-fully-manual-local-dev-only) and [Ollama](#2-ollama-local-llm-runtime) installed. Use this if you'd rather skip conda and manage dependencies yourself, or if you only want the lightweight `server.py`/`app_lite.py` entry points (neither needs AmberTools/PyMOL/DSSP at all).
+
+**Step 1** — Pull the LLM models (first time only):
 
 ```bash
 bash ollama.sh
@@ -207,23 +294,23 @@ cd protein-viz-agent
 pip install -r requirements.txt
 ```
 
-**Step 3** — Run the application:
+**Step 3** — Run one of the three entry points:
 
 ```bash
-# FastAPI server (Docker default) — persistent NGL viewer, no page reloads
+# FastAPI server — 3 tools, SSE streaming, persistent NGL viewer, no page reloads
 uvicorn server:app --reload
 
-# Full-featured Streamlit agent — MDAnalysis, named selections, agent debug log
+# Full-featured Streamlit agent — 54 tools, MDAnalysis, AmberTools/PyMOL/DSSP-backed analysis
 streamlit run app.py
 
-# Lite Streamlit agent — lightweight three-tool agent
+# Lite Streamlit agent — same 3 tools as server.py, for debugging the agent loop
 streamlit run app_lite.py
 ```
 
 **Step 4** — Open your browser:
 
-- FastAPI: `http://localhost:8000`
-- Streamlit: `http://localhost:8501`
+- FastAPI (`server.py`): `http://localhost:8000`
+- Streamlit (`app.py` / `app_lite.py`): `http://localhost:8501`
 
 ---
 
@@ -231,9 +318,9 @@ streamlit run app_lite.py
 
 | File | Description |
 | --- | --- |
-| `server.py` | **FastAPI server (Docker default)** — SSE streaming, server-side tool-call deduplication, NGL selection normalisation, color extraction from natural language, in-place representation updates via `repMap` |
-| `app.py` | Streamlit full-featured agent — MDAnalysis structural analysis, 18 tools, named selections, B-factor filtering, distance measurement, structure alignment, camera persistence, agent debug panel |
-| `app_lite.py` | Streamlit lite agent — three core tools (search, load, represent); useful for development and debugging without the full server pipeline |
+| `server.py` | FastAPI server — 3 tools (`search_pdb`, `set_pdb`, `add_representation`), SSE streaming, server-side tool-call deduplication, NGL selection normalisation, color extraction from natural language, in-place representation updates. Docker's own default before it switched to `app.py`; still available manually. |
+| `app.py` | Streamlit full-featured agent — **54 tools** spanning structure loading, selections, visualization, MDAnalysis-backed analysis, interaction detection, measurement, structure prep, membrane building, MD/QM input generation, PyMOL ray-traced rendering, and fold/topology classification. This is what Docker and `run.sh` both run. |
+| `app_lite.py` | Streamlit lite agent — same 3-tool set as `server.py`, for debugging the agent loop without the full pipeline. |
 
 ---
 
@@ -319,49 +406,93 @@ The LLM agent has access to the following tools, which it calls autonomously bas
 
 ```text
 PARORA/
-├── logo/
-│   ├── banner.png               # Project banner image
-│   ├── logo.png                 # Logo with text
-│   └── logo_notext.png          # Logo without text
+├── logo/                         # Banner/logo images used in this README
 ├── protein-viz-agent/
-│   ├── server.py                # FastAPI server + agent (Docker default)
-│   ├── templates/
-│   │   └── index.html           # Single-page UI with embedded NGL.js
-│   ├── app.py                   # Streamlit full-featured agent
-│   ├── app_lite.py              # Streamlit lite agent — three tools
-│   ├── requirements.txt         # Python dependencies
-│   ├── Dockerfile               # Container configuration
-│   └── structures/              # Local PDB file cache
-├── deploy.sh                    # Docker build & run script (port 8000)
-└── ollama.sh                    # Ollama model setup script
+│   ├── server.py                 # FastAPI server — 3-tool agent
+│   ├── app_lite.py               # Streamlit lite agent — same 3 tools as server.py
+│   ├── app.py                    # Streamlit full agent — 54 tools (Docker/run.sh default)
+│   ├── templates/index.html      # server.py's single-page UI (vanilla JS + NGL.js)
+│   ├── viewer_component/         # app.py's NGL viewer as a declared Streamlit component
+│   ├── config.yaml               # Per-entry-point model config (read by parora_config.py)
+│   ├── parora_config.py          # Shared model/Ollama config loader
+│   ├── parora_logging.py         # Shared logging setup (logs/parora.log)
+│   ├── rag_grounding.py          # Few-shot prompt grounding (app.py only)
+│   ├── rag_examples.json         # Grounding examples rag_grounding.py reads
+│   ├── Protein_accession.py      # RCSB + UniProt protein lookup
+│   ├── sequence_utils.py         # Dependency-free PDB sequence parsing
+│   ├── structure_report.py       # Dependency-free composition reports
+│   ├── interactions.py           # Salt bridges, H-bonds, disulfides, stacking, metals
+│   ├── measure.py                # Distance/angle/dihedral measurement
+│   ├── superpose.py              # RMSD structure superposition
+│   ├── topology.py               # DSSP + CATH/SCOP fold/topology classification
+│   ├── prepare.py                # Structure prep (hydrogens, states, cleanup)
+│   ├── membrane.py               # OPM/MEMEMBED orientation + PACKMOL-Memgen packing
+│   ├── simulation.py             # Amber/GROMACS/Rosetta input generation
+│   ├── quantum.py / oniom.py     # QM region extraction / Gaussian QM-MM
+│   ├── pymol_render.py / pymol_worker.py  # PyMOL ray-traced rendering
+│   ├── analysis_tools.py         # Notebook-derived deterministic analysis
+│   ├── requirements.txt          # Python dependencies (pip)
+│   ├── Dockerfile                # Container configuration (builds app.py)
+│   ├── structures/ membranes/ prepared/ logs/  # Runtime dirs, gitignored, created on demand
+│   └── simulations/              # Generated MD/QM job files
+├── run.sh                        # Preferred local launcher — conda env, models, tool discovery, then app.py
+├── setup_tools.sh                # Interactive AmberTools/PyMOL/DSSP checker & installer
+├── deploy.sh                     # Docker build & run script (port 8501)
+├── ollama.sh                     # Pulls both required Ollama models
+└── parora.yml                    # Conda env spec used by run.sh
 ```
 
 ---
 
 ## Environment Variables
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL. Automatically set to `http://host.docker.internal:11434` when running inside Docker on macOS. |
+None of these are required — every entry point works with its documented defaults. Set these to override behavior or point at a non-standard tool install.
+
+| Variable | Applies to | Default | Description |
+| --- | --- | --- | --- |
+| `OLLAMA_HOST` | all | `http://localhost:11434` | Ollama server URL. `app.py`/`server.py`/`app_lite.py` all auto-switch to `http://host.docker.internal:11434` when they detect they're running inside a container, even without setting this explicitly. |
+| `PARORA_TEMPERATURE` | all | `0.0` (from `config.yaml`) | Sampling temperature. |
+| `PARORA_NUM_CTX` | all | `16384` | Ollama context window, in tokens. |
+| `PARORA_KEEP_ALIVE` | all | `30m` | How long Ollama keeps the model loaded in memory. |
+| `PARORA_MODEL_SERVER` | `server.py` | `qwen2.5:7b` | Override just this entry point's model. |
+| `PARORA_MODEL_APP_LITE` | `app_lite.py` | `llama3.2:latest` | Override just this entry point's model. |
+| `PARORA_MODEL_APP` | `app.py` | `qwen2.5:7b` | Override just this entry point's model. |
+| `PARORA_LOG_LEVEL` | all | `INFO` | Logging verbosity. |
+| `PARORA_LOG_DIR` | all | `protein-viz-agent/logs/` | Where `parora.log` is written. |
+| `PACKMOL_MEMGEN` | `app.py` | auto-discovered | Path to AmberTools' `packmol-memgen`, if it lives somewhere `run.sh`/`setup_tools.sh` wouldn't find on their own. |
+| `PYMOL_PYTHON` | `app.py` | auto-discovered | Path to a Python interpreter that can `import pymol2`. |
+| `DSSP_BIN` | `app.py` | auto-discovered | Path to an `mkdssp` binary. |
 
 ---
 
 ## Troubleshooting
 
 **Ollama connection refused**
-Ensure Ollama is running. On macOS, the installer registers it as a background service; verify with `ollama list`. If not running, launch the Ollama desktop app or run `ollama serve`.
+Ensure Ollama is running. On macOS, the installer registers it as a background service; on Linux it runs as a systemd service after `curl -fsSL https://ollama.com/install.sh | sh`. Verify with `ollama list`; if it's not running, launch the desktop app or run `ollama serve`.
 
 **Model not found**
-Run `bash ollama.sh` to pull the `qwen2.5:7b` model before starting the app.
+Run `bash ollama.sh` to pull both `qwen2.5:7b` and `llama3.2` before starting any entry point.
+
+**`run.sh` says "Could not find a conda installation"**
+Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) (or Miniforge/Anaconda) first — `run.sh` looks for it at `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, or a few common system paths, but doesn't install conda itself. See [Conda](#3-conda-for-runsh-the-recommended-local-path).
 
 **Docker can't reach Ollama**
-On macOS, the container connects to `host.docker.internal:11434` automatically. On Linux, you may need to add `--add-host=host.docker.internal:host-gateway` to the `docker run` command in `deploy.sh`.
+On macOS, the container connects to `host.docker.internal:11434` automatically. On Linux, add `--add-host=host.docker.internal:host-gateway` to the `docker run` command in `deploy.sh`.
 
 **Slow responses**
 `qwen2.5:7b` runs on CPU by default if no compatible GPU is detected. For faster inference on Apple Silicon, ensure the Ollama version supports Metal acceleration (included by default in recent Ollama releases). The model requires approximately 6 GB of memory to run.
 
 **MDAnalysis not available**
 The `app.py` full-featured agent gracefully degrades if MDAnalysis fails to import. Re-install with `pip install MDAnalysis` in your environment.
+
+**AmberTools / PyMOL / DSSP report "unavailable"**
+Expected if you haven't installed them — none are required. Run `bash setup_tools.sh` to check what's present and install what's missing, interactively. See [Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp).
+
+**DSSP crashes / `describe_fold`'s computed topology never returns**
+conda-forge's `dssp` package (4.x) has been observed to segfault unpredictably on at least one arm64 macOS machine, on every input. `setup_tools.sh` handles this automatically (installs 4.x, smoke-tests it, falls back to `dssp=3` if the test fails); if you installed DSSP manually and hit this, run `conda install -n dssp -c conda-forge "dssp=3" -y` yourself.
+
+**Running natively on Windows (no WSL, no Docker)**
+Not supported directly — `run.sh`/`deploy.sh`/`ollama.sh`/`setup_tools.sh` are all bash scripts. Use Docker Desktop, or WSL 2 for the local path. See [Platform Support](#platform-support).
 
 ---
 

@@ -2021,7 +2021,8 @@ def _normalise_color(color: str) -> str:
     return c   # a plain CSS/NGL colour name such as "red" is passed through
 
 
-def tool_show(rep_type: str, selection: str, color: str = "element") -> str:
+def tool_show(rep_type: str, selection: str, color: str = "element",
+              exclusive: bool = False) -> str:
     """
     Add or replace a visual representation layer for a given selection.
 
@@ -2033,6 +2034,10 @@ def tool_show(rep_type: str, selection: str, color: str = "element") -> str:
         rep_type : Representation style (e.g. "cartoon", "surface", "licorice").
         selection: Named selection key or raw NGL expression.
         color    : NGL color scheme or named color (default: "element").
+        exclusive: When True ("show only X"), every other representation is
+            dropped first — otherwise the structure's default full-coverage
+            layer (e.g. "protein", added on load) keeps drawing everything
+            else right alongside the new one.
 
     Returns:
         Confirmation string.
@@ -2071,38 +2076,64 @@ def tool_show(rep_type: str, selection: str, color: str = "element") -> str:
         u = get_universe()
         ngl_sel, _ = _expression_to_ngl(selection, u)
 
-    # Replace any existing representation of the same type+selection instead of stacking
-    st.session_state.representations = [
-        r for r in st.session_state.representations
-        if not (r["type"] == rep_type and r["selection"] == ngl_sel)
-    ]
+    if exclusive:
+        st.session_state.representations = []
+    else:
+        # Replace any existing representation of the same type+selection instead of stacking
+        st.session_state.representations = [
+            r for r in st.session_state.representations
+            if not (r["type"] == rep_type and r["selection"] == ngl_sel)
+        ]
     st.session_state.representations.append({
         "type": rep_type, "selection": ngl_sel,
         "color": color, "transparency": 0.0,
         "sid": _scope_for(ngl_sel),
     })
-    return f"Showing {rep_type} for '{selection}' ({color})"
+    suffix = " — everything else hidden" if exclusive else ""
+    return f"Showing {rep_type} for '{selection}' ({color}){suffix}"
 
 
 def tool_hide(selection: str) -> str:
     """
-    Remove all representation layers for a selection name or NGL expression.
+    Hide a selection: drop any layer that is exactly it, and narrow every
+    broader surviving layer so it no longer draws those atoms either.
+
+    A structure loads with one "protein"/"all"-scoped cartoon layer covering
+    every chain. Asking to hide one chain out of several used to only ever
+    remove a layer whose stored selection matched the hidden one exactly —
+    which that catch-all layer never does, so it kept right on drawing the
+    "hidden" chain and the request silently did nothing. Narrowing every
+    other surviving layer with "and not (<hidden>)" is what actually removes
+    those atoms from the picture regardless of which layer was drawing them.
 
     Args:
         selection: Named selection key or raw NGL expression to hide.
 
     Returns:
-        Status string with the number of layers removed.
+        Status string describing what changed.
     """
     ngl_sel = resolve_selection(selection)
     before = len(st.session_state.representations)
-    st.session_state.representations = [
-        r for r in st.session_state.representations
+    exclude_clause = f"and not ({ngl_sel})"
+    survivors = []
+    narrowed = 0
+    for r in st.session_state.representations:
         # Match by internal selection-name tag OR by NGL string — not both simultaneously
-        if r.get("_sel_name") != selection and r["selection"] != ngl_sel
-    ]
-    removed = before - len(st.session_state.representations)
-    return f"Removed {removed} representation(s) for '{selection}'"
+        if r.get("_sel_name") == selection or r["selection"] == ngl_sel:
+            continue
+        if exclude_clause not in r["selection"]:
+            r["selection"] = f"{r['selection']} {exclude_clause}"
+            narrowed += 1
+        survivors.append(r)
+    st.session_state.representations = survivors
+    removed = before - len(survivors)
+    detail = ", ".join(
+        p for p in (
+            f"removed {removed} layer(s)" if removed else "",
+            f"narrowed {narrowed} layer(s) to exclude it" if narrowed else "",
+        ) if p
+    ) or "no matching layers found"
+    return f"Hid '{selection}' ({detail})"
 
 
 def tool_hide_all() -> str:
@@ -3930,7 +3961,12 @@ TOOLS = [
                 "selection": {"type": "string", "description": "A selection name or NGL expression"},
                 "color": {"type": "string", "default": "element",
                           "description": ("Colour scheme or plain colour name. Schemes: "
-                                          + ", ".join(sorted(set(NGL_COLOR_SCHEMES.values()))))}
+                                          + ", ".join(sorted(set(NGL_COLOR_SCHEMES.values()))))},
+                "exclusive": {"type": "boolean", "default": False,
+                              "description": ("True when the user said 'only', 'just' or "
+                                              "'nothing else' — hides every other "
+                                              "representation first, so the viewer shows "
+                                              "this selection and nothing else.")}
             }, "required": ["rep_type", "selection"]}
         }
     },
@@ -4560,7 +4596,7 @@ TOOL_DISPATCH = {
     "select":            lambda a: tool_select(a.get("name", "sel"), a.get("expression", "all")),
     "select_within":     lambda a: tool_select_within(a.get("name", "pocket"), a.get("radius", 5.0), a.get("target_selection", "ligand")),
     "select_by_bfactor": lambda a: tool_select_by_bfactor(a.get("name", "flex"), a.get("operator", ">"), a.get("threshold", 50.0)),
-    "show":              lambda a: tool_show(a.get("rep_type", "cartoon"), a.get("selection", "protein"), a.get("color", "element")),
+    "show":              lambda a: tool_show(a.get("rep_type", "cartoon"), a.get("selection", "protein"), a.get("color", "element"), bool(a.get("exclusive", False))),
     "hide":              lambda a: tool_hide(a.get("selection", "all")),
     "hide_all":          lambda _: tool_hide_all(),
     "show_all":          lambda a: tool_show_all(a.get("rep_type", "cartoon")),
@@ -4706,11 +4742,23 @@ def _system_prompt() -> str:
         "   distances the tool gives; never invent an interaction. "
         "1. Do not call fetch_structure or load_protein for a structure already in the "
         "   scene. Loading a different one is fine and keeps the others. "
+        "1a. A chain is NOT a separately loadable structure — it is already part of "
+        "   whichever entry it belongs to. 'load chain A too' / 'also load chain H' "
+        "   when that chain's structure is already in the scene means show/select that "
+        "   chain, not a new load. Never reply that a chain was 'loaded' — say what you "
+        "   actually did (e.g. 'chain A is part of 7MN5, already in the scene — showing "
+        "   it now') or call `show`/`select` on it if that is what they clearly want. "
         "2. Call the MINIMUM tools needed. Never repeat a tool with the same arguments. "
         "3. Use a short descriptive selection name (e.g. 'nonstandard', 'atp_res', 'chain_a') — never 'sel'. "
         "4. `show` vs `select` are MUTUALLY EXCLUSIVE for the same command: "
         "   - User says 'show <type> for X' → call ONLY `show`. NEVER also call `select`. "
         "   - User says 'select X' or 'highlight X' → call ONLY `select`. Only also call `show` if the user explicitly wants a different rep type (e.g. surface, cartoon) in addition. "
+        "4a. 'show ONLY X', 'JUST show X', 'show X and hide/nothing else' → ONE `show` "
+        "   call with exclusive=true. Do NOT call `hide` for the other chains/parts one "
+        "   by one — exclusive=true already removes every other representation, "
+        "   including the full-structure layer added when the structure was loaded, "
+        "   which a per-chain `hide` never reaches. Plain 'show X' with no 'only'/'just' "
+        "   → exclusive=false (default), adding X alongside what is already shown. "
         "5. Expression rules for `select` and `show`: "
         "   - 'standard residues' or 'protein' → expression='protein' "
         "   - 'ligand' or 'small molecule' → expression='ligand' "
@@ -4734,6 +4782,16 @@ def _system_prompt() -> str:
         "   not change the interactive viewer, so never call it to 'show' something. "
         "   Use quality='publication' only if the user asks for high/publication quality. "
         "8. After your tools have run, reply with a plain-text summary. Stop calling tools. "
+        "8a. Questions about current state — 'are you showing all the chains?', 'why did "
+        "   you label X and not Y?', 'is chain A hidden?', 'what just happened?' — are "
+        "   answered ONLY from the 'Representations currently drawn' and 'Text labels "
+        "   currently pinned' lines in the Scene block above, or from a real tool call "
+        "   (e.g. `summarize_chains`). NEVER call `add_label`, `show`, `select` or any "
+        "   other mutating tool in response to a question — a question is not an "
+        "   instruction, even one phrased as 'why did you X' or ending in 'right?'. "
+        "   NEVER state a residue range, chain list or visibility fact that is not "
+        "   literally present in that Scene block; if it does not say, say you cannot "
+        "   tell from the current state instead of guessing. "
 
         "9. MDAnalysis analysis tools (a deterministic, MDAnalysis-backed fallback path "
         "   alongside the tools above) — use these when the request is phrased in raw "
@@ -4852,14 +4910,31 @@ def _state_block() -> str:
     """
     pdb = st.session_state.pdb_id or "none"
     sels = ", ".join(st.session_state.selections.keys()) or "none"
-    reps = len(st.session_state.representations)
     loaded = ", ".join(s["pdb_id"] for s in structures()) or "none"
     fits = "; ".join(f"{s['pdb_id']} superposed on {s.get('fit_reference', '?')}"
                      for s in structures() if s["matrix"]) or "none"
     focus = focus_line()
+
+    # Spelled out layer-by-layer, not just a count — a count told the model
+    # nothing to answer "are you showing all the chains?" or "why only chain
+    # B?" with, so it improvised an answer instead. This is the actual,
+    # complete list of what the viewer draws; nothing outside it is visible.
+    rep_desc = "; ".join(
+        f"{r['type']} on '{r['selection']}' ({r.get('color', 'element')})"
+        for r in st.session_state.representations
+    ) or "none"
+
+    label_desc = "; ".join(
+        f"'{a['text']}' on {a.get('desc') or a.get('target') or '?'}"
+        for a in st.session_state.annotations
+    ) or "none"
+
     return (
-        f"Scene — current structure: {pdb}. Named selections: [{sels}]. "
-        f"Active representations: {reps}. Structures in the scene: [{loaded}]. "
+        f"Scene — current structure: {pdb}. Structures in the scene: [{loaded}]. "
+        f"Named selections: [{sels}]. "
+        f"Representations currently drawn (this is everything the viewer shows, nothing "
+        f"else is visible): [{rep_desc}]. "
+        f"Text labels currently pinned: [{label_desc}]. "
         f"Superpositions: [{fits}]." + (f" {focus}" if focus else ""))
 
 
@@ -5127,7 +5202,24 @@ def _log(msg: str, level: int = logging.INFO) -> None:
     log.log(level, msg)
 
 
-def run_agent(user_prompt: str) -> str:
+def _progress(status, msg: str) -> None:
+    """
+    Mirror one high-level agent-loop step into the live "working" dialog.
+
+    `status` is an `st.status(...)` container passed down from the chat_input
+    handler, or None when run_agent() is called without one (kept optional so
+    nothing else calling run_agent has to change). Writing into it here is
+    what turns an opaque multi-second freeze into a readable trace — the same
+    events already going to `_log`, just the plain-language subset of them,
+    surfaced while the screen is still locked instead of only afterward in
+    the debug expander.
+    """
+    if status is not None:
+        status.update(label=msg)
+        status.write(msg)
+
+
+def run_agent(user_prompt: str, status=None) -> str:
     """
     Execute a gated, deduplicated multi-turn tool-calling loop for one user command.
 
@@ -5147,11 +5239,15 @@ def run_agent(user_prompt: str) -> str:
 
     Args:
         user_prompt: Natural-language command from the chat input.
+        status: optional `st.status(...)` container to narrate progress into
+            while this runs — see `_progress`. None runs silently, same as
+            before this parameter existed.
 
     Returns:
         Final agent text summary or a concatenation of tool result strings.
     """
     _log(f"📨 User: {user_prompt}")
+    _progress(status, "Reading your request…")
 
     prompt_lower = user_prompt.lower()
 
@@ -5159,6 +5255,7 @@ def run_agent(user_prompt: str) -> str:
     # Unmatched prompts continue through the original PARORA agent.
     deterministic_result = handle_deterministic_workflow(user_prompt)
     if deterministic_result is not None:
+        _progress(status, "Handled by a fast-path workflow, no model call needed.")
         return deterministic_result
 
 
@@ -5268,7 +5365,11 @@ def run_agent(user_prompt: str) -> str:
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight
     show_rep_fired = False                 # True once any non-ball+stick show has executed
 
-    for _ in range(MAX_TURNS):
+    for turn in range(MAX_TURNS):
+        _progress(
+            status,
+            "Thinking…" if turn == 0 else f"Thinking about next step (turn {turn + 1})…",
+        )
         try:
             response = ollama_client.chat(
                 model=MODEL,
@@ -5303,6 +5404,7 @@ def run_agent(user_prompt: str) -> str:
                 active_tools, tools_are_subset = TOOLS, False
                 continue
             _log(f"💬 Agent: {final_text}")
+            _progress(status, "Composing reply…")
             return final_text or ("Done: " + "; ".join(summary_parts))
 
         tool_results = []
@@ -5401,6 +5503,7 @@ def run_agent(user_prompt: str) -> str:
             dispatch = TOOL_DISPATCH.get(name)
             if not dispatch:
                 _log(f"❓ Unknown tool requested: {name}", logging.WARNING)
+            _progress(status, f"Running {name.replace('_', ' ')}…")
             t0 = time.monotonic()
             try:
                 result = dispatch(args) if dispatch else f"Unknown tool: {name}"
@@ -5425,6 +5528,9 @@ def run_agent(user_prompt: str) -> str:
                 show_rep_fired = True
 
             level = logging.ERROR if str(result).lower().startswith(("error", "tool error")) else logging.INFO
+            if status is not None:
+                ok = level != logging.ERROR
+                status.write(f"{'✓' if ok else '✗'} {name.replace('_', ' ')}")
             _log(f"🔧 {name}({args}) → {result}", level)
             summary_parts.append(f"{name}: {result}")
             tool_results.append({"tool": name, "result": result})
@@ -5452,6 +5558,7 @@ def run_agent(user_prompt: str) -> str:
         })
 
     _log("⚠️ Max turns reached", logging.WARNING)
+    _progress(status, "Stopping — reached the step limit for this request.")
     return "Done: " + "; ".join(summary_parts)
 
 
@@ -9339,9 +9446,14 @@ with left:
 
     if prompt := st.chat_input("e.g. Load pdb id, color chain A red."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.spinner("Agent reasoning..."):
-            reply = run_agent(prompt)
+        # st.status() renders and updates live during run_agent() — unlike
+        # st.spinner, it can carry a running trace of what the agent loop is
+        # doing (thinking / running a tool / composing a reply), so the
+        # screen-lock during a slow multi-turn request isn't a blank wait.
+        with st.status("🤖 Working on it…", expanded=True) as status:
+            reply = run_agent(prompt, status=status)
             st.session_state.messages.append({"role": "assistant", "content": reply})
+            status.update(label="✅ Done", state="complete", expanded=False)
         st.rerun()
 
     with st.expander("🔍 Agent Debug Logs", expanded=False):

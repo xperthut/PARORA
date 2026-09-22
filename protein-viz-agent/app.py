@@ -27,6 +27,7 @@
 # =============================================================================
 
 import streamlit as st
+import base64
 import os
 import json
 import logging
@@ -143,25 +144,34 @@ st.set_page_config(
 
 st.markdown(
     "<style>"
+    "header[data-testid='stHeader'] { height: 0; visibility: hidden; }"
     "[data-testid='stToolbar'] { display: none; }"
-    "section.main > div.block-container { padding-top: 1rem; }"
+    ".block-container { padding-top: 1rem !important; "
+    "padding-left: 2rem !important; padding-right: 2rem !important; "
+    "max-width: 100% !important; }"
     "</style>",
     unsafe_allow_html=True,
 )
 
 # ── Compact header: logo + product name + one-line description ────────────────
-col_logo, col_title = st.columns([1, 10])
-with col_logo:
-    if _LOGO.exists():
-        st.image(str(_LOGO), width=48)
-with col_title:
-    st.markdown(
-        "<div style='display:flex; flex-direction:column; justify-content:center; height:48px;'>"
-        "<span style='font-size:1.6rem; font-weight:700; line-height:1.2;'>Molecular Agent</span>"
-        "<span style='font-size:0.85rem; color:#888;'>Natural language → Tool-calling agent → Analyze and visualize molecular structures</span>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
+# Built as one inline-flex block, not st.columns — columns reserve a fixed
+# fraction of the page width per column regardless of the image's actual
+# size, which left a wide dead gap between the 48px logo and the title.
+_logo_b64 = base64.b64encode(_LOGO.read_bytes()).decode() if _LOGO.exists() else None
+_logo_img = (
+    f"<img src='data:image/png;base64,{_logo_b64}' "
+    "style='width:48px;height:48px;object-fit:contain;flex-shrink:0;'>"
+    if _logo_b64 else ""
+)
+st.markdown(
+    f"<div style='display:flex;align-items:center;gap:12px;'>"
+    f"{_logo_img}"
+    "<div style='display:flex;flex-direction:column;justify-content:center;'>"
+    "<span style='font-size:1.6rem;font-weight:700;line-height:1.2;'>Molecular Agent</span>"
+    "<span style='font-size:0.85rem;color:#888;'>Natural language → Tool-calling agent → Analyze and visualize molecular structures</span>"
+    "</div></div>",
+    unsafe_allow_html=True,
+)
 
 st.divider()
 

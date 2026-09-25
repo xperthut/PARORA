@@ -21,13 +21,90 @@
 <style>
   html,body{margin:0;padding:0;background:transparent;}
   #root{width:100%;}
+  #grip{height:10px;cursor:ns-resize;display:flex;align-items:center;
+        justify-content:center;touch-action:none;user-select:none;}
+  #grip::after{content:"";width:48px;height:4px;border-radius:2px;background:#888;opacity:.6;}
+  #grip:hover::after,#grip.drag::after{opacity:1;background:#4a90e2;}
 </style>
 <div id="root"></div>
+<div id="grip" title="Drag to resize the viewer · double-click to fit the window"></div>
 <script>
 (function () {
   var READY = false;
   var lastHtml = null;
   var seq = 0;
+
+  // ── Viewer height ──────────────────────────────────────────────────────
+  // The template draws #wrap at a fixed 680px, which is small on a tall
+  // screen. By default the viewer fills from its top edge down to the bottom
+  // of the browser window; dragging the grip under it sets an explicit
+  // height, remembered across reruns. Double-click the grip to go back to
+  // fitting the window.
+  var KEY = "parora.viewerHeight";
+  var GRIP = 10, BORDER = 2, MIN_H = 300, MAX_H = 4000;
+  var userH = null;
+  try { userH = parseInt(localStorage.getItem(KEY), 10) || null; } catch (e) {}
+
+  function autoHeight() {
+    try {
+      var top = window.frameElement.getBoundingClientRect().top;
+      return Math.max(420, Math.round(window.parent.innerHeight - top - GRIP - BORDER - 16));
+    } catch (e) {
+      return 680;   // parent not reachable (cross-origin): template default
+    }
+  }
+
+  var autoH = null;
+  function currentHeight() { return userH || autoH || (autoH = autoHeight()); }
+
+  function applyHeight(h) {
+    var wrap = document.getElementById("wrap");
+    if (wrap) { wrap.style.height = h + "px"; }
+    setFrameHeight(h + BORDER + GRIP);
+    // NGL resizes its canvas on window resize; the iframe's own resize can
+    // lag behind the frame-height message, so nudge it directly.
+    window.dispatchEvent(new Event("resize"));
+  }
+
+  try {
+    window.parent.addEventListener("resize", function () {
+      if (userH) return;
+      autoH = autoHeight();
+      applyHeight(autoH);
+    });
+  } catch (e) {}
+
+  (function () {
+    var grip = document.getElementById("grip");
+    var startY = 0, startH = 0, pending = null;
+    grip.addEventListener("pointerdown", function (e) {
+      e.preventDefault();
+      grip.setPointerCapture(e.pointerId);   // keep tracking outside the iframe
+      grip.classList.add("drag");
+      startY = e.screenY;
+      startH = currentHeight();
+    });
+    grip.addEventListener("pointermove", function (e) {
+      if (!grip.hasPointerCapture(e.pointerId)) return;
+      userH = Math.min(MAX_H, Math.max(MIN_H, Math.round(startH + e.screenY - startY)));
+      if (pending) return;
+      pending = requestAnimationFrame(function () { pending = null; applyHeight(userH); });
+    });
+    function end(e) {
+      if (!grip.hasPointerCapture(e.pointerId)) return;
+      grip.releasePointerCapture(e.pointerId);
+      grip.classList.remove("drag");
+      try { localStorage.setItem(KEY, String(userH)); } catch (err) {}
+    }
+    grip.addEventListener("pointerup", end);
+    grip.addEventListener("pointercancel", end);
+    grip.addEventListener("dblclick", function () {
+      userH = null;
+      try { localStorage.removeItem(KEY); } catch (err) {}
+      autoH = autoHeight();
+      applyHeight(autoH);
+    });
+  })();
 
   function post(msg) {
     msg.isStreamlitMessage = true;
@@ -76,13 +153,14 @@
     })(0);
   }
 
-  function render(html, height) {
+  // The Python-side `height` argument is no longer the viewer's size; the
+  // host picks it (see currentHeight) so a rebuilt scene keeps the size the
+  // user dragged it to.
+  function render(html) {
     var root = document.getElementById("root");
     root.innerHTML = html;
-    injectScripts(root, function () {
-      setFrameHeight(height || 700);
-    });
-    setFrameHeight(height || 700);
+    applyHeight(currentHeight());
+    injectScripts(root, function () { applyHeight(currentHeight()); });
   }
 
   window.addEventListener("message", function (e) {
@@ -91,9 +169,9 @@
     var html = args.html || "";
     // Streamlit re-sends render on every rerun. Rebuilding an unchanged scene
     // would drop the camera and reload every structure, so skip it.
-    if (html === lastHtml) { setFrameHeight(args.height || 700); return; }
+    if (html === lastHtml) { applyHeight(currentHeight()); return; }
     lastHtml = html;
-    render(html, args.height);
+    render(html);
   });
 
   if (!READY) {

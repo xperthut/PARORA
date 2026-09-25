@@ -810,8 +810,10 @@ def resolve_selection(sel_name_or_expr: str) -> str:
     sels = st.session_state.selections
     if sel_name_or_expr in sels:
         return sels[sel_name_or_expr]
-    # Pass-through — assume it's already a valid NGL expression
-    return sel_name_or_expr
+    # Translate plain-English phrases. NGL has no "chain" keyword: a raw
+    # "chain A" matched nothing, so "protein and not chain A" matched every
+    # chain and coloring the rest grey painted chains A and B grey too.
+    return _expression_to_ngl(sel_name_or_expr, get_universe())[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2266,6 +2268,83 @@ def _ngl_resname(resname: str) -> str:
     return f"[{rn}]" if rn and rn[0].isdigit() else rn
 
 
+def _chain_ids_present(u) -> list:
+    """Chain ids in the active structure, in file order ([] when unknown)."""
+    if u is None:
+        return []
+    try:
+        ids = getattr(u.atoms, "chainIDs", None)
+        if ids is None or not len(ids):
+            ids = u.atoms.segids
+        return list(dict.fromkeys(str(c) for c in ids if str(c).strip()))
+    except Exception:
+        return []
+
+
+# "chain A", "chains C-K", "chains C:K", "chains C to K", "chains A, B and D".
+# Each id must be a lone character, so "chain A and not chain B" stops at "and".
+_CHAIN_LIST_RE = re.compile(
+    r"\bchains?\s+([A-Za-z0-9](?:\s*(?:,|&|/|-|:|\band\b|\bor\b|\bto\b|\bthrough\b|\bthru\b)"
+    r"\s*[A-Za-z0-9](?![A-Za-z0-9]))*)(?![A-Za-z0-9])",
+    re.IGNORECASE)
+
+
+def _chain_list_to_ngl(expression: str, u=None) -> str:
+    """
+    Rewrite every "chain(s) <ids>" phrase in an expression as NGL chain syntax.
+
+    NGL has no "chain" keyword; passed through, "chains C:K" parsed as junk
+    and colouring "the other chains" grey painted every chain grey. Ranges
+    ("C-K", "C:K", "C to K") expand over the chains actually in the structure
+    when it is known, else over the alphabet.
+    """
+    present = _chain_ids_present(u)
+
+    def expand(spec: str) -> list:
+        ids = []
+        for part in re.split(r"\s*(?:,|&|/|\band\b|\bor\b)\s*", spec, flags=re.I):
+            m = re.fullmatch(r"([A-Za-z0-9])\s*(?:-|:|\bto\b|\bthrough\b|\bthru\b)\s*([A-Za-z0-9])",
+                             part.strip(), re.I)
+            if m:
+                lo, hi = m.group(1), m.group(2)
+                if lo in present and hi in present:
+                    i, j = present.index(lo), present.index(hi)
+                    ids += present[min(i, j):max(i, j) + 1]
+                else:
+                    ids += [chr(c) for c in range(ord(lo), ord(hi) + 1)]
+            elif part.strip():
+                ids.append(part.strip())
+        return list(dict.fromkeys(ids))
+
+    def sub(m):
+        ids = expand(m.group(1))
+        if len(ids) == 1:
+            return f":{ids[0]}"
+        return "(" + " or ".join(f":{c}" for c in ids) + ")"
+
+    return _CHAIN_LIST_RE.sub(sub, expression)
+
+
+# Words NGL's selection language understands. Anything else lowercase and
+# alphabetic in a selection is English the translation missed — NGL would
+# read it as a residue name and quietly select the wrong atoms.
+_NGL_WORDS = {
+    "and", "or", "not", "all", "none", "protein", "nucleic", "rna", "dna",
+    "polymer", "hetero", "ligand", "ion", "saccharide", "sugar", "water",
+    "organic", "backbone", "sidechain", "sidechainattached", "helix", "sheet",
+    "turn", "hydrophobic", "hydrophilic", "aromatic", "polar", "charged",
+    "acidic", "basic", "small", "nucleophilic", "amid", "aliphatic", "cyclic",
+    "bonded", "ring", "metal", "cg", "hydrogen", "helix", "within",
+}
+
+
+def _ngl_unknown_words(ngl_sel: str) -> list:
+    """Lowercase words in an NGL selection that NGL does not know."""
+    stripped = re.sub(r"\[[^\]]*\]|[:_@.#%/^][A-Za-z0-9,*-]*", " ", ngl_sel or "")
+    return [w for w in re.findall(r"\b[a-z][a-z]+\b", stripped)
+            if w not in _NGL_WORDS]
+
+
 def _expression_to_ngl(expression: str, u) -> tuple[str, str]:
     """
     Translate a PyMOL-style / plain-English expression to an NGL selection string.
@@ -2331,9 +2410,8 @@ def _expression_to_ngl(expression: str, u) -> tuple[str, str]:
             f" of chain {chain.upper()}" if chain else " (every chain)")
         return ngl, label
 
-    if expr_lower.startswith("chain "):
-        chain = expression.split()[-1]
-        return f":{chain}", f"chain {chain}"
+    if _CHAIN_LIST_RE.fullmatch(expression.strip()):
+        return _chain_list_to_ngl(expression.strip(), u), expression.strip()
 
     # "resn ATP" / "resname ATP" → NGL "[ATP]"
     if expr_lower.startswith("resn ") or expr_lower.startswith("resname "):
@@ -2391,7 +2469,11 @@ def _expression_to_ngl(expression: str, u) -> tuple[str, str]:
                 pass
         return "all", "B-factor filter (MDAnalysis unavailable)"
 
-    return expression, expression
+    # "chain A" inside a compound expression ("protein and not chain A") →
+    # ":A". The whole-string case is handled above; this catches the rest.
+    ngl = _chain_list_to_ngl(expression, u)
+    ngl = re.sub(r"\bsegid\s+([A-Za-z0-9])\b", r":\1", ngl, flags=re.IGNORECASE)
+    return ngl, expression
 
 
 def _add_highlight(ngl: str, name: str) -> None:
@@ -2679,20 +2761,67 @@ def tool_color(color: str, selection: str) -> str:  # noqa: D401
         Confirmation string.
     """
     color = _normalise_color(color)
+    bulk = ("cartoon", "ribbon", "tube", "rope", "backbone", "trace", "surface")
+    reps = st.session_state.representations
+
+    # "the rest" / "other chains": every layer colour() carved a piece out of
+    # still draws exactly what nobody has coloured yet, so recolour those.
+    if _REST_RE.fullmatch((selection or "").strip()):
+        rest = [r for r in reps if r["type"] in bulk and not r.get("_colored")
+                and not r.get("_sel_name")]
+        if not rest:
+            selection = "polymer"
+        else:
+            for r in rest:
+                r["color"] = color
+            return f"Colored the rest (everything not coloured explicitly) as {color}"
+
     ngl_sel = resolve_selection(selection)
+    unknown = _ngl_unknown_words(ngl_sel)
+    if unknown:
+        return (f"Error: could not read the selection '{selection}' (unknown word(s): "
+                f"{', '.join(unknown)}). Nothing was coloured. Use 'chain A', "
+                f"'chains C-K', 'chains C, D and E', or 'rest' for everything "
+                f"not yet coloured.")
+
     updated = 0
-    for r in st.session_state.representations:
+    for r in reps:
         if r["selection"] == ngl_sel:
             r["color"] = color
             updated += 1
-    if updated == 0:
-        # Add a cartoon layer with this color if nothing matches
-        st.session_state.representations.append({
-            "type": "cartoon", "selection": ngl_sel,
-            "color": color, "transparency": 0.0,
-            "sid": _scope_for(ngl_sel),
-        })
+    if updated:
+        return f"Colored '{selection}' as {color}"
+
+    # No layer is exactly this selection, so the atoms are drawn by a broader
+    # one (the load-time "protein" cartoon). Just stacking a coloured layer on
+    # top left two cartoons over the same atoms and the old colour still
+    # showed. Carve the selection out of every broader bulk layer and redraw
+    # it, in the same style, with the new colour.
+    exclude = f" and not ({ngl_sel})"
+    added = {}
+    for r in list(reps):
+        if r["type"] not in bulk or r.get("_sel_name") or not r.get("visible", True):
+            continue
+        key = (r["type"], r.get("sid"))
+        if key not in added:
+            added[key] = {"type": r["type"], "selection": ngl_sel, "color": color,
+                          "transparency": r.get("transparency", 0.0),
+                          "sid": r.get("sid") or _scope_for(ngl_sel), "_colored": True}
+        if exclude not in r["selection"]:
+            r["selection"] = f"({r['selection']}){exclude}"
+    if not added:
+        added[("cartoon", None)] = {"type": "cartoon", "selection": ngl_sel,
+                                    "color": color, "transparency": 0.0,
+                                    "sid": _scope_for(ngl_sel), "_colored": True}
+    reps.extend(added.values())
     return f"Colored '{selection}' as {color}"
+
+
+_REST_RE = re.compile(
+    r"(?:the\s+)?(?:rest|others?|remaining|remainder|everything\s+else|"
+    r"(?:all\s+)?(?:the\s+)?(?:other|remaining)\s+(?:chains?|parts?|residues?)|"
+    r"rest\s+of\s+(?:the\s+)?(?:protein|chains?|structure|molecule))",
+    re.IGNORECASE)
 
 
 def tool_set_transparency(value: float, selection: str) -> str:
@@ -4545,10 +4674,11 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "color",
-            "description": "Apply a color to a selection. Color can be a name (red, green, blue, white) or scheme (element, spectrum, chainname, residueindex, bfactor)",
+            "description": "Apply a color to a selection. Color can be a name (red, green, blue, white) or scheme (element, spectrum, chainname, residueindex, bfactor). For 'chain A red, chain B blue, rest grey' make one call per part, in that order, the last with selection 'rest'.",
             "parameters": {"type": "object", "properties": {
                 "color": {"type": "string"},
-                "selection": {"type": "string"}
+                "selection": {"type": "string",
+                              "description": "e.g. 'chain A', 'chains C-K', 'chains C, D and E', 'ligand', or 'rest' = everything not coloured by an earlier call"}
             }, "required": ["color", "selection"]}
         }
     },

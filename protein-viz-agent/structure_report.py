@@ -560,6 +560,80 @@ def summarize(pdb_path) -> dict:
     }
 
 
+# ── Chain identities ──────────────────────────────────────────────────────
+
+
+def chain_molecules(pdb_path) -> list:
+    """
+    Which molecule each chain of a PDB file is, and which residues it observes.
+
+    A complex names every chain's molecule in COMPND (MOL_ID blocks) and its
+    UniProt accession in DBREF. Without this, "which chain is HER2" can only be
+    guessed — and chain A is often not the protein that was searched for (in
+    7MN5, chain A is HER3 and HER2 is chain B). The observed range comes from
+    the ATOM records, not DBREF: DBREF describes the construct, which can span
+    far more than the density resolved.
+
+    Returns:
+        One dict per polymer chain, in file order: chain, molecule (readable
+        COMPND name, or ""), uniprot (accessions from DBREF), first/last
+        observed residue number, residues (observed count).
+    """
+    names, uniprot, observed, order = {}, {}, {}, []
+    mol_name, mol_chains, cont = {}, {}, ""
+    try:
+        fh = open(pdb_path, "r", errors="replace")
+    except OSError:
+        return []
+    with fh:
+        for line in fh:
+            rec = line[:6]
+            if rec == "COMPND":
+                text = line[10:80].rstrip()
+                # A field can wrap onto the next COMPND line with no key.
+                if cont and ":" not in text.split(";")[0]:
+                    text = cont + " " + text.strip()
+                cont = "" if text.rstrip().endswith(";") else text
+                m = re.match(r"\s*(MOL_ID|MOLECULE|CHAIN):\s*(.*?);?\s*$", text)
+                if not m:
+                    continue
+                key, val = m.group(1), m.group(2).strip()
+                if key == "MOL_ID":
+                    mol = val
+                elif key == "MOLECULE":
+                    mol_name[mol] = val.rstrip(",")
+                else:
+                    mol_chains[mol] = [c.strip() for c in val.split(",") if c.strip()]
+            elif rec == "DBREF ":
+                chain = line[12:13].strip() or "_"
+                if line[26:32].strip() == "UNP":
+                    acc = line[33:41].strip()
+                    if acc and acc not in uniprot.setdefault(chain, []):
+                        uniprot[chain].append(acc)
+            elif rec == "ATOM  ":
+                chain = line[21:22].strip() or "_"
+                try:
+                    num = int(line[22:26])
+                except ValueError:
+                    continue
+                if chain not in observed:
+                    observed[chain] = {"first": num, "last": num, "seen": set()}
+                    order.append(chain)
+                o = observed[chain]
+                o["first"], o["last"] = min(o["first"], num), max(o["last"], num)
+                o["seen"].add((num, line[26:27]))
+            elif rec == "ENDMDL":
+                break               # the first model is enough to name chains
+    for mol, chains in mol_chains.items():
+        for c in chains:
+            names[c] = mol_name.get(mol, "")
+    return [{"chain": c,
+             "molecule": pretty_chemical(names[c]) if names.get(c) else "",
+             "uniprot": uniprot.get(c, []),
+             "first": observed[c]["first"], "last": observed[c]["last"],
+             "residues": len(observed[c]["seen"])} for c in order]
+
+
 # ── Output formats ────────────────────────────────────────────────────────
 
 

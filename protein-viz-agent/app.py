@@ -347,6 +347,74 @@ def active_structure():
         structures()[0] if structures() else None)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_chain_molecules(path: str, mtime: float):
+    """srep.chain_molecules, cached on the file's contents."""
+    return srep.chain_molecules(path)
+
+
+def chain_molecules(entry) -> list:
+    """Which molecule each chain of a loaded structure is, or [] if unreadable."""
+    if not entry or not Path(entry["path"]).exists():
+        return []
+    p = Path(entry["path"])
+    return _cached_chain_molecules(str(p), p.stat().st_mtime)
+
+
+_WHOLE_SELECTIONS = {"", "*", "all", "protein", "polymer", "backbone", "sidechain",
+                     "chains", "not water", "not hetero"}
+
+
+def chains_drawn(entry) -> set:
+    """
+    Chains of a structure that some visible layer draws, as far as can be told.
+
+    A layer on 'protein' draws every chain; ':A' or 'chain A' draws one.
+    Anything else (a ligand, a residue range) is not counted as drawing a
+    chain. Without this the model read "cartoon on 'protein'" and told the
+    user the non-HER2 chains of 7MN5 were hidden, when they were on screen.
+    """
+    if not entry or not entry.get("visible", True):
+        return set()
+    every = {c["chain"] for c in chain_molecules(entry)}
+    drawn = set()
+    for rep in st.session_state.representations:
+        if not rep.get("visible", True) or not rep_applies_to(rep, entry["sid"]):
+            continue
+        sel = str(rep.get("selection", "")).strip()
+        if sel.lower() in _WHOLE_SELECTIONS:
+            return every
+        drawn |= {c for c in re.findall(r"(?::|\bchain\s+)([A-Za-z0-9])\b", sel)} & every
+    return drawn
+
+
+def chain_map_line(entry, accession: str = "", show_drawn: bool = False) -> str:
+    """
+    '7MN5 chains: A = erbb-3 (P21860, res 28-630); B = erbb-2 ... ← focus protein'.
+
+    Every chain in the file, not only the one belonging to the protein that was
+    searched for: the agent used to answer "which chain is loaded" with "chain
+    A" for 7MN5 — which is HER3, not the HER2 the user asked for.
+    """
+    rows = chain_molecules(entry)
+    if not rows:
+        return ""
+    base = accession.split("-")[0] if accession else ""
+    drawn = chains_drawn(entry) if show_drawn else set()
+    parts = []
+    for r in rows:
+        mol = r["molecule"] or "unnamed molecule"
+        acc = ", ".join(r["uniprot"])
+        bit = (f"{r['chain']} = {mol}" + (f" ({acc})" if acc else "")
+               + f", residues {r['first']}-{r['last']} observed")
+        if show_drawn:
+            bit += ", drawn in the viewer" if r["chain"] in drawn else ", not drawn"
+        if base and any(a.split("-")[0] == base for a in r["uniprot"]):
+            bit += " ← the working-context protein"
+        parts.append(bit)
+    return f"{entry['pdb_id']} chains: " + "; ".join(parts)
+
+
 def _sync_active() -> None:
     """
     Mirror the active structure into the legacy single-structure session keys.
@@ -432,8 +500,8 @@ def reset_structures() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # What the conversation is *about*, as distinct from what happens to be loaded.
 #
-# run_agent() rebuilds its message list from scratch every turn, so the agent
-# sees no chat history at all. Without a focus, an unqualified follow-up — "find
+# run_agent() rebuilds its message list from scratch every turn, and carries
+# only a few trimmed chat turns (_history_block). Without a focus, an unqualified follow-up — "find
 # residues 1-500", "what ligands are there" — carries no trace of the protein
 # looked up three messages ago, and the model is free to start the search over
 # and land on a different entry. The focus pins that subject: it is set the
@@ -493,12 +561,19 @@ def note_focus_structure(pdb_id: str) -> None:
     row = next((r for r in prof["structures"] if r["pdb_id"].upper() == key), None)
     if not row:
         return
+    # UniProt's start/end is the span the deposited construct maps to, which
+    # can be far wider than what was resolved: 7MN5's HER2 construct maps to
+    # 1-1029, but the file only has residues 24-629. Record what is actually
+    # in the file for the focus protein's own chains.
+    observed = [c for c in chain_molecules(find_structure(key))
+                if any(a.split("-")[0] == focus["accession"] for a in c["uniprot"])]
     focus["entries"][key] = {
         "start":    row.get("start"),
         "end":      row.get("end"),
         "coverage": row.get("coverage_pct"),
         "method":   row.get("method") or "",
-        "chains":   list(row.get("chains") or []),
+        "chains":   [c["chain"] for c in observed] or list(row.get("chains") or []),
+        "observed": [(c["chain"], c["first"], c["last"]) for c in observed],
     }
 
 
@@ -523,10 +598,13 @@ def focus_line() -> str:
         parts = []
         for k in loaded:
             e = f["entries"][k]
-            span = (f"UniProt residues {e['start']}-{e['end']}"
+            span = (f"construct maps to UniProt residues {e['start']}-{e['end']}"
                     if e["start"] and e["end"] else "span unknown")
-            cov = f", {e['coverage']:.0f}% of the sequence" if e["coverage"] else ""
-            parts.append(f"{k} ({e['method'] or 'method unknown'}, {span}{cov})")
+            obs = e.get("observed") or []
+            if obs:
+                span += "; " + ", ".join(
+                    f"chain {c} has residues {a}-{b} in the file" for c, a, b in obs)
+            parts.append(f"{k} ({e['method'] or 'method unknown'}, {span})")
         out.append("Structures of it already in the scene: " + "; ".join(parts) + ".")
     else:
         out.append("No structure of it is loaded yet.")
@@ -844,16 +922,46 @@ def tool_protein_structures(name: str = "", method: str = "",
     if not rows:
         return (f"No structure of {prof['protein_name']} matches those criteria "
                 f"({prof['totals']['structures']} exist in total).")
-    ranked = pacc.rank_structures(rows)[:max(1, int(limit or 10))]
-    out = [f"{prof['protein_name']} ({prof['accession']}) — "
-           f"{len(rows)} matching structures, best first:"]
-    for r in ranked:
+    who = prof.get("gene") or "this protein"
+
+    def row_line(r):
         res = f"{r['resolution']:.2f} A" if r["resolution"] is not None else "no resolution"
         lig = ", ".join(l["code"] for l in pacc.notable_ligands(r)[:3]) or "none"
-        out.append(f"  {r['pdb_id']}: {r['method']}, {res}, residues "
-                   f"{r['start']}-{r['end']} ({r['coverage_pct']:.0f}% of the protein), "
-                   f"chains {'/'.join(r['chains']) or '?'}, ligands: {lig}"
-                   + (f" — {r['title'][:60]}" if r["title"] else ""))
+        partners = ", ".join((r.get("partners") or [])[:3])
+        return (f"  {r['pdb_id']}: {r['method']}, {res}, construct maps to residues "
+                f"{r['start']}-{r['end']} ({r['coverage_pct']:.0f}% of the protein), "
+                f"{who} is chain {'/'.join(r['chains']) or '?'} in this entry, ligands: {lig}"
+                + (f", bound to: {partners}" if partners else ", no other protein")
+                + (f" — {r['title'][:60]}" if r["title"] else ""))
+
+    out = [f"{prof['protein_name']} ({prof['accession']}, {prof.get('length') or '?'} aa) — "
+           f"{len(rows)} matching structures. Chain letters are labels inside each "
+           f"entry file, not parts of the protein: {who} can be chain A in one entry "
+           f"and chain B in another. Group answers by region/entry, never by chain letter."]
+    # Unfiltered, the question is usually "what is there for this protein" —
+    # which parts of it have structures. A flat top-10 by coverage showed only
+    # the extracellular-domain complexes for HER2 and hid its kinase domain.
+    filtered = bool(method or (max_resolution and max_resolution > 0) or ligands_only)
+    regions = prof.get("regions") or []
+    shown = set()
+    if regions and not filtered:
+        keep = {r["pdb_id"] for r in rows}
+        for g in regions[:6]:
+            ids = [i for i in g["pdb_ids"] if i in keep]
+            if not ids:
+                continue
+            members = pacc.rank_structures([r for r in rows if r["pdb_id"] in ids])[:3]
+            out.append(f"Region {g['start']}-{g['end']} ({g['label']}): "
+                       f"{len(ids)} structures, best:")
+            out.extend(row_line(r) for r in members)
+            shown |= {r["pdb_id"] for r in members}
+    else:
+        for r in pacc.rank_structures(rows)[:max(1, int(limit or 10))]:
+            out.append(row_line(r))
+            shown.add(r["pdb_id"])
+    rest = len(rows) - len(shown)
+    if rest > 0:
+        out.append(f"{rest} more not listed; filter by method, resolution or ligands to narrow.")
     return "\n".join(out)
 
 
@@ -952,12 +1060,37 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
     best = pacc.rank_structures(rows, prefer)[0]
     msg = tool_add_structure(best["pdb_id"])
     res = f"{best['resolution']:.2f} Å" if best["resolution"] is not None else "no resolution"
+    # Say which chain is the protein asked for, and what else is in the file —
+    # the top-ranked entry is often a complex, and its chain A is not
+    # necessarily the protein that was searched for.
+    entry = find_structure(best["pdb_id"])
+    chains = chain_molecules(entry)
+    ours = [c for c in chains
+            if any(a.split("-")[0] == prof["accession"] for a in c["uniprot"])]
+    if ours:
+        where = "; ".join(f"chain {c['chain']}, residues {c['first']}-{c['last']} resolved"
+                          for c in ours)
+        others = [c for c in chains if c not in ours]
+        where = (f" {prof.get('gene') or prof['protein_name']} is {where}"
+                 + (" (the construct maps to UniProt "
+                    f"{best['start']}-{best['end']}, but only the resolved residues are in the file)"
+                    if best["start"] and best["end"] else ""))
+        if others:
+            where += (". The file also contains " + "; ".join(
+                f"chain {c['chain']} = {c['molecule'] or 'unnamed'}" for c in others))
+        drawn = chains_drawn(entry)
+        if drawn and len(drawn) == len(chains):
+            where += f". All {len(chains)} chains are drawn in the viewer"
+        where += "."
+    else:
+        where = (f" Residues {best['start']}–{best['end']} of the sequence "
+                 f"({best['coverage_pct']:.0f}%).")
     return (f"{msg} {best['pdb_id']} is the {prefer} choice for "
-            f"{prof['protein_name']} ({prof['accession']}): {best['method']}, {res}, "
-            f"residues {best['start']}–{best['end']} "
-            f"({best['coverage_pct']:.0f}% of the sequence)"
-            + (f", {best['title']}" if best["title"] else "")
-            + f". {len(rows)} structures of this protein are loadable in total.")
+            f"{prof['protein_name']} ({prof['accession']}): {best['method']}, {res}"
+            + (f", {best['title']}" if best["title"] else "") + "."
+            + where
+            + f" {len(rows)} structures of this protein are loadable in total "
+              "(protein_structures lists them).")
 
 
 # ── Structure preparation ────────────────────────────────────────────────────
@@ -1982,8 +2115,12 @@ def tool_list_structures() -> str:
             bits.append("(hidden)")
         if s["fit"]:
             bits.append(f"— superposed: {s['fit']}")
+        chains = chain_map_line(s, (st.session_state.focus or {}).get("accession", ""),
+                                show_drawn=True)
+        if chains:
+            bits.append(f"— {chains}")
         lines.append(" ".join(bits))
-    return "Loaded structures: " + "; ".join(lines)
+    return "Loaded structures: " + "\n".join(lines)
 
 
 def _ngl_resname(resname: str) -> str:
@@ -3373,15 +3510,19 @@ def _format_nearby_residue_summary(df, selection: str, cutoff: float) -> str:
 
 def tool_summarize_chains() -> str:
     """Summarize chains/segments in the currently loaded structure."""
+    # Chain identities come from the file's own COMPND/DBREF records, so this
+    # names each chain's molecule even when MDAnalysis is unavailable.
+    names = chain_map_line(active_structure(),
+                           (st.session_state.focus or {}).get("accession", ""))
     u = get_universe()
     if not u:
-        return "Load a protein structure before requesting a chain summary."
+        return names or "Load a protein structure before requesting a chain summary."
 
     try:
         df = summarize_chains_from_universe(u)
-        return _format_chain_summary(df)
+        return (names + "\n\n" if names else "") + _format_chain_summary(df)
     except Exception as e:
-        return f"Error summarizing chains: {e}"
+        return names or f"Error summarizing chains: {e}"
 
 
 def tool_list_residues(
@@ -3987,9 +4128,14 @@ TOOLS = [
             "name": "protein_structures",
             "description": (
                 "List the PDB structures of a protein as a table, best first, with "
-                "optional filters on technique, resolution and bound ligands. Use this "
-                "for 'list the X-ray structures of X', 'which structures of X have a "
-                "ligand bound', 'show me high resolution structures of X'. Loads nothing."
+                "optional filters on technique, resolution and bound ligands. Each row "
+                "gives the residues covered, which chain(s) the protein is in that entry, "
+                "and the other molecules it is bound to. Use this for 'list the X-ray "
+                "structures of X', 'which structures of X have a ligand bound', 'show me "
+                "high resolution structures of X', and for questions about the PROTEIN "
+                "beyond the loaded file: 'what other structures / chains / entries / "
+                "domains / regions exist for this protein', 'other structures of it'. "
+                "Loads nothing."
             ),
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Protein name or accession; empty reuses the last lookup"},
@@ -4443,7 +4589,10 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "list_structures",
-            "description": "List the structures currently in the scene and how they are placed",
+            "description": ("List the structures currently in the scene, how they are placed, "
+                            "and every chain of each file with the molecule it is and the "
+                            "residues it has. Only the loaded files — for other structures "
+                            "of a protein use protein_structures."),
             "parameters": {"type": "object", "properties": {}}
         }
     },
@@ -4534,7 +4683,9 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "summarize_chains",
-            "description": "Summarize available chains/segments in the currently loaded protein structure.",
+            "description": ("Summarize the chains of the active loaded structure: which "
+                            "molecule each chain is, its UniProt accession, and residue counts. "
+                            "Answers 'what chains are in this structure', 'which chain is X'."),
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -4981,6 +5132,28 @@ def _system_prompt() -> str:
         "   to the user and stop — do not choose. When the user then says to search "
         "   online → `find_structural_neighbors` with where='online'; when they say to "
         "   download the database → `download_foldseek_database`. "
+        "0a6. SCENE vs PROTEIN. Two different questions: "
+        "   - About the LOADED FILE — 'what chain is loaded', 'which chain is HER2', "
+        "     'what chains are in this structure' → answer from the 'chains' list in the "
+        "     Scene block (every chain of a loaded file is in the scene, with the "
+        "     molecule it is). Name the chain that IS the working-context protein; never "
+        "     assume it is chain A. Mention the other molecules in the file too. "
+        "   - About the PROTEIN beyond the loaded file — 'other chains / structures / "
+        "     entries / regions available for this protein', 'I mean the protein, not the "
+        "     scene' → ONE `protein_structures` call (no name needed; it reuses the "
+        "     working context). Report entries, residue ranges, which chain the protein "
+        "     is in each, and the partner molecules. This is NOT a `protein_function` "
+        "     question. "
+        "   Residue ranges: report what the file actually has ('residues 24-629 "
+        "   resolved'), not only the UniProt span the construct maps to. "
+        "0a7. EARLIER CONVERSATION. The user message may start with the last few chat "
+        "   turns. Use them only to resolve what 'it', 'this protein', 'the other ones' "
+        "   or a correction like 'I meant X, not Y' refers to — a correction means your "
+        "   previous answer missed the question, so answer the corrected question, not "
+        "   the old one and not a different one. Act only on the newest request. "
+        "   The earlier turns are TRIMMED and are not a source of facts: never copy "
+        "   accessions, residue ranges or chain letters out of them — call the tool that "
+        "   answers the question (e.g. `protein_structures`) and report its result. "
         "0d2. Preparing a structure — 'keep only one state', 'remove the other "
         "   models', 'this NMR structure has 20 states', 'clean it up', 'add "
         "   hydrogens', 'get it ready for Amber / Rosetta / simulation' → ONE "
@@ -5057,6 +5230,8 @@ def _system_prompt() -> str:
         "   not change the interactive viewer, so never call it to 'show' something. "
         "   Use quality='publication' only if the user asks for high/publication quality. "
         "8. After your tools have run, reply with a plain-text summary. Stop calling tools. "
+        "   Write the reply for the user only — never add remarks about tools, such as "
+        "   'no further tools are needed'. "
         "8a. Questions about current state — 'are you showing all the chains?', 'why did "
         "   you label X and not Y?', 'is chain A hidden?', 'what just happened?' — are "
         "   answered ONLY from the 'Representations currently drawn' and 'Text labels "
@@ -5209,7 +5384,7 @@ def _state_block() -> str:
         for a in st.session_state.annotations
     ) or "none"
 
-    # run_agent sends no chat history, so a bare "download it" / "search
+    # run_agent sends only trimmed history, so a bare "download it" / "search
     # online" reply would otherwise arrive with nothing to answer.
     pending = st.session_state.get("foldseek_pending")
     pending_line = (
@@ -5218,13 +5393,77 @@ def _state_block() -> str:
         "or download the local Foldseek database. If this message answers it: online → "
         "find_structural_neighbors(where='online'); download → download_foldseek_database."
         if pending else "")
+    # Chain identities of every loaded file. Every chain of a loaded file is in
+    # the scene — "which chain is loaded" was otherwise answered "chain A" by
+    # guesswork, for a file whose chain A was a different protein.
+    acc = (st.session_state.focus or {}).get("accession", "")
+    chain_desc = " ".join(x for x in (chain_map_line(s, acc, show_drawn=True)
+                                      for s in structures()) if x)
     return (
         f"Scene — current structure: {pdb}. Structures in the scene: [{loaded}]. "
-        f"Named selections: [{sels}]. "
+        + (f"Every chain of each loaded file is in the scene: {chain_desc}. " if chain_desc else "")
+        + f"Named selections: [{sels}]. "
         f"Representations currently drawn (this is everything the viewer shows, nothing "
         f"else is visible): [{rep_desc}]. "
         f"Text labels currently pinned: [{label_desc}]. "
         f"Superpositions: [{fits}]." + (f" {focus}" if focus else "") + pending_line)
+
+
+HISTORY_TURNS = 6          # chat messages (user + assistant) carried into a request
+HISTORY_CHARS = 500        # per message; long tool dumps are trimmed
+
+
+def _history_block() -> str:
+    """
+    The last few chat turns, as context for the newest request.
+
+    run_agent used to send no history at all, so a follow-up such as "I am
+    talking about the protein, not the scene" arrived with nothing to correct
+    — the model guessed a new question (protein_function) instead of
+    answering the one it had just missed. The focus line pins the protein;
+    this carries what was actually asked and answered. Kept short and in the
+    volatile user message so the cached system prefix is untouched.
+    """
+    msgs = st.session_state.get("messages") or []
+    # The chat handler appends the current prompt before calling run_agent.
+    if msgs and msgs[-1].get("role") == "user":
+        msgs = msgs[:-1]
+    recent = msgs[-HISTORY_TURNS:]
+    if not recent:
+        return ""
+    lines = []
+    for m in recent:
+        text = " ".join(str(m.get("content", "")).split())
+        if len(text) > HISTORY_CHARS:
+            text = text[:HISTORY_CHARS] + " … [trimmed]"
+        who = "User" if m.get("role") == "user" else "You"
+        lines.append(f"{who}: {text}")
+    return "Earlier conversation (context only — act on the newest request):\n" + "\n".join(lines)
+
+
+# Lines a local model sometimes appends that describe its own tool use rather
+# than answer the user, e.g. "No further tools are needed based on the current
+# request."
+_META_LINE = re.compile(
+    r"^\s*(\(?\s*)?(no (further|additional|more|other) (tool|function)s?( calls?)? (are |is )?"
+    r"(needed|required|necessary)|i (will|do) not (need to )?call (any )?(more |further )?tools?|"
+    r"tool execution is complete)\b.*$",
+    re.IGNORECASE)
+
+
+# "Other chains/structures available for this protein", "I mean the protein, not
+# the scene" — questions about the protein across the PDB, not the loaded file.
+PROTEIN_LEVEL_RE = re.compile(
+    r"\b(other|more|all|available|different|additional)\s+(\w+\s+)?"
+    r"(chains?|structures?|entries|pdbs?|depositions?|models?)\b"
+    r"|\bthe protein,?\s+not\b|\bnot\s+(just\s+)?(what|which|the one)?.{0,20}\b(current\s+)?scene\b"
+    r"|\bbeyond\s+(the\s+)?(current\s+|loaded\s+)?(scene|file|structure)\b")
+
+
+def _clean_reply(text: str) -> str:
+    """Drop tool-use meta remarks from a final reply."""
+    kept = [ln for ln in text.splitlines() if not _META_LINE.match(ln)]
+    return "\n".join(kept).strip()
 
 
 def _tc_args(tc: dict) -> dict:
@@ -5618,9 +5857,12 @@ def run_agent(user_prompt: str, status=None) -> str:
     # message alongside the scene state, same reasoning as _state_block().
     grounding = format_grounding(user_prompt)
     grounding_block = f"{grounding}\n\n" if grounding else ""
+    history = _history_block()
+    history_block = f"{history}\n\n" if history else ""
     messages = [
         {"role": "system", "content": _system_prompt()},
-        {"role": "user", "content": f"{_state_block()}\n\n{grounding_block}{user_prompt}"}
+        {"role": "user", "content": (f"{_state_block()}\n\n{grounding_block}{history_block}"
+                                     f"Newest request: {user_prompt}")}
     ]
 
     active_tools, tools_are_subset = TOOLS, False
@@ -5663,6 +5905,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     called_sigs: set[str] = set()          # Tracks (name, args) pairs to avoid exact repeats
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight
     show_rep_fired = False                 # True once any non-ball+stick show has executed
+    protein_nudged = False                 # One retry for a tool-less protein-level answer
 
     for turn in range(MAX_TURNS):
         _progress(
@@ -5702,9 +5945,26 @@ def run_agent(user_prompt: str, status=None) -> str:
                     f"{len(TOOLS)} schemas")
                 active_tools, tools_are_subset = TOOLS, False
                 continue
+            # A question about the protein beyond the loaded file, answered
+            # with no lookup at all: qwen2.5:7b does this about half the time
+            # for "I mean the protein, not the scene", reciting the loaded
+            # file's chains as if they were the protein's other structures.
+            # One nudge towards the tool that actually answers it.
+            if (not summary_parts and not protein_nudged and st.session_state.focus
+                    and PROTEIN_LEVEL_RE.search(prompt_lower)
+                    and not re.search(r"\b(colou?r|show|hide|select|highlight|label|zoom|"
+                                      r"superpose|align|measure|remove)\b", prompt_lower)):
+                protein_nudged = True
+                _log("↻ Protein-level question answered with no tool — nudging to protein_structures")
+                messages.append({"role": "assistant", "content": msg.get("content", "")})
+                messages.append({"role": "user", "content": (
+                    "That answer used no tool. The question is about the protein's structures "
+                    "in the PDB beyond the loaded file. Call `protein_structures` (no filters) "
+                    "and answer from its result, grouped by region.")})
+                continue
             _log(f"💬 Agent: {final_text}")
             _progress(status, "Composing reply…")
-            reply = final_text or ("Done: " + "; ".join(summary_parts))
+            reply = _clean_reply(final_text) or ("Done: " + "; ".join(summary_parts))
             question = st.session_state.pop("foldseek_question", None)
             if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
                 reply = f"{reply}\n\n{question}"
@@ -5739,6 +5999,26 @@ def run_agent(user_prompt: str, status=None) -> str:
                         f"🧭 Injected explicit salt-bridge chain scope: "
                         f"{args['chain']}"
                     )
+
+            # Structure-list filters only when the user asked for them. With
+            # chat history in context, qwen2.5:7b carried "7MN5 is Cryo-EM"
+            # into a follow-up as method='Cryo-EM', max_resolution=3.5 and
+            # silently hid 49 of HER2's 63 structures.
+            if name == "protein_structures":
+                unasked = []
+                if args.get("method") and not re.search(
+                        r"x-?ray|crystal|nmr|cryo|electron|\bem\b|method|techni", prompt_lower):
+                    unasked.append("method")
+                if args.get("max_resolution") and not re.search(
+                        r"resolution|å|\bangstrom|\d\s*a\b|high[- ]res|sharp", prompt_lower):
+                    unasked.append("max_resolution")
+                if args.get("ligands_only") and not re.search(
+                        r"ligand|bound|inhibitor|drug|compound|cofactor", prompt_lower):
+                    unasked.append("ligands_only")
+                for k in unasked:
+                    args.pop(k, None)
+                if unasked:
+                    _log(f"🧭 Dropped unrequested protein_structures filters: {unasked}")
 
             # ── Gate: select ────────────────────────────────────────────────
             # Block select when: a show already fired this run, or a

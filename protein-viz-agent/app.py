@@ -836,19 +836,127 @@ def _cached_protein_profile(accession: str, schema: int):
     return pacc.profile(accession)
 
 
+# ── Clarification ────────────────────────────────────────────────────────────
+# When a request has more than one reasonable reading, the agent asks instead
+# of guessing. A question is stored here with its choices and the request that
+# raised it; run_agent returns it to the user at once, the chat shows each
+# choice as a button, and the reply ("2", "the second one", the choice's own
+# text) re-runs the original request with that meaning spelled out.
+#
+#   question  one sentence
+#   options   [{"label": shown to the user, "meaning": what the choice means,
+#              written as an instruction the agent can act on}]
+#   request   the user message that raised the question
+
+def ask_clarification(question: str, options: list, request: str = "") -> str:
+    """Record a question for the user; returns the tool-result text for it."""
+    opts = []
+    for o in options:
+        if isinstance(o, dict):
+            label = str(o.get("label") or o.get("meaning") or "").strip()
+            meaning = str(o.get("meaning") or label).strip()
+        else:
+            label = meaning = str(o).strip()
+        if label:
+            opts.append({"label": label, "meaning": meaning})
+    if len(opts) == 1:
+        return "ask_user needs at least two distinct options, or none for an open question."
+    st.session_state.clarify = {
+        "question": question.strip(),
+        "options": opts[:5],
+        "request": request or st.session_state.get("current_request", ""),
+    }
+    return "NEEDS USER CHOICE — asked the user: " + clarification_text()
+
+
+def clarification_text() -> str:
+    """The pending question, as the chat reply shows it."""
+    c = st.session_state.get("clarify")
+    if not c:
+        return ""
+    lines = [c["question"]]
+    lines += [f"{i}. {o['label']}" for i, o in enumerate(c["options"], 1)]
+    return "\n".join(lines)
+
+
+_ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+             "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+             "former": 1, "latter": 2, "last": -1}
+
+
+def resolve_clarification(pending: dict, reply: str):
+    """
+    Which option a reply to a pending question picks, or None.
+
+    Accepts "2", "option 2", "#2", "the second one", "the latter", the
+    option's own text, or a reply containing exactly one option's text.
+    """
+    opts = pending["options"]
+    if not opts:                      # an open question: the reply is the answer
+        return None
+    r = reply.strip().lower().rstrip(".!")
+    m = re.fullmatch(r"(?:option\s*|choice\s*|#|no\.?\s*)?(\d)\)?", r)
+    if m and 1 <= int(m.group(1)) <= len(opts):
+        return opts[int(m.group(1)) - 1]
+    m = re.fullmatch(r"(?:the\s+)?(?:option\s+)?(\w+)(?:\s+(?:one|option|choice))?", r)
+    if m and m.group(1) in _ORDINALS:
+        i = _ORDINALS[m.group(1)]
+        if i == -1 or 1 <= i <= len(opts):
+            return opts[i - 1] if i != -1 else opts[-1]
+    for o in opts:
+        if r == o["label"].lower():
+            return o
+    hits = [o for o in opts if o["label"].lower() in r]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _hit_exactness(h: dict, q: str) -> int:
+    """0 gene/accession, 1 name/alt name, 2 gene synonym, 3 no exact match."""
+    q = q.strip().lower()
+    if h["gene"].lower() == q or h["accession"].lower() == q:
+        return 0
+    if h["protein_name"].lower() == q or q in {a.lower() for a in h["alt_names"]}:
+        return 1
+    if q in {g.lower() for g in h["gene_synonyms"]}:
+        return 2
+    return 3
+
+
 def resolve_protein(name: str, organism: str = "human"):
     """
     Look a protein name up and remember the result for the Proteins panel.
 
     Returns:
         (profile, error). The profile and the full hit list are also written to
-        session state so the panel shows whatever the agent just found.
+        session state so the panel shows whatever the agent just found. When
+        the name matches no entry exactly, the error is a NEEDS USER CHOICE
+        question instead of a silent pick of the first hit.
     """
     hits, err = _cached_protein_search(name, organism, True, pacc.SCHEMA_VERSION)
     if err:
         return None, err
     if not hits:
         return None, f"No UniProt entry matches '{name}'" + (f" in {organism}." if organism else ".")
+    # UniProt's first hit is only trustworthy when the name matches it exactly
+    # (gene, accession, name or synonym). Otherwise it is a text-relevance
+    # guess: "spike" → moesin, "actin" → gelsolin, "ras" → RIN2, "ubiquitin" →
+    # USP46. Ask rather than load the wrong protein.
+    focus = st.session_state.get("focus") or {}
+    already = name.strip().lower() in {str(focus.get(k, "")).lower()
+                                       for k in ("accession", "gene", "query")} - {""}
+    if not already and _hit_exactness(hits[0], name) == 3:
+        opts = [{"label": f"{h['gene'] or h['accession']} — {h['protein_name']} "
+                          f"({h['organism'] or 'unknown organism'}, {h['accession']})",
+                 "meaning": f"by '{name}' I mean UniProt {h['accession']} "
+                            f"({h['protein_name']}); use the accession {h['accession']} "
+                            f"as the protein name"}
+                for h in hits[:4]]
+        opts.append({"label": f"None of these — search '{name}' in every organism",
+                     "meaning": f"search '{name}' with organism='' (any species), then "
+                                f"ask me which entry if it is still not an exact match"})
+        return None, ask_clarification(
+            f"'{name}' does not exactly match a UniProt protein"
+            + (f" in {organism}" if organism else "") + ". Which one do you mean?", opts)
     prof, err = _cached_protein_profile(hits[0]["accession"], pacc.SCHEMA_VERSION)
     if err:
         return None, err
@@ -2102,6 +2210,27 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
     return "\n".join(lines)
 
 
+def tool_ask_user(question: str, options) -> str:
+    """
+    Put a clarifying question to the user instead of guessing.
+
+    Args:
+        question: One short question.
+        options : 2-4 concrete readings of the request. A single string of
+                  comma/semicolon/newline-separated choices is split, since a
+                  small model sometimes sends the list that way.
+
+    Returns:
+        NEEDS USER CHOICE text, or why the question could not be asked.
+    """
+    if isinstance(options, str):
+        options = [o.strip(" -*0123456789.)") for o in re.split(r"[;\n]|,\s(?=[A-Z])", options)]
+    options = [o for o in options if str(o).strip()]
+    if not question.strip():
+        return "ask_user needs a question."
+    return ask_clarification(question, options)
+
+
 def tool_list_structures() -> str:
     """Describe every structure currently in the scene and how it is placed."""
     if not structures():
@@ -2189,6 +2318,19 @@ def _expression_to_ngl(expression: str, u) -> tuple[str, str]:
         return ngl_map[expr_lower], expr_lower
 
     # "chain A" → NGL ":A"
+    # Residue numbers, optionally with a chain: "resi 58", "resid 20-30 and
+    # chain A", "residue 58 of chain A". NGL has no 'resi' keyword — passed
+    # through, "resi 58" silently matched residue 58 of every chain.
+    m = re.fullmatch(r"(?:resi|resid|resnum|residues?)\s+(\d+)(?:\s*(?:-|to|through)\s*(\d+))?"
+                     r"(?:\s+(?:and\s+|in\s+|of\s+|on\s+)?(?:chain|segid)\s+([a-z0-9]))?",
+                     expr_lower)
+    if m:
+        lo, hi, chain = m.group(1), m.group(2), m.group(3)
+        ngl = (f"{lo}-{hi}" if hi else lo) + (f":{chain.upper()}" if chain else "")
+        label = (f"residues {lo}-{hi}" if hi else f"residue {lo}") + (
+            f" of chain {chain.upper()}" if chain else " (every chain)")
+        return ngl, label
+
     if expr_lower.startswith("chain "):
         chain = expression.split()[-1]
         return f":{chain}", f"chain {chain}"
@@ -2996,6 +3138,14 @@ def tool_highlight(target: str, style: str = "ball+stick",
     else:
         for piece in [p for p in spec.split(",") if p.strip()]:
             piece = piece.strip()
+            # Spelled-out ranges the model writes: "A/20 to A/30",
+            # "20 to 30 in chain A", "residues 20-30 of chain A".
+            piece = re.sub(r"^(?:residues?\s+)", "", piece, flags=re.I)
+            cm = re.search(r"\s+(?:in|of|on)?\s*chain\s+([A-Za-z0-9])$", piece, re.I)
+            if cm:
+                piece = f"{cm.group(1)}/{piece[:cm.start()].strip()}"
+            piece = re.sub(r"(\d+)\s*(?:to|through|–|-)\s*(?:[A-Za-z0-9][/:])?(\d+)$",
+                           r"\1-\2", piece)
             # A range like "57-102" is a region, not two residues.
             m = re.fullmatch(r"(?:([A-Za-z0-9])[/:])?(\d+)\s*[-–]\s*(\d+)", piece)
             if m:
@@ -4092,6 +4242,10 @@ def _ngl_to_mda_approx(ngl_sel: str) -> str:
     if ngl_sel.startswith("@"):          # serial list → MDAnalysis index (0-based)
         serials = ngl_sel[1:].split(",")
         return "index " + " ".join(str(int(s) - 1) for s in serials[:100])
+    m = re.fullmatch(r"(\d+)(?:-(\d+))?(?::([A-Za-z0-9]))?", ngl_sel)
+    if m:                                # residue number/range, optional chain
+        res = f"resid {m.group(1)}" + (f":{m.group(2)}" if m.group(2) else "")
+        return res + (f" and (segid {m.group(3)} or chainID {m.group(3)})" if m.group(3) else "")
     return ngl_sel                       # pass-through for unknown expressions
 
 
@@ -4106,6 +4260,26 @@ def _ngl_to_mda_approx(ngl_sel: str) -> str:
 
 # TOOLS is the formal schema sent to Ollama; TOOL_DISPATCH maps names to callables.
 TOOLS = [
+    {
+        "type": "function", "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the user a clarifying question with 2-4 concrete choices INSTEAD of "
+                "guessing, when the request can reasonably mean different things that "
+                "need different tools or give different answers (e.g. 'other chains' = "
+                "other chains in the loaded file, or other PDB structures of the "
+                "protein?), or names something you cannot identify. Do not use it when "
+                "the working context or scene already settles the meaning, or when a "
+                "tool can simply look the answer up. Nothing else runs after it: the "
+                "user answers first."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "question": {"type": "string", "description": "One short question"},
+                "options": {"type": "array", "items": {"type": "string"},
+                            "description": "2-4 distinct, concrete readings of the request, each a short phrase"}
+            }, "required": ["question", "options"]}
+        }
+    },
     {
         "type": "function", "function": {
             "name": "find_protein",
@@ -4915,6 +5089,7 @@ def _safe_float(value, default):
     return float(value)
 
 TOOL_DISPATCH = {
+    "ask_user": lambda a: tool_ask_user(a.get("question", ""), a.get("options") or []),
     # ---------- Analysis tools from analysis_tools.py ----------
     "measure_mda_distance": lambda a: tool_measure_mda_distance(
         a.get("sel1", ""),
@@ -5074,6 +5249,21 @@ def _system_prompt() -> str:
         "You are a protein structure analysis agent. "
         "The scene you are working on is described in the user message. "
         "Rules — follow exactly: "
+        "A. ASK, DON'T GUESS. If the newest request can reasonably mean two or more "
+        "   different things that need different tools or give different answers, and "
+        "   the working context, the Scene block and the earlier conversation do not "
+        "   settle it, call `ask_user` with one short question and 2-4 concrete options "
+        "   — and nothing else. Also ask when it names a structure, chain, residue or "
+        "   protein you cannot find in the scene or the working context. Do NOT ask "
+        "   when one reading is clearly meant, when a tool can simply look the answer "
+        "   up, or about a point the user has just clarified; plain commands ('load "
+        "   4HHB', 'color chain A red') are never ambiguous. "
+        "B. NO ANSWERS FROM MEMORY. Every fact you state — PDB ids, accessions, chain "
+        "   letters, residue numbers, resolutions, distances, counts, names — must come "
+        "   from a tool result, the Scene block, or the working context in THIS request. "
+        "   If none of them has it, call the tool that does; if no tool can, say plainly "
+        "   that you cannot tell, and offer what you can do instead. Never fill a gap "
+        "   with general knowledge or a plausible-sounding number. "
         "0. Loading is ADDITIVE. `fetch_structure` and `add_structure` both keep the "
         "   structures already in the scene, so loading a new PDB never discards earlier "
         "   work. Only `clear_scene` unloads anything, and you call it ONLY when the user "
@@ -5460,6 +5650,137 @@ PROTEIN_LEVEL_RE = re.compile(
     r"|\bbeyond\s+(the\s+)?(current\s+|loaded\s+)?(scene|file|structure)\b")
 
 
+# Identifiers and measurements a reply can state. A 4-character token starting
+# with a digit is a PDB id only if it has a letter and is not an ordinal ("20th").
+_PDB_TOKEN = re.compile(r"\b[1-9][A-Za-z0-9]{3}\b")
+_UNIPROT_TOKEN = re.compile(
+    r"\b(?:[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2})\b")
+_DECIMAL = re.compile(r"(?<![\d.])\d+\.\d+(?![\d.])")
+
+
+def _unsupported_facts(reply: str, evidence: str) -> list:
+    """
+    PDB ids, UniProt accessions and decimal numbers in a reply that the
+    evidence never mentions. A number counts as supported when some number in
+    the evidence rounds to it at the reply's precision (2.9 for 2.93).
+    """
+    ev_upper = evidence.upper()
+    bad = []
+    for tok in sorted(set(_PDB_TOKEN.findall(reply))):
+        if not re.search(r"[A-Za-z]", tok) or re.fullmatch(r"\d+(st|nd|rd|th|aa|kd|mer)", tok, re.I):
+            continue
+        if tok.upper() not in ev_upper:
+            bad.append(tok)
+    for acc in sorted(set(_UNIPROT_TOKEN.findall(reply))):
+        if acc not in ev_upper:
+            bad.append(acc)
+    ev_nums = {float(x) for x in _DECIMAL.findall(evidence)}
+    for num in sorted(set(_DECIMAL.findall(reply))):
+        places, value = len(num.split(".")[1]), float(num)
+        if not any(abs(round(e, places) - value) < 1e-9 for e in ev_nums):
+            bad.append(num)
+    return bad
+
+
+# Tools whose string arguments are identifiers or free text, not residue
+# selections — PDB ids, accessions, file names, the question itself.
+NUMBER_GATE_EXEMPT = {
+    "ask_user", "fetch_structure", "add_structure", "replace_scene", "load_protein",
+    "find_protein", "protein_structures", "protein_function", "load_local",
+    "remove_structure", "render_image", "save_structure", "set_background",
+    "download_foldseek_database", "find_structural_neighbors", "superpose_structures",
+    "clear_superposition", "describe_structure", "list_structures", "clear_scene",
+    "prepare_structure", "inspect_preparation", "orient_membrane", "build_membrane",
+    "membrane_status", "clear_labels", "list_labels", "describe_fold",
+}
+
+# A tool result that means nothing happened.
+_TOOL_FAILED = re.compile(
+    r"^(error|tool error|blocked|warning|unknown tool|no structure|nothing)|"
+    r"could not|couldn't|cannot|not found|no such|failed|must be different|"
+    r"matched 0 atoms|nothing was", re.IGNORECASE)
+
+# Arguments that are free text or styling, never residue numbers.
+NUMBER_GATE_FREE_ARGS = {"color", "text", "name", "style", "rep_type", "filename",
+                         "quality", "operator", "profile", "types", "where"}
+
+
+_VIEWER_VERBS = re.compile(r"\b(colou?r|show|hide|select|highlight|label|zoom|remove|delete|"
+                           r"superpose|align|measure|display|render|make|turn|set)\b")
+
+
+def _ambiguity_question(prompt: str) -> str:
+    """
+    Ask up front about requests known to split between two readings.
+
+    Deliberately narrow: only patterns the model has been seen to guess on.
+    Everything else is left to the model, which has `ask_user` and a rule for
+    it. Returns the question text for the chat, or "" to carry on.
+    """
+    p = prompt.lower()
+    entry, focus = active_structure(), st.session_state.get("focus")
+
+    # "Other chains / chains available" with a protein in focus and a file
+    # loaded: the chains inside that file, or the protein's other PDB entries?
+    # Both readings are common, and they need different tools.
+    if (entry and focus and re.search(r"\bchains?\b", p)
+            and re.search(r"\b(other|more|available|else|rest|remaining|additional)\b", p)
+            and not _VIEWER_VERBS.search(p)
+            and not re.search(r"\b(scene|loaded|viewer|this file|this entry|this structure|"
+                              r"screen|displayed|visible|shown)\b", p)
+            and not re.search(r"\b(pdb|entries|entry|structures|depositions?|database)\b", p)
+            and not any(s["pdb_id"].lower() in p for s in structures())):
+        who = focus.get("gene") or focus["protein_name"]
+        base = focus["accession"]
+        chains = chain_molecules(entry)
+        others = [c for c in chains if not any(a.split("-")[0] == base for a in c["uniprot"])]
+        inside = (", ".join(f"{c['chain']} = {c['molecule'] or 'unnamed'}" for c in others)
+                  if others else f"it holds only {who}")
+        opts = [
+            {"label": f"The other chains inside the loaded file {entry['pdb_id']} ({inside})",
+             "meaning": f"list every chain inside the loaded structure {entry['pdb_id']} and "
+                        f"which molecule each one is (answer from the scene chain list)"},
+            {"label": f"Other PDB structures of {who} — different entries and regions of the protein",
+             "meaning": f"list the other PDB structures of {who} (UniProt {base}) beyond "
+                        f"{entry['pdb_id']}, grouped by sequence region — call protein_structures"},
+            {"label": f"Molecules {who} is bound to across its PDB structures",
+             "meaning": f"list the partner molecules (other chains) {who} is bound to across "
+                        f"its PDB structures — call protein_structures and report the "
+                        f"'bound to' partners"},
+        ]
+        ask_clarification(
+            f"By “other chains”, do you mean inside the loaded {entry['pdb_id']}, "
+            f"or across other structures of {who}?", opts, prompt)
+        return clarification_text()
+
+    # "Compare it" / "what is the RMSD" with nothing to compare against: the
+    # model superposed a structure onto itself and reported an RMSD of 0.0.
+    names_target = (any(t for t in _PDB_TOKEN.findall(prompt) if re.search(r"[A-Za-z]", t))
+                    or re.search(r"\b(with|to|against|and|onto|vs\.?|versus)\s+\w", p))
+    if (entry and len(structures()) < 2 and not names_target
+            and re.search(r"\b(compare|comparison|superpos|superimpos|align|overlay|rmsd)", p)):
+        opts = []
+        prof = st.session_state.get("protein_profile")
+        if focus and prof and prof.get("accession") == focus.get("accession"):
+            loaded = {s["pdb_id"] for s in structures()}
+            cands = [r for r in pacc.rank_structures(pacc.filter_structures(
+                prof["structures"], loadable_only=True)) if r["pdb_id"] not in loaded][:3]
+            who = focus.get("gene") or focus["protein_name"]
+            for r in cands:
+                res = f", {r['resolution']:.2f} Å" if r["resolution"] is not None else ""
+                opts.append({
+                    "label": f"{r['pdb_id']} — another {who} structure ({r['method']}{res}, "
+                             f"residues {r['start']}-{r['end']})",
+                    "meaning": f"load {r['pdb_id']} and superpose it onto {entry['pdb_id']}, "
+                               f"then report the RMSD"})
+        ask_clarification(
+            f"Only {entry['pdb_id']} is loaded — compare it with which structure? "
+            + ("Pick one, or type a PDB ID." if opts else "Type a PDB ID or a protein name."),
+            opts, prompt)
+        return clarification_text()
+    return ""
+
+
 def _clean_reply(text: str) -> str:
     """Drop tool-use meta remarks from a final reply."""
     kept = [ln for ln in text.splitlines() if not _META_LINE.match(ln)]
@@ -5777,7 +6098,37 @@ def run_agent(user_prompt: str, status=None) -> str:
     _log(f"📨 User: {user_prompt}")
     _progress(status, "Reading your request…")
 
+    # A reply to the question asked last turn: turn "2" back into the original
+    # request with the chosen meaning spelled out, so every gate and the model
+    # see what the user actually wants.
+    pending = st.session_state.pop("clarify", None)
+    clarify_note, clarified = "", False
+    if pending:
+        choice = resolve_clarification(pending, user_prompt)
+        if not choice and not pending["options"] and len(user_prompt.split()) <= 8:
+            # A short answer to an open question ("2W72") is that answer.
+            choice = {"meaning": user_prompt.strip()}
+        if choice:
+            clarified = True
+            user_prompt = f"{pending['request']} — clarification: {choice['meaning']}"
+            _log(f"🧭 Clarified request: {user_prompt}")
+        else:
+            clarify_note = (
+                f"Last turn you asked the user: \"{pending['question']}\" with the options "
+                + "; ".join(f"({i}) {o['meaning']}" for i, o in enumerate(pending["options"], 1))
+                + f", about their request \"{pending['request']}\". If the newest message "
+                "answers that, carry out the original request with the meaning they chose; "
+                "if it is a new request, handle that instead.\n\n")
+    st.session_state.current_request = user_prompt
+
     prompt_lower = user_prompt.lower()
+
+    if not clarified:
+        question = _ambiguity_question(user_prompt)
+        if question:
+            _log(f"❔ Ambiguous request — asking: {question}")
+            _progress(status, "Your request can mean more than one thing — asking.")
+            return question
 
     # Narrow deterministic workflow pre-router.
     # Unmatched prompts continue through the original PARORA agent.
@@ -5862,7 +6213,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     messages = [
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": (f"{_state_block()}\n\n{grounding_block}{history_block}"
-                                     f"Newest request: {user_prompt}")}
+                                     f"{clarify_note}Newest request: {user_prompt}")}
     ]
 
     active_tools, tools_are_subset = TOOLS, False
@@ -5906,6 +6257,8 @@ def run_agent(user_prompt: str, status=None) -> str:
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight
     show_rep_fired = False                 # True once any non-ball+stick show has executed
     protein_nudged = False                 # One retry for a tool-less protein-level answer
+    fact_checked = False                   # One correction pass for unsupported facts
+    user_chains = {c.upper() for c in re.findall(r"\bchain\s+([A-Za-z0-9])\b", user_prompt, re.I)}
 
     for turn in range(MAX_TURNS):
         _progress(
@@ -5962,15 +6315,45 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "in the PDB beyond the loaded file. Call `protein_structures` (no filters) "
                     "and answer from its result, grouped by region.")})
                 continue
+            # Fact check: every PDB id, accession and decimal number in the
+            # reply has to appear in something this request actually saw — the
+            # scene, the working context, the user's words or a tool result.
+            # One chance to correct it; after that, flag what is unverified
+            # rather than pass it off as fact.
+            evidence = "\n".join(str(m.get("content", "")) for m in messages
+                                 if m.get("role") == "user")
+            unsupported = _unsupported_facts(final_text, evidence)
+            if unsupported and not fact_checked:
+                fact_checked = True
+                _log(f"🔎 Reply states unsupported facts {unsupported} — asking for a correction")
+                _progress(status, "Double-checking the answer against the data…")
+                messages.append({"role": "assistant", "content": final_text})
+                messages.append({"role": "user", "content": (
+                    f"Check failed: your reply states {', '.join(unsupported)}, which appear in "
+                    "no tool result, Scene block or working context of this request. Rewrite "
+                    "the reply using only facts from those. If you need data you do not have, "
+                    "call the tool that provides it; if no tool can, say you cannot tell. Do "
+                    "not mention this check.")})
+                continue
             _log(f"💬 Agent: {final_text}")
             _progress(status, "Composing reply…")
             reply = _clean_reply(final_text) or ("Done: " + "; ".join(summary_parts))
+            if unsupported:
+                _log(f"⚠️ Unverified facts left in reply: {unsupported}", logging.WARNING)
+                reply += ("\n\n_Not verified against any tool result: "
+                          + ", ".join(unsupported) + " — treat with caution._")
             question = st.session_state.pop("foldseek_question", None)
             if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
                 reply = f"{reply}\n\n{question}"
             return reply
 
         tool_results = []
+
+        # Asking and acting in the same breath means the model is unsure what
+        # to act on — ask only.
+        asks = [tc for tc in tool_calls if tc.get("function", {}).get("name") == "ask_user"]
+        if asks:
+            tool_calls = asks[:1]
 
         # Check if this batch contains a non-ball+stick show (affects select gate below)
         batch_has_rep_show = any(
@@ -6019,6 +6402,45 @@ def run_agent(user_prompt: str, status=None) -> str:
                     args.pop(k, None)
                 if unasked:
                     _log(f"🧭 Dropped unrequested protein_structures filters: {unasked}")
+
+            # The user named one chain; a residue selection that dropped it
+            # would act on that residue in every chain ("select residue 58 of
+            # chain A" arrived as expression='resi 58').
+            if len(user_chains) == 1:
+                ch = next(iter(user_chains))
+                if name == "select":
+                    expr = str(args.get("expression", ""))
+                    if re.search(r"\d", expr) and not re.search(
+                            r"chain|segid|:[A-Za-z0-9]|/|@", expr, re.I):
+                        args["expression"] = f"{expr} chain {ch}"
+                        _log(f"🧭 Injected chain {ch} into select expression")
+                elif name == "highlight":
+                    tgt = str(args.get("target", ""))
+                    if re.search(r"\d", tgt) and not re.search(r"chain|/|:", tgt, re.I):
+                        args["target"] = ", ".join(f"{ch}/{p.strip()}"
+                                                   for p in tgt.split(",") if p.strip())
+                        _log(f"🧭 Injected chain {ch} into highlight target")
+
+            # ── Gate: invented residue numbers ──────────────────────────────
+            # "highlight the domain" came back as highlight(target='18-96'):
+            # numbers nobody said and no tool returned. Any number in a
+            # selection-like argument must come from the user's words, the
+            # scene, or a tool result in this request; otherwise block and
+            # have the model ask.
+            if name not in NUMBER_GATE_EXEMPT:
+                seen = set(re.findall(r"\d+", "\n".join(
+                    str(m.get("content", "")) for m in messages if m.get("role") == "user")))
+                invented = sorted({n for k, v in args.items()
+                                   if isinstance(v, str) and k not in NUMBER_GATE_FREE_ARGS
+                                   for n in re.findall(r"\d+", v)} - seen, key=int)
+                if invented:
+                    _log(f"🚫 Blocked '{name}' — numbers {invented} not from user or any tool")
+                    tool_results.append({"tool": name, "result": (
+                        f"Blocked — {', '.join(invented)} did not come from the user or any "
+                        "tool result. Do not guess residue numbers: call `ask_user` to ask "
+                        "which residues/region they mean (offer concrete options if a tool "
+                        "result lists them), or use a named selection without numbers.")})
+                    continue
 
             # ── Gate: select ────────────────────────────────────────────────
             # Block select when: a show already fired this run, or a
@@ -6137,6 +6559,14 @@ def run_agent(user_prompt: str, status=None) -> str:
             summary_parts.append(f"{name}: {result}")
             tool_results.append({"tool": name, "result": result})
 
+        # A question for the user (ask_user, or a tool that found the request
+        # ambiguous) ends the request here: the answer decides what runs next,
+        # so letting the model continue would only mean a guess.
+        if st.session_state.get("clarify"):
+            _log(f"❔ Asking the user: {clarification_text()}")
+            _progress(status, "Need a choice from you before going on.")
+            return clarification_text()
+
         results_text = "\n".join(f"[{r['tool']}]: {r['result']}" for r in tool_results)
 
         # Append tool results to the conversation. The system message is left
@@ -6154,6 +6584,17 @@ def run_agent(user_prompt: str, status=None) -> str:
             "Only call another tool if the previous result explicitly reports missing information "
             "that prevents completion."
         )
+        # Say which calls failed, in so many words. Left implicit, the model
+        # read "could not make sense of '30'" and told the user the residues
+        # were highlighted.
+        failed = [r for r in tool_results if _TOOL_FAILED.search(str(r["result"])[:240])]
+        if failed:
+            follow_up = (
+                "These calls FAILED and changed nothing: "
+                + "; ".join(f"{r['tool']} ({str(r['result'])[:120]})" for r in failed)
+                + ". Never say they worked. Retry once with corrected arguments if the "
+                "error shows how, otherwise tell the user plainly what failed and why. "
+                + ("" if show_rep_fired else follow_up))
         messages.append({
             "role": "user",
             "content": f"Tool results:\n{results_text}\n\n{_state_block()}\n\n{follow_up}"
@@ -10046,7 +10487,19 @@ with left:
                 clear_focus()
                 st.rerun()
 
-    if prompt := st.chat_input("e.g. Load pdb id, color chain A red."):
+    # A question the agent asked last turn: each choice as a button, so the
+    # user can answer with a click. Typing a reply works just as well — see
+    # resolve_clarification().
+    _clicked = None
+    _pending = st.session_state.get("clarify")
+    if _pending:
+        st.caption("❔ Pick one, or type your own answer:")
+        for _i, _o in enumerate(_pending["options"], 1):
+            if st.button(f"{_i}. {_o['label']}", key=f"clarify_opt_{_i}",
+                         use_container_width=True):
+                _clicked = _o["label"]
+
+    if prompt := (st.chat_input("e.g. Load pdb id, color chain A red.") or _clicked):
         st.session_state.messages.append({"role": "user", "content": prompt})
         # st.status() renders and updates live during run_agent() — unlike
         # st.spinner, it can carry a running trace of what the agent loop is

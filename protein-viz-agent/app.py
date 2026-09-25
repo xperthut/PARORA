@@ -87,6 +87,10 @@ import interactions as ixn
 # classification (CATH/SCOP via PDBe's SIFTS REST API).
 import topology as topo
 
+# Structure-based fold/homology search (Foldseek, optional external binary +
+# reference database) — the fallback when CATH/SCOP has nothing to key on.
+import structure_search as fsk
+
 # Geometric measurement — distances, angles, contact shells. Reads coordinates
 # from the PDB records directly, so it works without MDAnalysis.
 import measure as mz
@@ -1641,6 +1645,176 @@ def _cached_dssp(path: str, mtime: float, schema: int):
     return topo.run_dssp(path)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_foldseek(path: str, mtime: float, chains: tuple, max_hits: int,
+                     exclude: str, db: str, schema: int):
+    """
+    Run and cache a Foldseek search; mtime, db and schema bust the cache.
+    db is a local database prefix, or "online" for search.foldseek.com.
+    """
+    if db == "online":
+        return fsk.search_online(path, list(chains), max_hits=max_hits,
+                                 exclude_pdb_id=exclude)
+    return fsk.search(path, list(chains), max_hits=max_hits, exclude_pdb_id=exclude)
+
+
+def _foldseek_choice(entry: dict) -> str:
+    """
+    The question to put to the user when there is no local Foldseek
+    database and they have not agreed to an online search: which of the two
+    they want. Deliberately a question — uploading their structure and
+    downloading gigabytes are both the user's call, never the model's.
+    """
+    state, detail = fsk.download_status()
+    if state == "running":
+        return ("Structural similarity search: the local Foldseek database is still "
+                "downloading — try again in a few minutes. Or, if the user prefers, "
+                "search online now (uploads this structure's coordinates to "
+                "search.foldseek.com).")
+    download = (f"download the Foldseek PDB database locally — one-time, "
+                f"~{fsk.DOWNLOAD_GB} GB download, ~{fsk.DISK_GB} GB on disk, runs in "
+                "the background; searches then stay on this machine")
+    if not fsk.find_foldseek():
+        download += (" (needs the foldseek binary first: conda create -n foldseek "
+                     "-c conda-forge -c bioconda foldseek)")
+    failed = (f" A previous download failed: {detail.strip()[-150:]}"
+              if state == "failed" else "")
+    st.session_state.foldseek_pending = entry["pdb_id"]
+    # The model tends to shorten this question to "online or download?" and
+    # drop the upload warning and the size, so run_agent appends this exact
+    # wording to its reply instead of trusting the paraphrase.
+    st.session_state.foldseek_question = (
+        f"**Structural similarity search needs your choice** — no local Foldseek "
+        f"database is installed.\n"
+        f"1. **Search online** — uploads {entry['pdb_id']}'s coordinates to "
+        f"search.foldseek.com, a public third-party server. Fine for published "
+        f"structures, not for confidential ones.\n"
+        f"2. **{download[0].upper()}{download[1:]}.**{failed}\n\n"
+        f"Reply *search online* or *download the database*.")
+    return ("NEEDS USER CHOICE — structural similarity search has no local Foldseek "
+            "database. Ask the user which they want, and do not pick for them: "
+            f"(1) search online — uploads {entry['pdb_id']}'s coordinates to "
+            "search.foldseek.com, a public third-party server; fine for published "
+            "structures, not for confidential ones; or "
+            f"(2) {download}.{failed}")
+
+
+def tool_download_foldseek_database() -> str:
+    """
+    Start downloading the local Foldseek PDB database, in the background.
+
+    Only reachable when the user asked for it in their own words (a hard
+    gate in run_agent, not just the system prompt) — this is gigabytes of
+    someone else's disk and bandwidth.
+    """
+    state, _ = fsk.download_status()
+    if state == "ready":
+        return "The local Foldseek database is already installed — searches run locally."
+    ok, msg = fsk.start_download()
+    if ok:
+        st.session_state.pop("foldseek_pending", None)
+    return msg
+
+
+def _fold_key(c: dict):
+    """(label, name) of a CATH topology / SCOP fold — what 'same fold' means."""
+    if c["source"] == "CATH":
+        return (f"CATH topology {'.'.join(c['cath_id'].split('.')[:3])}", c["topology"])
+    return ("SCOP fold", c["fold"])
+
+
+def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
+                               where: str = "auto") -> list:
+    """
+    Foldseek hits for some chains of a structure, each annotated with the
+    hit's own CATH/SCOP classification, plus a per-chain fold consensus.
+
+    Shared by tool_find_structural_neighbors and tool_describe_fold's
+    no-classification fallback. Every fold named here is a curated
+    classification of a real aligned PDB chain — never inferred.
+
+    where: "local", "online" or "auto". Auto uses the local database when
+    installed, the online server only if the user already agreed to it this
+    session, and otherwise returns the question of which one they want.
+    """
+    local_ok, local_msg = fsk.availability()
+    online_ok = entry["path"] in st.session_state.get("foldseek_online_ok", set())
+    if where == "local" and not local_ok:
+        return [local_msg if fsk.find_database() else _foldseek_choice(entry)]
+    if where == "online" and not online_ok:
+        return [_foldseek_choice(entry)]
+    if where == "auto":
+        if local_ok:
+            where = "local"
+        elif online_ok:
+            where = "online"
+        else:
+            return [_foldseek_choice(entry)]
+
+    if entry.get("source") == "rcsb":
+        exclude = entry["pdb_id"]
+    elif entry.get("source") == "alphafold":
+        exclude = entry["pdb_id"].split("-", 1)[-1]   # "AF-P12345" -> own AFDB entry
+    else:
+        exclude = ""
+    db = "online" if where == "online" else fsk.find_database()
+    ok, msg, result = _cached_foldseek(
+        entry["path"], Path(entry["path"]).stat().st_mtime, tuple(chains),
+        max_hits, exclude, db, fsk.SCHEMA_VERSION)
+    if not ok:
+        return [msg]
+    st.session_state.pop("foldseek_pending", None)
+
+    against = (f"the {fsk.ONLINE_DB} database on search.foldseek.com (online)"
+               if where == "online" else f"the local '{Path(db).name}' database")
+    lines = [f"Structural neighbours (Foldseek, this structure's own coordinates vs "
+             f"{against}, E-value ≤ 1e-3):"]
+    for group in result.values():
+        label = ", ".join(group["chains"])
+        hits = group["hits"]
+        if not hits:
+            lines.append(f"  chain {label}: no confident structural match to any "
+                         "entry in the database — no known fold can be named from "
+                         "structural similarity.")
+            continue
+        lines.append(f"  chain {label}:")
+        folds = {}
+        for i, h in enumerate(hits, 1):
+            tm = (f"TM-score {min(h['tmscore'], 1.0):.2f}, "
+                  if h["tmscore"] is not None else "")
+            stats = (f"{tm}homology probability "
+                     f"{h['prob']:.2f}, E={h['evalue']:.1e}, {h['fident']:.0%} sequence "
+                     f"identity, query positions {h['qstart']}-{h['qend']} of {h['qlen']}")
+            if h["kind"] == "pdb":
+                c = _cached_classification(h["pdb_id"], topo.SCHEMA_VERSION).get(h["chain"])
+                if c and c["source"] == "CATH":
+                    cls = (f"CATH {c['cath_id']} {c['name']} ({c['class']} / "
+                           f"{c['architecture']} / {c['topology']})")
+                elif c:
+                    cls = f"SCOP {c['name']} (fold: {c['fold']})"
+                else:
+                    cls = "no CATH/SCOP classification on file"
+                if c:
+                    folds.setdefault(_fold_key(c), []).append(h["pdb_id"].upper())
+                lines.append(f"    {i}. PDB {h['pdb_id'].upper()} chain {h['chain']} — "
+                             f"{h['description']} — {stats} — {cls}")
+            elif h["kind"] == "afdb":
+                lines.append(f"    {i}. AlphaFold DB model of UniProt {h['accession']} — "
+                             f"{h['description']} — {stats} — predicted model, no "
+                             "CATH/SCOP lookup")
+            else:
+                lines.append(f"    {i}. {h['name']} — {h['description']} — {stats}")
+        if folds:
+            n_cls = sum(len(v) for v in folds.values())
+            (kind, name), ids = max(folds.items(), key=lambda kv: len(kv[1]))
+            lines.append(f"    Fold consensus: {len(ids)} of {n_cls} classified hits "
+                         f"share {kind} ({name}).")
+        else:
+            lines.append("    None of these hits has a CATH/SCOP classification on "
+                         "file, so no known fold can be named from them.")
+    return lines
+
+
 def tool_describe_fold(chain: str = "") -> str:
     """
     Report a structure's fold/topology — real, sourced data, never a guess.
@@ -1739,6 +1913,59 @@ def tool_describe_fold(chain: str = "") -> str:
             "DSSP not installed — computed topology unavailable. Set DSSP_BIN "
             "or install: conda create -n dssp -c conda-forge dssp")
 
+    # 3. Chains with no classification of their own: which classified
+    #    structures do they resemble? (Foldseek, optional.)
+    unclassified = [ch for ch in chains if ch not in classification]
+    if unclassified:
+        lines.extend(_structural_neighbor_lines(entry, unclassified, max_hits=3))
+
+    return "\n".join(lines)
+
+
+def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
+                                   where: str = "auto") -> str:
+    """
+    Find known structures that the loaded structure resembles in 3D.
+
+    Runs Foldseek on this structure's own coordinates — against a local
+    reference database, or search.foldseek.com if the user agreed to an
+    online search — and reports each hit's own CATH/SCOP classification
+    plus a per-chain fold consensus: evidence for "which known fold is
+    this like", even for an AlphaFold model or a local file with no
+    classification of its own. Identical chains are searched once. With no
+    local database and no online consent yet, returns the question of which
+    the user wants instead of choosing.
+
+    Args:
+        chain   : Restrict to one chain, e.g. "A". Empty searches every
+                  distinct protein chain.
+        max_hits: Neighbours reported per chain (1-20).
+        where   : "auto" (default), "local" or "online".
+
+    Returns:
+        A plain-text report, or why the search could not run.
+    """
+    entry = active_structure()
+    if not entry:
+        return "No structure is loaded — fetch one first."
+    chains = []
+    if (chain or "").strip():
+        wanted = chain.strip().upper().replace("CHAIN", "").strip()
+        present = _atoms_of(entry)["chains_present"]
+        if wanted not in present:
+            return (f"Chain {wanted} is not in {entry['pdb_id']}. "
+                    f"Chains present: {', '.join(present)}")
+        chains = [wanted]
+    try:
+        max_hits = max(1, min(int(max_hits), 20))
+    except (TypeError, ValueError):
+        max_hits = 5
+    lines = [f"Structural similarity search for {entry['pdb_id']}"
+             + (f", chain {chains[0]}" if chains else "")]
+    where = (where or "auto").strip().lower()
+    if where not in ("auto", "local", "online"):
+        where = "auto"
+    lines.extend(_structural_neighbor_lines(entry, chains, max_hits, where))
     return "\n".join(lines)
 
 
@@ -4179,6 +4406,42 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "find_structural_neighbors",
+            "description": (
+                "Find known structures this one resembles in 3D — 'what is this similar "
+                "to', 'find structural homologs', 'which known folds look like this', "
+                "'search Foldseek'. Runs a Foldseek structural search of the loaded "
+                "structure's own coordinates and reports each hit's PDB id, TM-score, "
+                "and that hit's own CATH/SCOP classification, plus a fold consensus. "
+                "Works for AlphaFold models and local files. For 'what fold is this' "
+                "use describe_fold first (it falls back to this search on its own). "
+                "Report exactly what this tool returns, including 'no confident match'. "
+                "If it returns NEEDS USER CHOICE, ask the user that question and stop."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "chain": {"type": "string",
+                          "description": "Restrict to one chain, e.g. 'A'; omit for all chains"},
+                "max_hits": {"type": "integer",
+                             "description": "Neighbours per chain, default 5"},
+                "where": {"type": "string", "enum": ["auto", "local", "online"],
+                          "description": ("'online' ONLY when the user said to search "
+                                          "online / upload; otherwise omit")}
+            }}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "download_foldseek_database",
+            "description": (
+                "Start downloading the local Foldseek PDB database (~2.2 GB) in the "
+                "background. ONLY when the user explicitly asked to download / install "
+                "the database — never on your own initiative."
+            ),
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "list_structures",
             "description": "List the structures currently in the scene and how they are placed",
             "parameters": {"type": "object", "properties": {}}
@@ -4625,6 +4888,9 @@ TOOL_DISPATCH = {
     "describe_structure": lambda a: tool_describe_structure(a.get("target", ""),
                                                             a.get("detail", "brief")),
     "describe_fold":     lambda a: tool_describe_fold(a.get("chain", "")),
+    "find_structural_neighbors": lambda a: tool_find_structural_neighbors(
+        a.get("chain", ""), a.get("max_hits", 5), a.get("where", "auto")),
+    "download_foldseek_database": lambda _: tool_download_foldseek_database(),
     "superpose_structures": lambda a: tool_superpose(
         a.get("mobile", ""), a.get("reference", ""),
         a.get("method", "auto"),
@@ -4706,6 +4972,15 @@ def _system_prompt() -> str:
         "   NOT invent a fold name from the protein's name or general knowledge. Report "
         "   exactly what `describe_fold` returns, including when it says no "
         "   classification is available. "
+        "0a5. Structural similarity — 'what is this similar to', 'find structural "
+        "   homologs / neighbours', 'what known structures look like this', 'run "
+        "   Foldseek' → ONE `find_structural_neighbors` call. Name a fold only when a "
+        "   hit's CATH/SCOP classification in its output says so; if it reports no "
+        "   confident match, say that — do not guess a fold. If `describe_fold` or "
+        "   `find_structural_neighbors` returns NEEDS USER CHOICE, put both options "
+        "   to the user and stop — do not choose. When the user then says to search "
+        "   online → `find_structural_neighbors` with where='online'; when they say to "
+        "   download the database → `download_foldseek_database`. "
         "0d2. Preparing a structure — 'keep only one state', 'remove the other "
         "   models', 'this NMR structure has 20 states', 'clean it up', 'add "
         "   hydrogens', 'get it ready for Amber / Rosetta / simulation' → ONE "
@@ -4867,6 +5142,11 @@ TOOL_GROUPS = {
     "label":    (r"label|annotat|mark\b|caption|text|name it|write\b|legend|"
                  r"\bdomain\b|\btm\b|transmembrane|extracellular|intracellular",
                  {"add_label", "clear_labels", "list_labels", "describe_structure"}),
+    "fold":     (r"\bfold|topolog|secondary structure|barrel|\bcath\b|\bscop\b|"
+                 r"foldseek|structural(ly)? (neighbo|homolog|similar|relative)|"
+                 r"similar to|resembl|look(s)? like",
+                 {"describe_fold", "find_structural_neighbors",
+                  "download_foldseek_database"}),
     "superpose": (r"superpose|superimpose|align|overlay|compare|rmsd|fit\b",
                   {"superpose_structures", "clear_superposition", "list_structures",
                    "add_structure", "fetch_structure"}),
@@ -4929,13 +5209,22 @@ def _state_block() -> str:
         for a in st.session_state.annotations
     ) or "none"
 
+    # run_agent sends no chat history, so a bare "download it" / "search
+    # online" reply would otherwise arrive with nothing to answer.
+    pending = st.session_state.get("foldseek_pending")
+    pending_line = (
+        f" Pending question to the user: structural similarity search for {pending} "
+        "needs a choice — search online (uploads the structure to search.foldseek.com) "
+        "or download the local Foldseek database. If this message answers it: online → "
+        "find_structural_neighbors(where='online'); download → download_foldseek_database."
+        if pending else "")
     return (
         f"Scene — current structure: {pdb}. Structures in the scene: [{loaded}]. "
         f"Named selections: [{sels}]. "
         f"Representations currently drawn (this is everything the viewer shows, nothing "
         f"else is visible): [{rep_desc}]. "
         f"Text labels currently pinned: [{label_desc}]. "
-        f"Superpositions: [{fits}]." + (f" {focus}" if focus else ""))
+        f"Superpositions: [{fits}]." + (f" {focus}" if focus else "") + pending_line)
 
 
 def _tc_args(tc: dict) -> dict:
@@ -5356,6 +5645,16 @@ def run_agent(user_prompt: str, status=None) -> str:
         )
     )
 
+    # Gate: Foldseek's two costly options are the user's call, never the
+    # model's — uploading their coordinates to a third-party server, and a
+    # multi-GB download. Both need the user's own words in this message.
+    foldseek_online_requested = bool(re.search(
+        r"\bonline\b|\bweb\b|upload|foldseek\.com|\bremote\b|\bserver\b|"
+        r"option (1|one)|first option|\(1\)", prompt_lower))
+    foldseek_download_requested = bool(re.search(
+        r"download|install|local (db|database)|option (2|two)|second option|\(2\)",
+        prompt_lower))
+
     # Each turn is a full round trip to the model: one to pick tools, one more
     # to read their results and either summarize or call more. A single-tool
     # request now costs two turns and a load-then-style request four.
@@ -5405,7 +5704,11 @@ def run_agent(user_prompt: str, status=None) -> str:
                 continue
             _log(f"💬 Agent: {final_text}")
             _progress(status, "Composing reply…")
-            return final_text or ("Done: " + "; ".join(summary_parts))
+            reply = final_text or ("Done: " + "; ".join(summary_parts))
+            question = st.session_state.pop("foldseek_question", None)
+            if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
+                reply = f"{reply}\n\n{question}"
+            return reply
 
         tool_results = []
 
@@ -5472,6 +5775,25 @@ def run_agent(user_prompt: str, status=None) -> str:
             if name in WRITE_TOOLS and not write_requested:
                 _log(f"🚫 Blocked '{name}' — not requested by user")
                 tool_results.append({"tool": name, "result": "Blocked — user did not request this operation."})
+                continue
+
+            # ── Gate: Foldseek online upload / database download ───────────
+            if name == "find_structural_neighbors":
+                entry_now = active_structure()
+                if foldseek_online_requested and entry_now:
+                    st.session_state.setdefault("foldseek_online_ok", set()).add(entry_now["path"])
+                    args["where"] = "online"
+                elif (args.get("where") == "online" and entry_now and entry_now["path"]
+                      not in st.session_state.get("foldseek_online_ok", set())):
+                    _log("🚫 Blocked online Foldseek — user did not agree to upload")
+                    tool_results.append({"tool": name, "result": (
+                        "Blocked — the user has not agreed to upload this structure. "
+                        "Ask them: search online, or download the local database?")})
+                    continue
+            if name == "download_foldseek_database" and not foldseek_download_requested:
+                _log("🚫 Blocked Foldseek database download — not requested")
+                tool_results.append({"tool": name, "result": (
+                    "Blocked — the user did not ask to download the database. Ask them first.")})
                 continue
 
             # ── Dedup: exact same call ──────────────────────────────────────

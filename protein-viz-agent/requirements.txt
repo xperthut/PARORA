@@ -8,6 +8,7 @@ rcsb-api
 requests
 MDAnalysis
 numpy
+pandas   # imported directly by analysis_tools.py; was only arriving transitively via streamlit
 # Sequence-alignment matching for superposing structures with different
 # residue numbering. Optional: superpose.py falls back to numbering-based
 # matching when it is missing.
@@ -53,3 +54,12 @@ rdkit
 # conda-forge's dssp 4.x has been observed to segfault unpredictably on at
 # least one arm64 macOS machine; dssp=3.1.4 was stable there
 # (conda install -n dssp -c conda-forge "dssp=3" if 4.x misbehaves).
+
+# Structure-based fold/homology search (structure_search.py,
+# find_structural_neighbors and describe_fold's no-classification fallback).
+# NOT a pip dependency -- `foldseek` is a single external binary, discovered
+# at runtime via FOLDSEEK_BIN or PATH, and it needs a reference database
+# (FOLDSEEK_DB, default protein-viz-agent/foldseek_db/pdb). Set up with:
+#     conda create -n foldseek -c conda-forge -c bioconda foldseek
+#     foldseek databases PDB protein-viz-agent/foldseek_db/pdb /tmp/fs
+# The PDB database is ~2.2 GB to download, ~4.2 GB on disk.

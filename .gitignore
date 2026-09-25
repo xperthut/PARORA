@@ -39,6 +39,9 @@ env/
 protein-viz-agent/structures/*
 !protein-viz-agent/structures/.gitkeep
 
+# Foldseek reference database (multi-GB, downloaded on request by setup_tools.sh)
+protein-viz-agent/foldseek_db/
+
 # Data files
 *.csv
 *.tsv

@@ -114,6 +114,34 @@ else
     echo "if the smoke test fails on this machine."
 fi
 
+# ── 3.6. Foldseek discovery (optional: find_structural_neighbors, describe_fold fallback) ──
+# Binary: FOLDSEEK_BIN, else PATH, else a conda env whose name mentions
+# foldseek. Database: FOLDSEEK_DB, else protein-viz-agent/foldseek_db/pdb.
+# The database is never downloaded from here -- ~2.2 GB is the user's call.
+if [ -z "${FOLDSEEK_BIN:-}" ]; then
+    if command -v foldseek >/dev/null 2>&1; then
+        export FOLDSEEK_BIN="$(command -v foldseek)"
+    else
+        FS_ENV_PATH=$(conda env list | awk '$1 ~ /foldseek/ {print $NF; exit}')
+        if [ -n "$FS_ENV_PATH" ] && [ -x "$FS_ENV_PATH/bin/foldseek" ]; then
+            export FOLDSEEK_BIN="$FS_ENV_PATH/bin/foldseek"
+        fi
+    fi
+fi
+FS_DB="${FOLDSEEK_DB:-$PWD/protein-viz-agent/foldseek_db/pdb}"
+if [ -n "${FOLDSEEK_BIN:-}" ] && [ -f "$FS_DB.dbtype" ]; then
+    export FOLDSEEK_DB="$FS_DB"
+    echo "Foldseek found -- FOLDSEEK_BIN=$FOLDSEEK_BIN, FOLDSEEK_DB=$FOLDSEEK_DB"
+else
+    echo "Foldseek structural search not ready -- find_structural_neighbors will report"
+    echo "unavailable rather than fail (describe_fold is otherwise unaffected)."
+    [ -z "${FOLDSEEK_BIN:-}" ] && echo "  binary:   conda create -n foldseek -c conda-forge -c bioconda foldseek"
+    [ -f "$FS_DB.dbtype" ] || echo "  database: foldseek databases PDB $FS_DB /tmp/fs   (~2.2 GB download, ~4.2 GB on disk)"
+    echo "or run 'bash setup_tools.sh', which asks before installing or downloading either."
+    echo "(The app itself also asks, the first time it's needed: search online at"
+    echo "search.foldseek.com, which uploads the structure, or download the database.)"
+fi
+
 # ── 4. PyMOL discovery (optional: render_image) ────────────────────────────────
 PYMOL_ENV_PATH=$(conda env list | awk '$1 ~ /pymol/ {print $NF; exit}')
 PYMOL_FOUND=false

@@ -21,7 +21,7 @@ The production server streams each action to the browser as an SSE event, so the
   - [2. Ollama](#2-ollama-local-llm-runtime)
   - [3. Conda](#3-conda-for-runsh-the-recommended-local-path) *(for `run.sh`, the recommended local path)*
   - [4. Python 3.12](#4-python-312-for-fully-manual-local-dev-only) *(fully manual local dev only)*
-  - [5. Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp) *(AmberTools / PyMOL / DSSP)*
+  - [5. Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp--foldseek) *(AmberTools / PyMOL / DSSP / Foldseek)*
 - [Getting Started](#getting-started)
   - [Option A: Docker (Recommended for most users)](#option-a-docker-recommended-for-most-users)
   - [Option B: `run.sh` (Recommended for local development)](#option-b-runsh-recommended-for-local-development)
@@ -86,7 +86,7 @@ The production server streams each action to the browser as an SSE event, so the
 
 `run.sh`, `deploy.sh`, `ollama.sh`, and `setup_tools.sh` are all `#!/bin/bash` scripts — there is no native `.bat`/`.ps1` equivalent for any of them. On Windows, either use the Docker path (which runs Linux inside a container regardless of the host OS) or open a WSL 2 terminal and treat it as Linux for everything else in this README.
 
-The three optional structural-biology tools ([AmberTools / PyMOL / DSSP](#5-optional-structural-biology-tools-ambertools--pymol--dssp)) are auto-discovered from conda environments in Unix-style locations (`~/miniconda3`, `/opt/...`, and — for PyMOL only — `/Applications/PyMOL.app` on macOS). This works on macOS, Linux, and inside WSL 2; on native Windows you would need to set `PACKMOL_MEMGEN` / `PYMOL_PYTHON` / `DSSP_BIN` by hand if you have them installed there.
+The four optional structural-biology tools ([AmberTools / PyMOL / DSSP / Foldseek](#5-optional-structural-biology-tools-ambertools--pymol--dssp--foldseek)) are auto-discovered from conda environments in Unix-style locations (`~/miniconda3`, `/opt/...`, and — for PyMOL only — `/Applications/PyMOL.app` on macOS). This works on macOS, Linux, and inside WSL 2; on native Windows you would need to set `PACKMOL_MEMGEN` / `PYMOL_PYTHON` / `DSSP_BIN` / `FOLDSEEK_BIN` by hand if you have them installed there.
 
 ---
 
@@ -213,15 +213,16 @@ Should report `3.12.x`.
 
 ---
 
-### 5. Optional structural-biology tools (AmberTools / PyMOL / DSSP)
+### 5. Optional structural-biology tools (AmberTools / PyMOL / DSSP / Foldseek)
 
-The full `app.py` agent has three features that depend on external tools it does **not** bundle and does **not** require — without them, the agent still runs, and the tools that need them just report "unavailable" instead of failing:
+The full `app.py` agent has four features that depend on external tools it does **not** bundle and does **not** require — without them, the agent still runs, and the tools that need them just report "unavailable" instead of failing:
 
 | Tool | Unlocks | Without it |
 | --- | --- | --- |
 | **AmberTools** | Hydrogen addition, membrane building, MD/QM input generation (`prepare_structure`, `build_membrane`, simulation/quantum/oniom tools) | Those specific tools report unavailable; everything else works |
 | **PyMOL** (open-source build) | Ray-traced publication-quality figure rendering (`render_image`) | That tool reports unavailable |
 | **DSSP** | Computed secondary-structure topology strings in `describe_fold` | `describe_fold` still returns CATH/SCOP fold classification (a network lookup, no dependency needed) — just not the computed topology half |
+| **Foldseek** + a reference database | Structural similarity search (`find_structural_neighbors`): which known PDB structures this one resembles in 3D, with each hit's own CATH/SCOP fold — also `describe_fold`'s fallback for AlphaFold models and unclassified entries | The app **asks you** whether to search online at search.foldseek.com (uploads the structure; no binary needed) or download the local database — it never does either on its own |
 
 These only matter for the full `app.py` agent; `server.py` and `app_lite.py` never use them.
 
@@ -233,11 +234,15 @@ bash setup_tools.sh --yes        # installs whatever's missing without asking
 bash setup_tools.sh --check-only # just reports what's found, installs nothing
 ```
 
-It only touches its own conda environments (`ambertools`, `pymol-render`, `dssp`) and never installs anything without asking, unless you pass `--yes`.
+It only touches its own conda environments (`ambertools`, `pymol-render`, `dssp`, `foldseek`) plus `protein-viz-agent/foldseek_db/`, and never installs or downloads anything without asking, unless you pass `--yes`.
+
+> **Foldseek: local or online, your choice.** With no local database, the first structural-similarity question gets a reply asking which you want: *search online* (uploads that structure's coordinates to the public search.foldseek.com server — fine for published structures, not for confidential ones; consent is remembered per structure for the session) or *download the database* (starts the download in the background from inside the app). Neither happens without your say-so.
+>
+> **Foldseek database size:** the Foldseek binary is small, but it needs a reference database to search. The PDB one is **~2.2 GB to download and ~4.2 GB on disk**, so `setup_tools.sh` asks about it separately and `run.sh` never downloads it. Manual equivalent: `foldseek databases PDB protein-viz-agent/foldseek_db/pdb /tmp/fs`, or set `FOLDSEEK_DB` to a database you already have (any Foldseek database prefix works, e.g. an AlphaFold-DB/Swiss-Prot one).
 
 > **Known issue:** conda-forge's `dssp` package (4.x) has been observed to crash unpredictably on at least one arm64 macOS machine. `setup_tools.sh` installs the current version first, actually tests it, and automatically falls back to `dssp=3` if the test fails — so this is handled for you either way.
 
-`run.sh` auto-discovers all three by conda environment name every time it starts the app, so once installed (by `setup_tools.sh` or manually), no further configuration is needed. To point at a non-standard install location instead, set `PACKMOL_MEMGEN` / `PYMOL_PYTHON` / `DSSP_BIN` yourself (see [Environment Variables](#environment-variables)).
+`run.sh` auto-discovers all four by conda environment name every time it starts the app, so once installed (by `setup_tools.sh` or manually), no further configuration is needed. To point at a non-standard install location instead, set `PACKMOL_MEMGEN` / `PYMOL_PYTHON` / `DSSP_BIN` / `FOLDSEEK_BIN` / `FOLDSEEK_DB` yourself (see [Environment Variables](#environment-variables)).
 
 ---
 
@@ -273,13 +278,13 @@ The preferred way to run the full agent **outside** Docker — one command sets 
 bash run.sh
 ```
 
-That's it — open your browser at `http://localhost:8501` once it prints the Streamlit URL. Optionally, run `bash setup_tools.sh` first if you also want AmberTools/PyMOL/DSSP (see [Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp)) — `run.sh` will pick them up automatically either way, before or after.
+That's it — open your browser at `http://localhost:8501` once it prints the Streamlit URL. Optionally, run `bash setup_tools.sh` first if you also want AmberTools/PyMOL/DSSP/Foldseek (see [Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp--foldseek)) — `run.sh` will pick them up automatically either way, before or after.
 
 ---
 
 ### Option C: Fully manual
 
-Requires [Python 3.12](#4-python-312-for-fully-manual-local-dev-only) and [Ollama](#2-ollama-local-llm-runtime) installed. Use this if you'd rather skip conda and manage dependencies yourself, or if you only want the lightweight `server.py`/`app_lite.py` entry points (neither needs AmberTools/PyMOL/DSSP at all).
+Requires [Python 3.12](#4-python-312-for-fully-manual-local-dev-only) and [Ollama](#2-ollama-local-llm-runtime) installed. Use this if you'd rather skip conda and manage dependencies yourself, or if you only want the lightweight `server.py`/`app_lite.py` entry points (neither needs AmberTools/PyMOL/DSSP/Foldseek at all).
 
 **Step 1** — Pull the LLM models (first time only):
 
@@ -300,7 +305,7 @@ pip install -r requirements.txt
 # FastAPI server — 3 tools, SSE streaming, persistent NGL viewer, no page reloads
 uvicorn server:app --reload
 
-# Full-featured Streamlit agent — 54 tools, MDAnalysis, AmberTools/PyMOL/DSSP-backed analysis
+# Full-featured Streamlit agent — 55 tools, MDAnalysis, AmberTools/PyMOL/DSSP/Foldseek-backed analysis
 streamlit run app.py
 
 # Lite Streamlit agent — same 3 tools as server.py, for debugging the agent loop
@@ -319,7 +324,7 @@ streamlit run app_lite.py
 | File | Description |
 | --- | --- |
 | `server.py` | FastAPI server — 3 tools (`search_pdb`, `set_pdb`, `add_representation`), SSE streaming, server-side tool-call deduplication, NGL selection normalisation, color extraction from natural language, in-place representation updates. Docker's own default before it switched to `app.py`; still available manually. |
-| `app.py` | Streamlit full-featured agent — **54 tools** spanning structure loading, selections, visualization, MDAnalysis-backed analysis, interaction detection, measurement, structure prep, membrane building, MD/QM input generation, PyMOL ray-traced rendering, and fold/topology classification. This is what Docker and `run.sh` both run. |
+| `app.py` | Streamlit full-featured agent — **55 tools** spanning structure loading, selections, visualization, MDAnalysis-backed analysis, interaction detection, measurement, structure prep, membrane building, MD/QM input generation, PyMOL ray-traced rendering, and fold/topology classification and Foldseek structural similarity search. This is what Docker and `run.sh` both run. |
 | `app_lite.py` | Streamlit lite agent — same 3-tool set as `server.py`, for debugging the agent loop without the full pipeline. |
 
 ---
@@ -410,7 +415,7 @@ PARORA/
 ├── protein-viz-agent/
 │   ├── server.py                 # FastAPI server — 3-tool agent
 │   ├── app_lite.py               # Streamlit lite agent — same 3 tools as server.py
-│   ├── app.py                    # Streamlit full agent — 54 tools (Docker/run.sh default)
+│   ├── app.py                    # Streamlit full agent — 55 tools (Docker/run.sh default)
 │   ├── templates/index.html      # server.py's single-page UI (vanilla JS + NGL.js)
 │   ├── viewer_component/         # app.py's NGL viewer as a declared Streamlit component
 │   ├── config.yaml               # Per-entry-point model config (read by parora_config.py)
@@ -425,6 +430,7 @@ PARORA/
 │   ├── measure.py                # Distance/angle/dihedral measurement
 │   ├── superpose.py              # RMSD structure superposition
 │   ├── topology.py               # DSSP + CATH/SCOP fold/topology classification
+│   ├── structure_search.py       # Foldseek structural similarity search
 │   ├── prepare.py                # Structure prep (hydrogens, states, cleanup)
 │   ├── membrane.py               # OPM/MEMEMBED orientation + PACKMOL-Memgen packing
 │   ├── simulation.py             # Amber/GROMACS/Rosetta input generation
@@ -434,9 +440,10 @@ PARORA/
 │   ├── requirements.txt          # Python dependencies (pip)
 │   ├── Dockerfile                # Container configuration (builds app.py)
 │   ├── structures/ membranes/ prepared/ logs/  # Runtime dirs, gitignored, created on demand
+│   ├── foldseek_db/              # Optional Foldseek reference database, gitignored
 │   └── simulations/              # Generated MD/QM job files
 ├── run.sh                        # Preferred local launcher — conda env, models, tool discovery, then app.py
-├── setup_tools.sh                # Interactive AmberTools/PyMOL/DSSP checker & installer
+├── setup_tools.sh                # Interactive AmberTools/PyMOL/DSSP/Foldseek checker & installer
 ├── deploy.sh                     # Docker build & run script (port 8501)
 ├── ollama.sh                     # Pulls both required Ollama models
 └── parora.yml                    # Conda env spec used by run.sh
@@ -462,6 +469,8 @@ None of these are required — every entry point works with its documented defau
 | `PACKMOL_MEMGEN` | `app.py` | auto-discovered | Path to AmberTools' `packmol-memgen`, if it lives somewhere `run.sh`/`setup_tools.sh` wouldn't find on their own. |
 | `PYMOL_PYTHON` | `app.py` | auto-discovered | Path to a Python interpreter that can `import pymol2`. |
 | `DSSP_BIN` | `app.py` | auto-discovered | Path to an `mkdssp` binary. |
+| `FOLDSEEK_BIN` | `app.py` | auto-discovered | Path to a `foldseek` binary. |
+| `FOLDSEEK_DB` | `app.py` | `protein-viz-agent/foldseek_db/pdb` | Foldseek database prefix to search against. |
 
 ---
 
@@ -485,8 +494,8 @@ On macOS, the container connects to `host.docker.internal:11434` automatically. 
 **MDAnalysis not available**
 The `app.py` full-featured agent gracefully degrades if MDAnalysis fails to import. Re-install with `pip install MDAnalysis` in your environment.
 
-**AmberTools / PyMOL / DSSP report "unavailable"**
-Expected if you haven't installed them — none are required. Run `bash setup_tools.sh` to check what's present and install what's missing, interactively. See [Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp).
+**AmberTools / PyMOL / DSSP / Foldseek report "unavailable"**
+Expected if you haven't installed them — none are required. Run `bash setup_tools.sh` to check what's present and install what's missing, interactively. See [Optional structural-biology tools](#5-optional-structural-biology-tools-ambertools--pymol--dssp--foldseek).
 
 **DSSP crashes / `describe_fold`'s computed topology never returns**
 conda-forge's `dssp` package (4.x) has been observed to segfault unpredictably on at least one arm64 macOS machine, on every input. `setup_tools.sh` handles this automatically (installs 4.x, smoke-tests it, falls back to `dssp=3` if the test fails); if you installed DSSP manually and hit this, run `conda install -n dssp -c conda-forge "dssp=3" -y` yourself.

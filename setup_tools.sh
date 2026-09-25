@@ -1,13 +1,15 @@
 #!/bin/bash
-# Check this machine for the three OPTIONAL tools app.py's agent can use --
-# AmberTools, PyMOL and DSSP -- and offer to install whichever are missing.
+# Check this machine for the OPTIONAL tools app.py's agent can use --
+# AmberTools, PyMOL, DSSP and Foldseek (+ its reference database) -- and
+# offer to install whichever are missing.
 #
 # None of these are required to run the app (run.sh already runs fine
 # without any of them; the tools that need them just report "unavailable").
 # This script exists for someone who wants the fuller feature set and would
 # rather be asked than dig the install commands out of run.sh/requirements.txt
 # themselves. It only ever touches its own named conda envs (ambertools,
-# pymol-render, dssp) -- nothing here is required for those names, run.sh's
+# pymol-render, dssp, foldseek) and protein-viz-agent/foldseek_db/ (or
+# $FOLDSEEK_DB) -- nothing here is required for those names, run.sh's
 # existing discovery logic already looks for exactly these.
 #
 # Usage:
@@ -25,7 +27,7 @@ for arg in "$@"; do
         --yes|-y) ASSUME_YES=true ;;
         --check-only) CHECK_ONLY=true ;;
         -h|--help)
-            sed -n '2,17p' "$0"
+            sed -n '2,18p' "$0"
             exit 0
             ;;
         *)
@@ -84,6 +86,8 @@ confirm() {
 STATUS_AMBERTOOLS="not checked"
 STATUS_PYMOL="not checked"
 STATUS_DSSP="not checked"
+STATUS_FOLDSEEK="not checked"
+STATUS_FOLDSEEK_DB="not checked"
 
 # ── 1. AmberTools ────────────────────────────────────────────────────────────
 # Needed by: prepare_structure (hydrogens via reduce), build_membrane,
@@ -221,13 +225,82 @@ else
 fi
 echo
 
+# ── 4. Foldseek (binary + reference database) ───────────────────────────────
+# Needed by: find_structural_neighbors, and describe_fold's fallback for
+# chains with no CATH/SCOP classification of their own (AlphaFold models,
+# local files, recent entries). Two separate pieces: the binary (small conda
+# package) and a reference database to search against. The PDB database is
+# ~2.2 GB to download, ~4.2 GB unpacked -- asked for separately and never
+# fetched silently.
+echo "── Foldseek ─────────────────────────────────────────────────────────────"
+FOLDSEEK_DB_PREFIX="${FOLDSEEK_DB:-$PWD/protein-viz-agent/foldseek_db/pdb}"
+fs_bin=""
+if [ -n "${FOLDSEEK_BIN:-}" ] && [ -x "${FOLDSEEK_BIN:-}" ]; then
+    fs_bin="$FOLDSEEK_BIN"
+elif command -v foldseek >/dev/null 2>&1; then
+    fs_bin="$(command -v foldseek)"
+else
+    FS_ENV_PATH=$(conda env list | awk '$1 ~ /foldseek/ {print $NF; exit}')
+    if [ -n "$FS_ENV_PATH" ] && [ -x "$FS_ENV_PATH/bin/foldseek" ]; then
+        fs_bin="$FS_ENV_PATH/bin/foldseek"
+    fi
+fi
+
+if [ -n "$fs_bin" ] && "$fs_bin" version >/dev/null 2>&1; then
+    echo "Binary found -- $fs_bin ($("$fs_bin" version 2>&1 | head -1))"
+    STATUS_FOLDSEEK="found ($fs_bin)"
+else
+    echo "Binary not found. Used by: find_structural_neighbors, and describe_fold's"
+    echo "fallback for structures with no CATH/SCOP classification of their own."
+    if confirm "Install Foldseek now? This downloads a small conda-forge/bioconda package."; then
+        if conda create -n foldseek -c conda-forge -c bioconda foldseek -y; then
+            fs_bin="$CONDA_ROOT/envs/foldseek/bin/foldseek"
+            STATUS_FOLDSEEK="installed"
+            echo "Foldseek installed."
+        else
+            STATUS_FOLDSEEK="install failed"
+            echo "Foldseek install failed -- see the conda output above."
+        fi
+    else
+        STATUS_FOLDSEEK="skipped"
+        echo "Skipped."
+    fi
+fi
+
+if [ -f "$FOLDSEEK_DB_PREFIX.dbtype" ]; then
+    echo "Database found -- $FOLDSEEK_DB_PREFIX"
+    STATUS_FOLDSEEK_DB="found ($FOLDSEEK_DB_PREFIX)"
+elif [ -n "$fs_bin" ] && [ -x "$fs_bin" ]; then
+    echo "Reference database not found at $FOLDSEEK_DB_PREFIX."
+    if confirm "Download the Foldseek PDB database now? ~2.2 GB download, ~4.2 GB on disk."; then
+        mkdir -p "$(dirname "$FOLDSEEK_DB_PREFIX")"
+        fs_tmp="$(mktemp -d)"
+        if "$fs_bin" databases PDB "$FOLDSEEK_DB_PREFIX" "$fs_tmp"; then
+            STATUS_FOLDSEEK_DB="downloaded ($FOLDSEEK_DB_PREFIX)"
+            echo "Foldseek PDB database ready."
+        else
+            STATUS_FOLDSEEK_DB="download failed"
+            echo "Database download failed -- see the output above."
+        fi
+        rm -rf "$fs_tmp"
+    else
+        STATUS_FOLDSEEK_DB="skipped"
+        echo "Skipped. Later: foldseek databases PDB $FOLDSEEK_DB_PREFIX /tmp/fs"
+    fi
+else
+    STATUS_FOLDSEEK_DB="not checked (no binary)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "── Summary ──────────────────────────────────────────────────────────────"
 printf "  %-12s %s\n" "AmberTools" "$STATUS_AMBERTOOLS"
 printf "  %-12s %s\n" "PyMOL" "$STATUS_PYMOL"
 printf "  %-12s %s\n" "DSSP" "$STATUS_DSSP"
+printf "  %-12s %s\n" "Foldseek" "$STATUS_FOLDSEEK"
+printf "  %-12s %s\n" "Foldseek DB" "$STATUS_FOLDSEEK_DB"
 echo
 echo "Nothing further to do -- run.sh's own discovery already looks for these"
-echo "exact conda env names (ambertools, a *pymol* name, dssp) every time it"
+echo "exact conda env names (ambertools, a *pymol* name, dssp, foldseek) every time it"
 echo "starts the app, so a freshly installed tool is picked up automatically"
 echo "on the next \`bash run.sh\`."

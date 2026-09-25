@@ -13,7 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # and the AmberTools-backed tools (membrane build, hydrogen prep, simulation,
 # QM/QM-MM) stay optional -- they shell out to a PyMOL/AmberTools conda env
 # discovered at runtime (PYMOL_PYTHON / PACKMOL_MEMGEN / AMBERHOME), which
-# this image does not bundle. Everything else works out of the box.
+# this image does not bundle. Same for DSSP and Foldseek (DSSP_BIN /
+# FOLDSEEK_BIN); with no local Foldseek database the app asks the user
+# before any online search, so the image still works without them.
+# Everything else works out of the box.
 COPY protein-viz-agent/app.py .
 COPY protein-viz-agent/parora_logging.py .
 COPY protein-viz-agent/parora_config.py .
@@ -32,6 +35,10 @@ COPY protein-viz-agent/membrane.py .
 COPY protein-viz-agent/Protein_accession.py .
 COPY protein-viz-agent/pymol_render.py .
 COPY protein-viz-agent/pymol_worker.py .
+COPY protein-viz-agent/topology.py .
+COPY protein-viz-agent/structure_search.py .
+COPY protein-viz-agent/rag_grounding.py .
+COPY protein-viz-agent/rag_examples.json .
 COPY protein-viz-agent/viewer_component/ ./viewer_component/
 COPY logo/ ./logo/
 RUN mkdir -p /app/structures /app/membranes /app/prepared /app/logs

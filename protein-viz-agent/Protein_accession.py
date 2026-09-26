@@ -44,7 +44,7 @@ import structure_report as srep
 # st.cache_data keys on the decorated function's own code, so a wrapper that
 # merely calls profile() keeps serving dicts built by an older version of this
 # module long after it has been edited.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 UNIPROT_SEARCH = "https://rest.uniprot.org/uniprotkb/search"
 UNIPROT_ENTRY = "https://rest.uniprot.org/uniprotkb/{acc}.json"
@@ -122,6 +122,21 @@ MIN_REGION_FEATURE = 30
 # Region: "Protein kinase" says what a construct is, "Interaction with CCAR2"
 # says what a stretch of it does.
 FEATURE_TYPES = ("Domain", "DNA binding", "Zinc finger", "Region")
+
+
+# Evidence codes (ECO) UniProt attaches to text produced by automatic rules
+# (UniRule/ARBA sequence-model matches, imported unreviewed assertions).
+_AUTOMATIC_ECO = {"ECO:0000256", "ECO:0000259", "ECO:0000313", "ECO:0007829"}
+
+# GO evidence codes. Experimental and curator-statement codes are recorded
+# observations; the rest are computational transfers (by homology, phylogeny,
+# InterPro mapping ...) and are predictions, however confident they look.
+_GO_RECORDED = {"EXP", "IDA", "IPI", "IMP", "IGI", "IEP",
+                "HTP", "HDA", "HMP", "HGI", "HEP", "TAS", "NAS", "IC"}
+
+# Extra fields for function_evidence() only; kept out of UNIPROT_FIELDS so
+# every ordinary lookup does not pay for the GO list.
+_EVIDENCE_FIELDS = "accession,protein_name,cc_similarity,keyword,go,xref_interpro,ec"
 
 
 class LookupFailed(Exception):
@@ -258,6 +273,20 @@ def _function_of(entry: dict) -> str:
                 if t.get("value"):
                     return re.sub(r"\s*\(PubMed:[^)]*\)", "", t["value"]).strip()
     return ""
+
+
+def _function_is_automatic(entry: dict) -> bool:
+    """
+    True when every FUNCTION text rests only on automatic rules.
+
+    Unreviewed (TrEMBL) entries often carry a FUNCTION comment written by
+    UniRule/ARBA from a sequence-family match (ECO:0000256), not by a curator.
+    It reads exactly like curated text, so it must be labelled as what it is.
+    """
+    codes = [e.get("evidenceCode", "")
+             for c in entry.get("comments") or [] if c.get("commentType") == "FUNCTION"
+             for t in c.get("texts") or [] for e in t.get("evidences") or []]
+    return bool(codes) and all(c in _AUTOMATIC_ECO for c in codes)
 
 
 def _subunit_of(entry: dict) -> str:
@@ -797,6 +826,7 @@ def profile(accession: str, enrich: bool = True):
         "mass": base["mass"],
         "sequence": (entry.get("sequence") or {}).get("value", ""),
         "function": base["function"],
+        "function_automatic": _function_is_automatic(entry),
         "subunit": _subunit_of(entry),
         "isoforms": _isoforms_of(entry),
         "domains": domains,
@@ -863,6 +893,71 @@ def lookup(name: str, organism="human", reviewed_only: bool = True, enrich: bool
         return None, [], f"No UniProt entry matches '{name}'{where}."
     prof, err = profile(hits[0]["accession"], enrich=enrich)
     return prof, hits, err
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Function evidence (entries with no FUNCTION comment)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@lru_cache(maxsize=64)
+def _uniprot_evidence_raw(accession: str) -> str:
+    """Raw UniProt entry with the family/GO/InterPro fields, cached."""
+    data = _http_json("GET", UNIPROT_ENTRY.format(acc=urllib.parse.quote(accession)),
+                      params={"fields": _EVIDENCE_FIELDS})
+    return json.dumps(data)
+
+
+def function_evidence(accession: str):
+    """
+    Collect what UniProt still knows about an entry that has no FUNCTION text.
+
+    About 40% of the UniProt entries that have a PDB structure carry no
+    FUNCTION comment, yet nearly all of them are placed in a sequence family
+    (InterPro, "Belongs to the ... family") and many carry GO terms. This
+    splits that into what was observed (GO terms with experimental or curator
+    evidence codes) and what was inferred by computation (family membership,
+    InterPro, electronically transferred GO terms, EC numbers), so a caller
+    can report the second as a low-confidence prediction and never at the
+    confidence of curated text.
+
+    Returns:
+        (dict, error). dict keys: recorded_go / inferred_go (lists of
+        (aspect, term, code)), family (list of SIMILARITY texts), interpro
+        (list of (id, name)), ec (list), keywords (list of (category, name)).
+    """
+    acc = (accession or "").strip().upper()
+    try:
+        entry = json.loads(_uniprot_evidence_raw(acc))
+    except LookupFailed as e:
+        return None, str(e)
+
+    recorded, inferred, interpro = [], [], []
+    for x in entry.get("uniProtKBCrossReferences") or []:
+        props = {p.get("key"): p.get("value", "") for p in x.get("properties") or []}
+        if x.get("database") == "InterPro":
+            interpro.append((x.get("id", ""), props.get("EntryName", "")))
+        elif x.get("database") == "GO":
+            aspect, _, term = props.get("GoTerm", "").partition(":")
+            code = props.get("GoEvidenceType", "").split(":")[0]
+            if aspect not in ("F", "P") or not term:
+                continue   # cellular component is location, not function
+            (recorded if code in _GO_RECORDED else inferred).append((aspect, term, code))
+
+    family = [re.sub(r"\s*\(PubMed:[^)]*\)", "", t["value"]).strip()
+              for c in entry.get("comments") or [] if c.get("commentType") == "SIMILARITY"
+              for t in c.get("texts") or [] if t.get("value")]
+
+    desc = entry.get("proteinDescription") or {}
+    names = [desc.get("recommendedName") or {}] + list(desc.get("submissionNames") or [])
+    ec = sorted({e["value"] for n in names for e in n.get("ecNumbers") or [] if e.get("value")})
+
+    keywords = [(k.get("category", ""), k.get("name", ""))
+                for k in entry.get("keywords") or []
+                if k.get("category") in ("Molecular function", "Biological process", "Ligand")]
+
+    return {"accession": acc, "recorded_go": recorded, "inferred_go": inferred,
+            "family": family, "interpro": interpro, "ec": ec,
+            "keywords": keywords}, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

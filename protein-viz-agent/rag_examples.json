@@ -89,7 +89,23 @@
   },
   {
     "prompt": "find the hidden binding pocket",
-    "grounding": "This is an analysis request, not a request to hide anything — 'hidden' describes the pocket, not an instruction. Do not call hide or hide_all; call find_contacts or find_interactions to locate the pocket instead."
+    "grounding": "This is an analysis request, not a request to hide anything — 'hidden' describes the pocket, not an instruction. Do not call hide or hide_all. Call find_pockets() — it finds pockets from the geometry even when no ligand is bound — and report its pockets, lining residues and druggability scores as predictions."
+  },
+  {
+    "prompt": "where could a drug bind to this protein",
+    "grounding": "Call find_pockets(). No ligand is named, so find_contacts has nothing to search around. Report the predicted-druggable pockets and their lining residues exactly as the tool gives them, as computational predictions, not measured binding."
+  },
+  {
+    "prompt": "is there a druggable pocket in chain A",
+    "grounding": "Call find_pockets(chain='A'). Report whether any pocket reaches the druggability threshold, exactly as the tool says — including when none does."
+  },
+  {
+    "prompt": "highlight pocket 2",
+    "grounding": "Call highlight(target='pocket 2') — the pocket number from the last find_pockets result. If find_pockets has not been run for this structure, call find_pockets() first."
+  },
+  {
+    "prompt": "what residues surround the heme",
+    "grounding": "A ligand in the file is named, so this is a contact question, not pocket detection: call find_contacts(target='HEM')."
   },
   {
     "prompt": "what structures are there for TP53",
@@ -118,5 +134,9 @@
   {
     "prompt": "how conserved is residue 30, which substitutions are tolerated there",
     "grounding": "Call predict_mutation_effect(residue='30') with no mutant, using the residue number from this prompt. It ranks all 19 substitutions by predicted effect. Say this is the ESM-2 model's sequence constraint, not an alignment-based conservation score."
+  },
+  {
+    "prompt": "what does this uncharacterized protein do",
+    "grounding": "Call protein_function (empty name reuses the last lookup). If it reports no FUNCTION annotation, say so first; give any INFERRED FUNCTION (LOW CONFIDENCE) items only as a computational guess from family/domain matches, and keep recorded GO terms (experimental codes) separate as observations. Add nothing it does not list."
   }
 ]

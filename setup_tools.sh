@@ -1,6 +1,6 @@
 #!/bin/bash
 # Check this machine for the OPTIONAL tools app.py's agent can use --
-# AmberTools, PyMOL, DSSP, Foldseek (+ its reference database) and ESM-2
+# AmberTools, PyMOL, DSSP, Foldseek (+ its reference database), fpocket and ESM-2
 # (torch env + model checkpoint) -- and
 # offer to install whichever are missing.
 #
@@ -9,7 +9,7 @@
 # This script exists for someone who wants the fuller feature set and would
 # rather be asked than dig the install commands out of run.sh/requirements.txt
 # themselves. It only ever touches its own named conda envs (ambertools,
-# pymol-render, dssp, foldseek, esm), the Hugging Face model cache and protein-viz-agent/foldseek_db/ (or
+# pymol-render, dssp, foldseek, fpocket, esm), the Hugging Face model cache and protein-viz-agent/foldseek_db/ (or
 # $FOLDSEEK_DB) -- nothing here is required for those names, run.sh's
 # existing discovery logic already looks for exactly these.
 #
@@ -89,6 +89,7 @@ STATUS_PYMOL="not checked"
 STATUS_DSSP="not checked"
 STATUS_FOLDSEEK="not checked"
 STATUS_FOLDSEEK_DB="not checked"
+STATUS_FPOCKET="not checked"
 STATUS_ESM="not checked"
 STATUS_ESM_MODEL="not checked"
 
@@ -295,6 +296,43 @@ else
 fi
 echo
 
+# ── 4.5. fpocket ─────────────────────────────────────────────────────────────
+# Needed by: find_pockets (binding-pocket / druggability detection from the
+# structure's geometry). Single small binary, no database, no GPU. fpocket
+# has no --version flag; run bare it prints a usage banner naming itself.
+echo "── fpocket ──────────────────────────────────────────────────────────────"
+fp_bin=""
+if [ -n "${FPOCKET_BIN:-}" ] && [ -x "${FPOCKET_BIN:-}" ]; then
+    fp_bin="$FPOCKET_BIN"
+elif command -v fpocket >/dev/null 2>&1; then
+    fp_bin="$(command -v fpocket)"
+else
+    FP_ENV_PATH=$(conda env list | awk '$1 ~ /fpocket/ {print $NF; exit}')
+    if [ -n "$FP_ENV_PATH" ] && [ -x "$FP_ENV_PATH/bin/fpocket" ]; then
+        fp_bin="$FP_ENV_PATH/bin/fpocket"
+    fi
+fi
+
+if [ -n "$fp_bin" ] && "$fp_bin" 2>&1 | grep -qi fpocket; then
+    echo "Found -- $fp_bin"
+    STATUS_FPOCKET="found ($fp_bin)"
+else
+    echo "Not found. Used by: find_pockets (candidate binding pockets + druggability)."
+    if confirm "Install fpocket now? This downloads a small conda-forge package."; then
+        if conda create -n fpocket -c conda-forge fpocket -y; then
+            STATUS_FPOCKET="installed"
+            echo "fpocket installed."
+        else
+            STATUS_FPOCKET="install failed"
+            echo "fpocket install failed -- see the conda output above."
+        fi
+    else
+        STATUS_FPOCKET="skipped"
+        echo "Skipped."
+    fi
+fi
+echo
+
 # ── 5. ESM-2 (torch + transformers env, plus the model checkpoint) ───────────
 # Needed by: predict_mutation_effect (zero-shot mutation-effect scoring).
 # torch stays out of the parora env and the Docker image; the worker runs in
@@ -362,10 +400,11 @@ printf "  %-12s %s\n" "PyMOL" "$STATUS_PYMOL"
 printf "  %-12s %s\n" "DSSP" "$STATUS_DSSP"
 printf "  %-12s %s\n" "Foldseek" "$STATUS_FOLDSEEK"
 printf "  %-12s %s\n" "Foldseek DB" "$STATUS_FOLDSEEK_DB"
+printf "  %-12s %s\n" "fpocket" "$STATUS_FPOCKET"
 printf "  %-12s %s\n" "ESM-2 env" "$STATUS_ESM"
 printf "  %-12s %s\n" "ESM-2 model" "$STATUS_ESM_MODEL"
 echo
 echo "Nothing further to do -- run.sh's own discovery already looks for these"
-echo "exact conda env names (ambertools, a *pymol* name, dssp, foldseek) every time it"
+echo "exact conda env names (ambertools, a *pymol* name, dssp, foldseek, fpocket) every time it"
 echo "starts the app, so a freshly installed tool is picked up automatically"
 echo "on the next \`bash run.sh\`."

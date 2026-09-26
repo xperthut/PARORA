@@ -96,6 +96,10 @@ import structure_search as fsk
 # separate interpreter, driven as a subprocess — same pattern as PyMOL).
 import esm_tools as esm
 
+# Binding-pocket / druggability detection (fpocket, optional external binary)
+# — candidate sites from the fold itself, bound ligand or not.
+import pockets as pkt
+
 # Geometric measurement — distances, angles, contact shells. Reads coordinates
 # from the PDB records directly, so it works without MDAnalysis.
 import measure as mz
@@ -1107,15 +1111,80 @@ def tool_protein_function(name: str = "") -> str:
             return err
     lines = [f"{prof['protein_name']} ({prof['accession']})"]
     if prof["function"]:
-        lines.append("Function: " + prof["function"])
+        if prof.get("function_automatic"):
+            lines.append("Function (AUTOMATIC annotation — written by UniProt's UniRule/ARBA "
+                         "rules from a sequence-family match, not reviewed by a curator): "
+                         + prof["function"])
+        else:
+            lines.append("Function: " + prof["function"])
     if prof["subunit"]:
         lines.append("Subunit structure: " + prof["subunit"])
-    if not prof["function"] and not prof["subunit"]:
-        lines.append(
-            "UniProt has no curated function or subunit annotation for this "
-            "entry — this protein may be uncharacterized or under-studied."
-        )
+    if not prof["function"]:
+        lines.append("UniProt has no FUNCTION annotation for this entry — this protein "
+                     "may be uncharacterized or under-studied.")
+        lines.extend(_function_fallback(prof["accession"]))
     return "\n".join(lines)
+
+
+# P13: only reached when UniProt has no FUNCTION text; never shown next to one.
+_GO_ASPECT = {"F": "Molecular function", "P": "Biological process"}
+
+
+def _function_fallback(accession: str) -> list:
+    """
+    Report what UniProt still holds for an entry with no FUNCTION comment.
+
+    GO terms with experimental or curator evidence codes are observations and
+    are reported as such. Family membership, InterPro domains, electronically
+    transferred GO terms and EC numbers are computational inferences, so they
+    go under one explicit LOW CONFIDENCE heading that run_agent keys its
+    caveat footer on.
+    """
+    ev, err = pacc.function_evidence(accession)
+    if err:
+        return [f"Could not fetch family/GO data to infer a role: {err}"]
+
+    def go_lines(terms):
+        out = []
+        for aspect, label in _GO_ASPECT.items():
+            picked = [f"{t} [{c}]" for a, t, c in terms if a == aspect]
+            if picked:
+                more = f" (+{len(picked) - 8} more)" if len(picked) > 8 else ""
+                out.append(f"  {label}: " + "; ".join(picked[:8]) + more)
+        return out
+
+    lines = []
+    recorded = go_lines(ev["recorded_go"])
+    if recorded:
+        lines.append("Recorded GO annotations (experimental or curator evidence code in "
+                     "brackets — observations, not predictions):")
+        lines.extend(recorded)
+
+    inferred = []
+    if ev["family"]:
+        inferred.append("  Sequence family: " + "; ".join(ev["family"]))
+    if ev["interpro"]:
+        inferred.append("  InterPro families/domains: " + "; ".join(
+            f"{n} ({i})" for i, n in ev["interpro"][:6]))
+    inferred.extend(go_lines(ev["inferred_go"]))
+    if ev["ec"]:
+        inferred.append("  EC number (rule-assigned): " + ", ".join(ev["ec"]))
+    if ev["keywords"]:
+        inferred.append("  UniProt keywords: " + ", ".join(n for _, n in ev["keywords"]))
+    if inferred:
+        lines.append("INFERRED FUNCTION (LOW CONFIDENCE — computational, from sequence-"
+                     "family and domain matches, not a curated or measured function):")
+        lines.extend(inferred)
+        lines.append("Caveat: belonging to a family or carrying a domain suggests a role but "
+                     "does not establish it — family members can differ in substrate or "
+                     "partner, or have lost activity. Report these as a computational guess, "
+                     "not as this protein's known function, and keep this heading's "
+                     "LOW CONFIDENCE label in the reply.")
+    if not recorded and not inferred:
+        lines.append("UniProt has no family, domain or GO information for it either — there "
+                     "is nothing to base even a low-confidence guess on. Say so; do not "
+                     "guess a role from the name.")
+    return lines
 
 
 def tool_load_protein(name: str, organism: str = "human", prefer: str = "balanced",
@@ -1871,9 +1940,28 @@ def tool_describe_structure(target: str = "", detail: str = "brief") -> str:
     if summary is None:
         return (f"No structure called '{target}' is loaded. Loaded: "
                 + ", ".join(s["pdb_id"] for s in structures()))
-    if (detail or "brief").lower() in ("full", "detailed", "long", "all"):
-        return srep.as_text(summary)
-    return srep.as_brief(summary)
+    text = (srep.as_text(summary)
+            if (detail or "brief").lower() in ("full", "detailed", "long", "all")
+            else srep.as_brief(summary))
+    return text + _pocket_summary(find_structure(target) if target else active_structure())
+
+
+def _pocket_summary(entry) -> str:
+    """
+    One line on pockets already found for this file by find_pockets, so a
+    later composition question does not read as "no ligand = no binding
+    site". Only reuses a finished run — never starts fpocket itself.
+    """
+    found = st.session_state.get("pockets")
+    if not entry or not found or found["path"] != entry["path"] or not found["by_rank"]:
+        return ""
+    ps = list(found["by_rank"].values())
+    drug = [p for p in ps if p.get("drug_score", 0) >= pkt.DRUGGABLE]
+    tail = (f"; predicted druggable: " + ", ".join(
+        f"pocket {p['rank']} ({p['drug_score']:.2f}"
+        + (", holds " + p["occupants"][0]["label"] if p["occupants"] else ", empty") + ")"
+        for p in drug) if drug else "; none predicted druggable")
+    return f"\nPockets (fpocket, found earlier): {len(ps)} candidate pocket(s){tail}."
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -2218,6 +2306,209 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
 
 
 @st.cache_data(show_spinner=False)
+def _cached_pockets(path: str, mtime: float, schema: int):
+    """Run and cache fpocket on a structure; mtime and schema bust the cache."""
+    return pkt.find_pockets(path)
+
+
+def _pocket_residues(p: dict) -> str:
+    """'A: F98 H103 · B: Y35' — a pocket's lining residues, grouped by chain."""
+    by_chain = {}
+    for chain, resseq, icode, resname in p["residues"]:
+        one = squ.AA3_TO_1.get(resname, resname)
+        by_chain.setdefault(chain, []).append(f"{one}{resseq}{icode}")
+    return " · ".join(f"{c}: {' '.join(r)}" for c, r in by_chain.items())
+
+
+def _pocket_chains(p: dict) -> str:
+    """'chain B' / 'chains A, D' — who lines a pocket, most residues first."""
+    counts = {}
+    for r in p["residues"]:
+        counts[r[0]] = counts.get(r[0], 0) + 1
+    chains = sorted(counts, key=lambda c: -counts[c])
+    return ("chain " if len(chains) == 1 else "chains ") + ", ".join(chains)
+
+
+def _pocket_line(p: dict) -> str:
+    """One pocket's headline: rank, scores, size."""
+    drug = p.get("drug_score", 0.0)
+    verdict = "predicted druggable" if drug >= pkt.DRUGGABLE else "not predicted druggable"
+    return (f"Pocket {p['rank']} — fpocket score {p.get('score', 0):.2f}, druggability "
+            f"{drug:.2f} ({verdict}), volume ~{p.get('volume', 0):.0f} Å³, "
+            f"{len(p['residues'])} lining residues on {_pocket_chains(p)}")
+
+
+def _pocket_occupancy(p: dict) -> str:
+    """What the deposited file has in this pocket, or that it is empty."""
+    if not p["occupants"]:
+        return "empty in this file (nothing is bound here in the deposited structure)"
+    return "occupied in this file by " + "; ".join(
+        f"{o['label']} ({srep.CATEGORY_LABELS.get(o['kind'], o['kind']).lower()}, "
+        f"{o['n_in']} of {o['n_atoms']} atoms inside)" for o in p["occupants"])
+
+
+def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
+    """
+    Find candidate ligand-binding pockets from the structure's own geometry.
+
+    Runs fpocket on a protein-only copy of the loaded structure (ligands,
+    ions and water removed), so occupied and empty sites are found on the
+    same footing, then says for each pocket what, if anything, the
+    deposited file has bound there. Works with no ligand in the file at
+    all — which is the point: "where could something bind" is a question
+    about the fold, not about what happened to be co-crystallised.
+
+    Shows the top pockets by fpocket's own score plus any further pocket
+    fpocket predicts druggable (druggability >= 0.5), since the two
+    rankings disagree: in 4HHB the heme pockets rank 5th and below by
+    pocket score but are the most druggable sites in the file.
+
+    Args:
+        chain      : Only pockets lined by this chain, e.g. "A". Empty for all.
+        max_pockets: How many top-ranked pockets to show (1-15).
+
+    Returns:
+        A plain-text report, or why pocket detection could not run.
+    """
+    entry = active_structure()
+    if not entry:
+        return "No structure is loaded — fetch one first."
+    if not pkt.fpocket_available():
+        return pkt.UNAVAILABLE
+    wanted = ""
+    if (chain or "").strip():
+        wanted = chain.strip().upper().replace("CHAIN", "").strip()
+        present = _atoms_of(entry)["chains_present"]
+        if wanted not in present:
+            return (f"Chain {wanted} is not in {entry['pdb_id']}. "
+                    f"Chains present: {', '.join(present)}")
+    try:
+        max_pockets = max(1, min(int(max_pockets), 15))
+    except (TypeError, ValueError):
+        max_pockets = 5
+
+    ok, msg, result = _cached_pockets(entry["path"], Path(entry["path"]).stat().st_mtime,
+                                      pkt.SCHEMA_VERSION)
+    if not ok:
+        return msg
+    pockets = [p for p in result["pockets"]
+               if not wanted or any(r[0] == wanted for r in p["residues"])]
+    scope = f", chain {wanted}" if wanted else ""
+    st.session_state.pockets = {"path": entry["path"], "pdb_id": entry["pdb_id"],
+                                "by_rank": {p["rank"]: p for p in pockets}}
+
+    stripped = (f"{len(result['hetero'])} hetero group(s) removed before the search "
+                "(ligands, ions; water too)" if result["hetero"]
+                else "no ligand is bound in this file; water removed")
+    lines = [f"Candidate binding pockets in {entry['pdb_id']}{scope} — fpocket, from this "
+             f"structure's own geometry ({stripped}, so occupied and empty sites are found "
+             "alike)."]
+    if not pockets:
+        lines.append("fpocket found no pocket"
+                     + (f" lined by chain {wanted}" if wanted else "")
+                     + ", even with a relaxed minimum size — there is no cavity here that "
+                     "could hold a ligand.")
+        return "\n".join(lines)
+
+    if result["relaxed"]:
+        best = max(p.get("drug_score", 0) for p in pockets)
+        lines.append(
+            f"No pocket met fpocket's default minimum size ({pkt.DEFAULT_MIN_SPHERES} alpha "
+            "spheres). A relaxed "
+            f"pass (≥{pkt.RELAXED_MIN_SPHERES} spheres) found {len(pockets)} small, shallow "
+            f"surface grooves; the best druggability is {best:.2f}, so none is a "
+            "conventional ligand-binding pocket. The protein may simply be too small to "
+            "enclose one.")
+
+    shown = pockets[:max_pockets]
+    extra = [p for p in pockets[max_pockets:] if p.get("drug_score", 0) >= pkt.DRUGGABLE]
+    # Most druggable first: qwen2.5:7b read "pocket 12 (0.87)" as the best
+    # when 0.88 came later in rank order.
+    druggable = sorted((p for p in pockets if p.get("drug_score", 0) >= pkt.DRUGGABLE),
+                       key=lambda p: -p["drug_score"])
+    empty_drug = [p for p in druggable if not p["occupants"]]
+    lines.append(f"{len(pockets)} pocket(s) detected; top {len(shown)} by fpocket score shown"
+                 + (f", plus {len(extra)} lower-ranked pocket(s) predicted druggable" if extra
+                    else "") + ".")
+    if druggable:
+        lines.append(
+            f"SUMMARY: {len(druggable)} of {len(pockets)} pocket(s) predicted druggable, most "
+            "druggable first: " + "; ".join(
+                f"pocket {p['rank']} ({p['drug_score']:.2f}, {_pocket_chains(p)}, "
+                + (f"holds {p['occupants'][0]['label']}" if p["occupants"] else "empty") + ")"
+                for p in druggable) + ". "
+            + (f"Empty and predicted druggable: "
+               + ", ".join(f"pocket {p['rank']}" for p in empty_drug) + "."
+               if empty_drug else
+               "None of them is empty — every predicted-druggable pocket already holds a "
+               "bound group in this file.")
+            + f" The other {len(pockets) - len(druggable)} pocket(s) are below the "
+            f"druggability threshold ({pkt.DRUGGABLE}).")
+    else:
+        lines.append(f"SUMMARY: none of the {len(pockets)} pocket(s) reaches fpocket's "
+                     f"druggability threshold ({pkt.DRUGGABLE}).")
+    for p in shown + extra:
+        lines.append("")
+        lines.append(_pocket_line(p))
+        lines.append(f"   lining: {_pocket_residues(p)}")
+        lines.append(f"   {_pocket_occupancy(p)}")
+    lines.append("")
+    lines.append(
+        "How to read this: pocket score is fpocket's ranking of how pocket-like a cavity "
+        "is; druggability (Schmidtke & Barril 2010, 0-1, ≥0.5 predicted druggable) "
+        "estimates whether a drug-like molecule could bind there tightly. Both are "
+        "computational predictions from one static conformation, not binding "
+        "measurements — a cryptic pocket that only opens when the protein moves or a "
+        "ligand binds is not visible here.")
+    lines.append("To show one in the viewer, say \"highlight pocket N\".")
+    return "\n".join(lines)
+
+
+_GENERIC_SITE = re.compile(r"\b(ligands?|pockets?|binding[ _-]?sites?|active[ _-]?sites?|"
+                           r"cavit\w*|drugs?|inhibitors?)\b", re.I)
+
+
+def _pocket_hint(target: str) -> str:
+    """
+    Appended when find_contacts/find_interactions could not resolve a
+    generic 'ligand' / 'pocket' target: the model reached for a contact
+    search to answer a pocket question (the pre-P12 answer to "find the
+    hidden binding pocket", which then asked the user for residue ranges).
+    """
+    if not _GENERIC_SITE.search(target or ""):
+        return ""
+    entry = active_structure()
+    het = sorted(r for r in (_atoms_of(entry)["resnames_present"] if entry else [])
+                 if r not in srep.STANDARD_AA and r not in squ.AA3_TO_1
+                 and r not in ("HOH", "WAT", "DOD"))
+    named = (f" For contacts, name one of this file's hetero groups: {', '.join(het)}."
+             if het else "")
+    return (named + " To find candidate binding pockets from the structure's geometry "
+            "— with or without a bound ligand — call find_pockets.")
+
+
+def _pocket_target(spec: str):
+    """
+    Residue keys of 'pocket N' from the last find_pockets run on the active
+    structure: (keys, label) or (None, error). (None, None) when spec does
+    not name a pocket at all.
+    """
+    m = re.fullmatch(r"(?:fpocket\s+)?pocket\s*#?\s*(\d+)", spec.strip(), re.I)
+    if not m:
+        return None, None
+    entry, found = active_structure(), st.session_state.get("pockets")
+    if not found or not entry or found["path"] != entry["path"]:
+        return None, "No pockets have been found for this structure yet — run find_pockets first."
+    p = found["by_rank"].get(int(m.group(1)))
+    if not p:
+        return None, (f"There is no pocket {m.group(1)} in {found['pdb_id']}. Pockets: "
+                      + ", ".join(str(r) for r in list(found["by_rank"])[:20]))
+    keys = [(c.strip(), r, i) for c, r, i, _ in p["residues"]]
+    return keys, (f"pocket {p['rank']} (druggability {p.get('drug_score', 0):.2f}; "
+                  f"{len(keys)} lining residues — {_pocket_residues(p)})")
+
+
+@st.cache_data(show_spinner=False)
 def _cached_esm_position(path: str, mtime: float, chain: str, index: int, model: str):
     """ESM-2 masked-marginal log-probs at one position; mtime/model bust the cache."""
     tokens, _, _ = esm.chain_sequence(path, chain)
@@ -2410,6 +2701,199 @@ def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str =
     caveats.extend(notes)
     lines.append("Caveats: " + "; ".join(caveats) + ".")
     return "\n".join(lines)
+
+
+# P11: a stability question that names a mutation is answerable (as a proxy);
+# one that names nothing to compute against is not. These read the mutation
+# out of the user's own words so the stability gate in run_agent can tell
+# the two apart without asking the model.
+_MUTATE_WORDS = re.compile(r"\b(mutat\w*|substitut\w*|replac\w*|swap\w*|variant|mutant)\b", re.I)
+
+
+def _stability_mutations(prompt: str) -> list:
+    """
+    (residue, mutant, wildtype, chain) for each mutation a prompt names, or [].
+
+    "H92A" / "Leu99Ala" tokens first (up to 4); otherwise "residue 45" /
+    "Leu 99" / "A/45" plus a substitution ("to alanine") or a mutation word
+    ("mutating residue 45" → all 19 ranked). A residue with neither — "is
+    residue 45 important for stability" — names nothing to compute.
+    """
+    chain_m = (re.search(r"\bchain\s+([A-Za-z0-9])\b", prompt, re.I)
+               or re.search(r"\b([A-Za-z])\s*[/:]\s*\d+\b", prompt))
+    chain = chain_m.group(1).upper() if chain_m else ""
+    found, seen = [], set()
+    for wt, n, mt in re.findall(r"\b([A-Za-z]{1,3})(\d+)([A-Za-z]{1,3})\b", prompt):
+        if n not in seen and esm.parse_amino_acid(wt) and esm.parse_amino_acid(mt):
+            seen.add(n)
+            found.append((n, esm.parse_amino_acid(mt), esm.parse_amino_acid(wt), chain))
+    if found:
+        return found[:4]
+    m = (re.search(r"\b(?:residue|res|position|pos|site)\s*(?:#|no\.?\s*)?"
+                   r"(?:[A-Za-z]\s*[/:]\s*)?(\d+)\b", prompt, re.I)
+         or re.search(rf"\b({_AA_WORDS})\s*-?\s*(\d+)\b", prompt, re.I)
+         or re.search(r"\b[A-Za-z]\s*[/:]\s*(\d+)\b", prompt))
+    if not m:
+        return []
+    num = m.group(m.lastindex)
+    wt = esm.parse_amino_acid(m.group(1)) if m.lastindex == 2 else ""
+    mut = _mutation_from_prompt(prompt, num)
+    if not mut and not _MUTATE_WORDS.search(prompt):
+        return []
+    return [(num, mut, wt, chain)]
+
+
+# Theoretical max solvent-accessible surface per residue, Å² (Tien et al. 2013).
+_MAX_ASA = {"A": 129, "R": 274, "N": 195, "D": 193, "C": 167, "Q": 225, "E": 223,
+            "G": 104, "H": 224, "I": 197, "L": 201, "K": 236, "M": 224, "F": 240,
+            "P": 159, "S": 155, "T": 172, "W": 285, "Y": 263, "V": 174}
+_VDW = {"C": 1.7, "N": 1.55, "O": 1.52, "S": 1.8}
+
+
+def _residue_rsa(path: str, chain: str, resseq: int, icode: str = "", cover: str = "all"):
+    """
+    Relative solvent accessibility (0-1) of one residue, or None.
+
+    Shrake-Rupley with a 1.4 Å probe over the first model's heavy atoms.
+    cover picks what may bury the residue: "all" (every chain and bound
+    ligand), "protein" (every chain, no ligands) or "chain" (its own chain
+    only) — comparing them tells core burial from an interface or a
+    ligand site. Water never counts. Stdlib only, and only atoms near the
+    residue are tested, so it is fast.
+    """
+    atoms, mine, one = [], [], ""
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if line.startswith("ENDMDL"):
+                break
+            if not line.startswith(("ATOM  ", "HETATM")) or line[16] not in " A":
+                continue
+            if line[17:20].strip() in ("HOH", "WAT", "DOD"):
+                continue
+            if cover != "all" and line.startswith("HETATM"):
+                continue
+            if cover == "chain" and (line[21].strip() or "_") != chain:
+                continue
+            el = (line[76:78].strip() or line[12:16].strip()[:1]).upper()
+            if el in ("H", "D"):
+                continue
+            try:
+                xyz = tuple(float(line[c:c + 8]) for c in (30, 38, 46))
+                key = (line[21].strip() or "_", int(line[22:26]), line[26].strip())
+            except ValueError:
+                continue
+            atom = (xyz, _VDW.get(el, 1.8) + 1.4)
+            atoms.append(atom)
+            if key == (chain, resseq, icode) and line.startswith("ATOM  "):
+                mine.append(atom)
+                one = squ.one_letter(line[17:20].strip())
+    if not mine or one not in _MAX_ASA:
+        return None
+    n = 100
+    dots = [(math.cos(2.39996 * i) * math.sqrt(1 - z * z),
+             math.sin(2.39996 * i) * math.sqrt(1 - z * z), z)
+            for i, z in ((i, 1 - (2 * i + 1) / n) for i in range(n))]
+    centre = tuple(sum(a[0][k] for a in mine) / len(mine) for k in range(3))
+    near = [a for a in atoms if math.dist(a[0], centre) < 16.0]
+    area = 0.0
+    for (c, r) in mine:
+        others = [a for a in near if a[0] != c and math.dist(a[0], c) < r + a[1]]
+        free = sum(1 for d in dots
+                   if not any(math.dist((c[0] + r * d[0], c[1] + r * d[1], c[2] + r * d[2]),
+                                        o[0]) < o[1] for o in others))
+        area += 4 * math.pi * r * r * free / n
+    return min(area / _MAX_ASA[one], 1.0)
+
+
+def _stability_estimate(mutations: list) -> str:
+    """
+    The P11 answer to a well-posed "would this mutation destabilize it":
+    P10's ESM-2 score per mutation, the position's burial, and a reading of
+    the two together — framed throughout as a proxy, never a ΔΔG.
+    """
+    entry = active_structure()
+    if not entry:
+        return "No structure is loaded — load one first, then ask about the mutation again."
+    if not esm.esm_available():
+        return ("A mutation-stability estimate needs the ESM-2 model, which is not "
+                "available here: " + esm.unavailable_reason())
+    parts = ["STABILITY ESTIMATE — a computational proxy, not a measured or computed ΔΔG. "
+             "Method: ESM-2 zero-shot mutation score (sequence statistics) read "
+             "together with how buried the position is in this structure."]
+    for resseq, mut, wt, chain in mutations:
+        report = tool_predict_mutation_effect(resseq, mut, wt, chain)
+        if not report.startswith("MODEL PREDICTION"):
+            # A chain question or an error (wrong wild type, no such residue):
+            # nothing was scored, so there is nothing to frame.
+            return report
+        pos = re.search(r"^Position: .*? chain (\S)[ ,]", report, re.M)
+        use = pos.group(1) if pos else chain
+        llr_m = re.search(r"log-likelihood ratio ([+-]\d+\.\d+)", report)
+        rsa = _residue_rsa(entry["path"], use, int(resseq))
+        buried, exposed = rsa is not None and rsa <= 0.10, rsa is not None and rsa >= 0.30
+        where = ("of unknown burial" if rsa is None else
+                 f"buried ({rsa:.0%} relative solvent accessibility)" if buried else
+                 f"exposed (surface; {rsa:.0%} relative solvent accessibility)" if exposed else
+                 f"partly buried ({rsa:.0%} relative solvent accessibility)")
+        # Buried by what: its own fold, a partner chain, or a bound ligand.
+        # Proximal His92 of hemoglobin is 0% accessible only because the
+        # heme covers it — a cofactor site, not core packing.
+        site = ""
+        if rsa is not None and rsa < 0.30:
+            own = _residue_rsa(entry["path"], use, int(resseq), cover="chain")
+            prot = _residue_rsa(entry["path"], use, int(resseq), cover="protein")
+            if prot - rsa >= 0.10:
+                site = "a bound ligand/cofactor"
+            elif own - prot >= 0.10:
+                site = "another chain (an interface)"
+            if site:
+                where += f"; mostly covered by {site} — {own:.0%} accessible in its own chain alone"
+                buried = False
+        if not llr_m:
+            reading = ("No single substitution named — the ranking above shows which "
+                       "replacements the model expects this position to accept least. "
+                       + ("At a buried position those are the likelier destabilizing ones."
+                          if buried else
+                          "At a surface position the constraint may be functional rather "
+                          "than folding stability." if exposed else
+                          "The score alone cannot separate a stability cost from a "
+                          "functional one."))
+        else:
+            llr = float(llr_m.group(1))
+            if llr >= -3:
+                reading = ("No sequence-level signal of destabilization. That is weak "
+                           "evidence the mutation is near-neutral for stability, not proof.")
+            elif site:
+                reading = (f"Disfavoured substitution at a position covered by {site} — the "
+                           "constraint is likely about that contact (binding or assembly); "
+                           "the mutation may weaken it, which can in turn destabilize the "
+                           "complex, but the score cannot say how much of the effect is "
+                           "folding stability.")
+            elif buried:
+                reading = ("Disfavoured substitution at a buried position — consistent with "
+                           "a destabilizing mutation (core packing is where substitutions "
+                           "most often cost folding stability).")
+            elif exposed:
+                reading = ("Disfavoured substitution, but at a surface position — the "
+                           "constraint may be functional (binding, catalysis, interfaces) "
+                           "rather than folding stability, so a destabilizing effect is "
+                           "less certain.")
+            else:
+                reading = ("Disfavoured substitution at a partly buried position — possibly "
+                           "destabilizing; the score alone cannot separate a stability cost "
+                           "from a functional one.")
+        parts.append(f"{report}\nStructural context: position is {where}, computed from this "
+                     "structure (Shrake-Rupley; other chains and ligands count as cover; "
+                     "cut-offs ≤10% buried, ≥30% exposed are heuristic).\n"
+                     f"Reading for stability: {reading}")
+    if len(mutations) > 1:
+        parts.append("Each mutation was scored on its own; effects of combined mutations "
+                     "are not additive in general and were not estimated.")
+    parts.append("Why this is only a proxy: ESM-2 scores evolutionary fitness, which mixes "
+                 "folding stability with function, and its agreement with measured ΔΔG is "
+                 "moderate in published benchmarks. A quantitative answer needs free-energy "
+                 "calculations (e.g. FEP) or a thermal/chemical denaturation experiment.")
+    return "\n\n".join(parts)
 
 
 def tool_ask_user(question: str, options) -> str:
@@ -3375,7 +3859,7 @@ def tool_find_interactions(target: str = "", types: str = "",
                     atoms["chain"], atoms["resseq"], atoms["icode"]) if c == chain}
                 scope_label = f"chain {chain}"
             else:
-                return err
+                return err + _pocket_hint(target)
         else:
             restrict = {(atoms["chain"][i], atoms["resseq"][i], atoms["icode"][i])
                         for i in side["indices"]}
@@ -3464,6 +3948,11 @@ def tool_highlight(target: str, style: str = "ball+stick",
                     sels.append(residue)
         ngl = " or ".join(sels)
         labels = [f"{len(sels)} residues from the last interaction scan"]
+    elif _pocket_target(spec) != (None, None):
+        pocket_keys, label = _pocket_target(spec)
+        if pocket_keys is None:
+            return label
+        ngl, labels = keys_to_ngl(pocket_keys), [label]
     else:
         for piece in [p for p in spec.split(",") if p.strip()]:
             piece = piece.strip()
@@ -3610,7 +4099,7 @@ def tool_find_contacts(target: str, radius: float = 4.0,
         return "No structure is loaded — fetch one first."
     side, err = _pick(target, entry, cross=False)
     if err:
-        return err
+        return err + _pocket_hint(target)
 
     try:
         radius = float(radius)
@@ -4659,7 +5148,9 @@ TOOLS = [
                 "biological role, not structure composition (use describe_structure for "
                 "ligands/chains/residues) and not structure availability (use "
                 "find_protein for what depositions exist). Report exactly what UniProt "
-                "says; never invent a function from the protein's name alone."
+                "says; never invent a function from the protein's name alone. For an "
+                "uncharacterized entry it adds family/domain/GO evidence under an "
+                "INFERRED FUNCTION (LOW CONFIDENCE) heading — report that as a guess."
             ),
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Protein name or accession; empty reuses the last lookup"}
@@ -4960,8 +5451,9 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {
                 "target": {"type": "string",
                            "description": ("What to highlight: '57', 'A/57', 'BEN', a "
-                                           "list '57, 102, 195', a range '57-102', or "
-                                           "'interactions' for the last scan's residues")},
+                                           "list '57, 102, 195', a range '57-102', "
+                                           "'interactions' for the last scan's residues, "
+                                           "or 'pocket 3' for a pocket find_pockets found")},
                 "style": {"type": "string", "enum": NGL_REP_TYPES,
                           "description": "ball+stick for residues, surface for a region"},
                 "color": {"type": "string", "description": "Colour name or scheme"}
@@ -5105,6 +5597,28 @@ TOOLS = [
                 "where": {"type": "string", "enum": ["auto", "local", "online"],
                           "description": ("'online' ONLY when the user said to search "
                                           "online / upload; otherwise omit")}
+            }}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "find_pockets",
+            "description": (
+                "Find candidate ligand-binding pockets from the structure's own geometry "
+                "(fpocket) — 'find the binding pocket', 'find the hidden pocket', 'where "
+                "could a drug bind', 'is there a druggable site', 'find cavities'. Works "
+                "with NO ligand bound: use this, not find_contacts, when the user asks "
+                "where a pocket or binding site is without naming a ligand that is in "
+                "the file. Reports each pocket's lining residues, fpocket score, "
+                "druggability score and whether the file has something bound there. "
+                "Report exactly what it returns; the scores are predictions, not "
+                "binding measurements."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "chain": {"type": "string",
+                          "description": "Only pockets lined by this chain, e.g. 'A'; omit for all"},
+                "max_pockets": {"type": "integer",
+                                "description": "Top pockets to show, default 5"}
             }}
         }
     },
@@ -5579,6 +6093,8 @@ TOOL_DISPATCH = {
     "find_structural_neighbors": lambda a: tool_find_structural_neighbors(
         a.get("chain", ""), a.get("max_hits", 5), a.get("where", "auto")),
     "download_foldseek_database": lambda _: tool_download_foldseek_database(),
+    "find_pockets":      lambda a: tool_find_pockets(a.get("chain", ""),
+                                                     a.get("max_pockets", 5)),
     "superpose_structures": lambda a: tool_superpose(
         a.get("mobile", ""), a.get("reference", ""),
         a.get("method", "auto"),
@@ -5667,7 +6183,11 @@ def _system_prompt() -> str:
         "   do NOT answer these from describe_structure (that reports composition: "
         "   ligands, chains, residues, not biological role) and do NOT invent a function "
         "   from the protein's name or general knowledge. If `protein_function` reports no "
-        "   annotation on file, say so; do not fill the gap with a guess. "
+        "   FUNCTION annotation, say so first; then, only if it lists an INFERRED "
+        "   FUNCTION (LOW CONFIDENCE) section, give that as a low-confidence "
+        "   computational guess from family/domain matches — never as the known "
+        "   function — and add nothing it does not list. GO terms it lists as "
+        "   recorded (experimental codes) are observations; say which is which. "
         "0a4. Fold/topology — 'what fold is this', 'describe the topology of chain A', "
         "   'is this a beta barrel', 'what is the secondary structure' → ONE "
         "   `describe_fold` call. This is fold/topology classification — do NOT answer "
@@ -5691,6 +6211,13 @@ def _system_prompt() -> str:
         "   these from general knowledge. Report its score, band and caveats, and call "
         "   it an ESM-2 model prediction, not a measurement. If no residue number was "
         "   given, ask for one. "
+        "0a5c. Pockets — 'find the (hidden) binding pocket', 'where could a drug bind', "
+        "   'is there a druggable site', 'find cavities' → ONE `find_pockets` call. It "
+        "   finds pockets from the geometry, so it works when no ligand is bound; do not "
+        "   use find_contacts or find_interactions for these unless the user names a "
+        "   ligand that is in the file. Report its pockets, lining residues and "
+        "   druggability as given, as predictions, and never invent a pocket. To show one: "
+        "   `highlight` target 'pocket N'. "
         "0a6. SCENE vs PROTEIN. Two different questions: "
         "   - About the LOADED FILE — 'what chain is loaded', 'which chain is HER2', "
         "     'what chains are in this structure' → answer from the 'chains' list in the "
@@ -5861,6 +6388,9 @@ TOOL_GROUPS = {
                  r"pi-?stack|hydrophobic|binding site|active site|pocket",
                  {"find_interactions", "highlight", "find_contacts",
                   "detect_salt_bridges", "detect_hydrogen_bonds", "detect_contacts"}),
+    "pocket":   (r"pocket|cavit|cleft|groove|druggab|binding site|where .*\bbind|"
+                 r"fpocket",
+                 {"find_pockets", "highlight"}),
     "describe": (r"describe|what is in|what.s in|composition|ligand|cofactor|"
                  r"residue|chain|how many|non-?standard|sequence|resolution|summar|"
                  r"b-?factor",
@@ -6163,16 +6693,26 @@ def _clean_reply(text: str) -> str:
 
 
 def _tc_args(tc: dict) -> dict:
-    """Safely extract tool-call arguments as a dict regardless of whether they're a str or dict."""
+    """
+    Safely extract tool-call arguments as a dict regardless of whether they're a str or dict.
+
+    Null values are dropped: qwen2.5:7b sends "chain": null for "which salt
+    bridges stabilize this protein", and a.get("chain", "") then passes None
+    through, so detect_salt_bridges searched a chain literally named "None"
+    and reported hemoglobin as having no salt bridges.
+    """
     raw = tc.get("function", {}).get("arguments", {})
-    if isinstance(raw, dict):
-        return raw
     if isinstance(raw, str):
         try:
-            return json.loads(raw)
+            raw = json.loads(raw)
         except Exception:
             return {}
-    return {}
+    if not isinstance(raw, dict):
+        return {}
+    # In place, so the tool_calls echoed back into the history match what ran.
+    for k in [k for k, v in raw.items() if v is None]:
+        del raw[k]
+    return raw
 
 
 # ============================================================
@@ -6562,11 +7102,26 @@ def run_agent(user_prompt: str, status=None) -> str:
         w in prompt_lower for w in
         ("correctly", "properly", "will", "process", "pathway")
     )
-    if folding_is_dynamics or any(x in prompt_lower for x in (
+    # P11 split (todo.txt): a stability question that names a mutation
+    # ("would mutating residue 45 to alanine destabilize this", "is H92A
+    # destabilizing") has something to compute against, so it gets P10's
+    # ESM-2 score framed as a stability proxy — answered here, without the
+    # model, since qwen2.5:7b already turned that score into "a significant
+    # decrease in stability" once. Nothing named → the refusal, unchanged.
+    # "(de)stabilize" joins only the mutation route: it contains no "stable",
+    # and refusing on it would catch "which salt bridges stabilize the dimer".
+    stability_asked = folding_is_dynamics or any(x in prompt_lower for x in (
         "stable",
         "stability",
         "thermostable",
-    )):
+    ))
+    if stability_asked or re.search(r"stabili[sz]", prompt_lower):
+        mutations = _stability_mutations(user_prompt)
+        if mutations:
+            _log(f"🧪 Stability question names mutation(s) {mutations} — ESM-2 proxy estimate")
+            _progress(status, "Estimating the mutation's effect with ESM-2…")
+            return _stability_estimate(mutations)
+    if stability_asked:
         return (
             "Protein stability cannot be determined from a single static "
             "PDB structure alone. Determining stability generally requires "
@@ -6574,7 +7129,9 @@ def run_agent(user_prompt: str, status=None) -> str:
             "or experimental measurements. "
             "I can instead analyze structural contacts, salt bridges, "
             "hydrogen bonds, B-factors, or prepare the structure for "
-            "simulation."
+            "simulation. For a specific mutation (e.g. \"would mutating "
+            "residue 45 to alanine destabilize it\") I can give a "
+            "sequence-based ESM-2 estimate — a proxy, not a ΔΔG."
         )
 
     # The system message is built once and never touched again — see
@@ -6725,9 +7282,35 @@ def run_agent(user_prompt: str, status=None) -> str:
                 reply += ("\n\n_ESM-2 model prediction from sequence statistics "
                           "(zero-shot masked-marginal score) — not an experimental "
                           "measurement and not a stability (ΔΔG) estimate._")
+            # P13: same paraphrase risk for a function inferred from family
+            # and domain matches — it must never read as the known function.
+            pf = [str(m.get("content", "")) for m in messages
+                  if "[protein_function]:" in str(m.get("content", ""))]
+            if any("INFERRED FUNCTION (LOW CONFIDENCE" in c for c in pf):
+                reply += ("\n\n_UniProt has no curated function for this protein. Any role "
+                          "above marked as inferred comes from sequence-family, domain and "
+                          "electronic GO matches — a low-confidence computational guess, not "
+                          "an established function._")
+            elif any("AUTOMATIC annotation" in c for c in pf):
+                reply += ("\n\n_This function text is UniProt's automatic (rule-based) "
+                          "annotation for an unreviewed entry, not curator-reviewed._")
             question = st.session_state.pop("foldseek_question", None)
             if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
                 reply = f"{reply}\n\n{question}"
+            # P12: qwen2.5:7b paraphrased find_pockets' report into wrong
+            # counts ("four druggable", listing three), wrong chains and
+            # "occupied by hemoglobin subunits" for heme. A pocket-only
+            # request gets the report itself; anything more keeps the
+            # model's reply with the report's SUMMARY line attached verbatim.
+            pocket_reports = [p[len("find_pockets: "):] for p in summary_parts
+                              if p.startswith("find_pockets: Candidate binding pockets")]
+            if pocket_reports:
+                if all(p.startswith("find_pockets: ") for p in summary_parts):
+                    return pocket_reports[-1]
+                summary = next((l for l in pocket_reports[-1].splitlines()
+                                if l.startswith("SUMMARY:")), "")
+                if summary:
+                    reply += f"\n\n_fpocket: {summary[len('SUMMARY:'):].strip()}_"
             return reply
 
         tool_results = []
@@ -6791,6 +7374,14 @@ def run_agent(user_prompt: str, status=None) -> str:
             # residue='44' / 'H92', no mutant), which silently turns a single-
             # mutation question into an all-19 scan; and it filled in chain
             # letters nobody said. Take both from the user's own words.
+            # find_pockets: qwen2.5:7b sent chain='A' for "find the hidden
+            # binding pocket" on single- and multi-chain structures alike,
+            # which would silently drop every pocket not lined by chain A.
+            if name == "find_pockets":
+                ch = str(args.get("chain") or "").strip().upper()
+                if ch and ch not in user_chains:
+                    args.pop("chain")
+                    _log(f"🧭 Dropped chain '{ch}' the user never named")
             if name == "predict_mutation_effect":
                 if not str(args.get("mutant") or "").strip():
                     mut = _mutation_from_prompt(user_prompt, str(args.get("residue", "")))

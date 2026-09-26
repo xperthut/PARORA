@@ -142,6 +142,27 @@ else
     echo "search.foldseek.com, which uploads the structure, or download the database.)"
 fi
 
+# ── 3.7. fpocket discovery (optional: find_pockets) ────────────────────────────
+# Single binary, same PATH/conda-env-name scan as DSSP.
+if [ -z "${FPOCKET_BIN:-}" ]; then
+    if command -v fpocket >/dev/null 2>&1; then
+        export FPOCKET_BIN="$(command -v fpocket)"
+    else
+        FP_ENV_PATH=$(conda env list | awk '$1 ~ /fpocket/ {print $NF; exit}')
+        if [ -n "$FP_ENV_PATH" ] && [ -x "$FP_ENV_PATH/bin/fpocket" ]; then
+            export FPOCKET_BIN="$FP_ENV_PATH/bin/fpocket"
+        fi
+    fi
+fi
+if [ -n "${FPOCKET_BIN:-}" ]; then
+    echo "fpocket found -- FPOCKET_BIN=$FPOCKET_BIN"
+else
+    echo "fpocket not found -- find_pockets (binding-pocket detection) will report"
+    echo "unavailable rather than fail. Set up with:"
+    echo "  conda create -n fpocket -c conda-forge fpocket"
+    echo "or run 'bash setup_tools.sh'."
+fi
+
 # ── 4. PyMOL discovery (optional: render_image) ────────────────────────────────
 PYMOL_ENV_PATH=$(conda env list | awk '$1 ~ /pymol/ {print $NF; exit}')
 PYMOL_FOUND=false

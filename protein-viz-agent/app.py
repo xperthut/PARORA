@@ -31,6 +31,7 @@ import base64
 import os
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -90,6 +91,10 @@ import topology as topo
 # Structure-based fold/homology search (Foldseek, optional external binary +
 # reference database) — the fallback when CATH/SCOP has nothing to key on.
 import structure_search as fsk
+
+# Zero-shot mutation-effect scoring with ESM-2 (optional: torch lives in a
+# separate interpreter, driven as a subprocess — same pattern as PyMOL).
+import esm_tools as esm
 
 # Geometric measurement — distances, angles, contact shells. Reads coordinates
 # from the PDB records directly, so it works without MDAnalysis.
@@ -2209,6 +2214,201 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
     if where not in ("auto", "local", "online"):
         where = "auto"
     lines.extend(_structural_neighbor_lines(entry, chains, max_hits, where))
+    return "\n".join(lines)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_esm_position(path: str, mtime: float, chain: str, index: int, model: str):
+    """ESM-2 masked-marginal log-probs at one position; mtime/model bust the cache."""
+    tokens, _, _ = esm.chain_sequence(path, chain)
+    return esm.position_log_probs(tokens, index)
+
+
+_MUTATION_TOKEN = re.compile(r"^\s*([A-Za-z])(\d+)([A-Za-z])\s*$")
+_AA_WORDS = "|".join(sorted(set(esm.AA_NAMES) | {k.lower() for k in esm.ONE_TO_3.values()},
+                            key=len, reverse=True))
+
+
+def _mutation_from_prompt(prompt: str, residue: str) -> str:
+    """
+    The substituted amino acid the user named for this residue, or "".
+
+    Reads "H92A" / "his92ala" style tokens for the same residue number, then
+    "to alanine" / "to Ala" / "to A" (a bare letter only when capitalised, so
+    the article "to a" never counts).
+    """
+    num = re.search(r"\d+", residue or "")
+    for wt, n, mt in re.findall(r"\b([A-Za-z]{1,3})(\d+)([A-Za-z]{1,3})\b", prompt):
+        if (not num or n == num.group()) and esm.parse_amino_acid(wt) and esm.parse_amino_acid(mt):
+            return esm.parse_amino_acid(mt)
+    m = (re.search(rf"\b(?:to|into|with|by|for)\s+(?:an?\s+)?({_AA_WORDS})\b", prompt, re.I)
+         or re.search(r"\b(?:to|into|with|by|for)\s+([A-Z])\b", prompt))
+    return esm.parse_amino_acid(m.group(1)) if m else ""
+
+
+def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str = "",
+                                 chain: str = "") -> str:
+    """
+    Predict how tolerated a single amino-acid substitution is — a MODEL
+    PREDICTION from ESM-2 sequence statistics, never a measurement.
+
+    Method: zero-shot masked-marginal log-likelihood ratio (Meier et al.
+    2021). The loaded chain's observed sequence is fed to ESM-2 with the
+    position masked; the score is log p(mutant) - log p(wild type) there.
+    With no mutant, all 19 substitutions are ranked — the "which residues
+    are tolerated here / how constrained is this position" question.
+
+    Args:
+        residue : The position, e.g. "45", "A/45", "HIS92", "B:92", or a whole
+                  mutation "H92A" (then mutant/wildtype come from it).
+        mutant  : Substituted amino acid ("A", "Ala", "alanine"); empty ranks all 19.
+        wildtype: The residue the user says is there; checked against the
+                  structure, never silently overridden.
+        chain   : Chain id; needed only when several chains carry the position.
+
+    Returns:
+        A plain-text, caveated report, a NEEDS USER CHOICE question when the
+        chain is ambiguous, or why the prediction could not run.
+    """
+    entry = active_structure()
+    if not entry:
+        return "No structure is loaded — fetch one first."
+    if not esm.esm_available():
+        return esm.unavailable_reason()
+
+    m = _MUTATION_TOKEN.match(residue or "")
+    if m:
+        wildtype = wildtype or m.group(1)
+        mutant = mutant or m.group(3)
+        residue = m.group(2)
+    spec = mz.parse_spec(residue or "")
+    if spec["resseq"] is None:
+        return (f"Could not read a residue number from '{residue}'. Give the position, "
+                "e.g. '45' or 'A/45'.")
+    resseq, icode = spec["resseq"], spec["icode"] or ""
+
+    mut = esm.parse_amino_acid(mutant) if (mutant or "").strip() else ""
+    if (mutant or "").strip() and not mut:
+        return f"'{mutant}' is not one of the 20 standard amino acids."
+    wt_claim = esm.parse_amino_acid(wildtype) if (wildtype or "").strip() else ""
+    if not wt_claim and spec["resname"]:
+        wt_claim = esm.parse_amino_acid(spec["resname"])
+
+    path = entry["path"]
+    mtime = Path(path).stat().st_mtime
+    residues = squ.parse_structure_residues(path)
+    wanted = (chain or spec["chain"] or "").strip().upper().replace("CHAIN", "").strip()
+    holders = {ch: r for ch, rs in residues.items() for r in rs
+               if r["kind"] == "protein" and r["resseq"] == resseq and r["icode"] == icode}
+    if wanted:
+        if wanted not in residues:
+            return (f"Chain {wanted} is not in {entry['pdb_id']}. "
+                    f"Chains present: {', '.join(residues)}")
+        if wanted not in holders:
+            return (f"Residue {resseq}{icode} is not an observed amino acid in "
+                    f"{entry['pdb_id']} chain {wanted}.")
+        use = wanted
+    elif not holders:
+        return f"No chain of {entry['pdb_id']} has an observed amino acid numbered {resseq}{icode}."
+    else:
+        # "H92A" in hemoglobin: only chain B has a His at 92, so no question.
+        if wt_claim and any(r["one"] == wt_claim for r in holders.values()):
+            holders = {ch: r for ch, r in holders.items() if r["one"] == wt_claim}
+        # Identical chains (hemoglobin A/C) score the same; distinct ones may not.
+        seqs = {}
+        for ch in holders:
+            key = "".join(r["one"] for r in residues[ch] if r["kind"] == "protein")
+            seqs.setdefault(key, []).append(ch)
+        if len(seqs) > 1:
+            names = {c["chain"]: c["molecule"] for c in chain_molecules(entry)}
+            opts = [{"label": f"Chain {chs[0]}"
+                              + (f" ({names[chs[0]]})" if names.get(chs[0]) else "")
+                              + f" — residue {holders[chs[0]]['resname']} {resseq}",
+                     "meaning": f"predict the mutation effect at residue {resseq} of chain {chs[0]}"}
+                    for chs in seqs.values()]
+            return ask_clarification(
+                f"Residue {resseq} exists in several different chains of "
+                f"{entry['pdb_id']}. Which chain do you mean?", opts)
+        use = sorted(holders)[0]
+    target = holders[use]
+    wt = target["one"]
+    if wt not in esm.AMINO_ACIDS:
+        return (f"Residue {target['resname']} {resseq} in chain {use} is non-standard; "
+                "ESM-2 scores only the 20 standard amino acids.")
+    if wt_claim and wt_claim != wt:
+        return (f"Residue {resseq} of {entry['pdb_id']} chain {use} is "
+                f"{target['resname']} ({wt}), not {wt_claim}. Check the position or "
+                "numbering — nothing was predicted.")
+    if mut == wt:
+        return f"{wt}{resseq}{mut} is not a substitution — the residue is already {wt}."
+
+    tokens, index_of, notes = esm.chain_sequence(path, use)
+    idx = index_of[(resseq, icode)]
+    with st.spinner("Scoring with ESM-2…"):
+        res = _cached_esm_position(path, mtime, use, idx, esm.model_name())
+    if not res.get("ok"):
+        return f"ESM-2 prediction failed: {res.get('error', 'unknown error')}"
+    lp = res["log_probs"]
+    ranked = sorted(lp, key=lp.get, reverse=True)
+    p_wt, wt_rank = math.exp(lp[wt]), ranked.index(wt) + 1
+
+    names = {c["chain"]: c["molecule"] for c in chain_molecules(entry)}
+    who = f" ({names[use]})" if names.get(use) else ""
+    model = esm.model_name().split("/")[-1]
+    lines = [
+        "MODEL PREDICTION — ESM-2 zero-shot masked-marginal log-likelihood ratio "
+        f"({model}), from sequence statistics only. Not a measurement, not a "
+        "ΔΔG, and not computed from this structure's 3D coordinates.",
+        f"Position: {entry['pdb_id']} chain {use}{who}, {target['resname']} {resseq}{icode}",
+    ]
+    if mut:
+        llr = lp[mut] - lp[wt]
+        lines.append(f"{wt}{resseq}{mut}: log-likelihood ratio {llr:+.2f} → {esm.band(llr)}")
+    # Stated in words: qwen2.5:7b called a native probability of 0.20 "high".
+    expect = ("strongly expected — a tightly constrained position" if p_wt >= 0.5 else
+              "moderately expected" if p_wt >= 0.2 else
+              "only weakly expected — the position is permissive or the model is unsure")
+    lines.append(f"Native {wt}: model probability {p_wt:.2f}, rank {wt_rank} of 20 at this "
+                 f"masked position — {expect}.")
+    top = ", ".join(f"{a} {math.exp(lp[a]):.2f}" for a in ranked[:5])
+    lines.append(f"Most compatible residues here: {top}")
+    if not mut:
+        # Grouped by band, each group self-contained: a flat list of 19 scores
+        # followed by a separate band legend was misread by qwen2.5:7b.
+        groups = {}
+        for a in ranked:
+            if a != wt:
+                groups.setdefault(esm.band(lp[a] - lp[wt]), []).append(
+                    f"{wt}{resseq}{a} ({esm.ONE_TO_3[a].title()}, {lp[a] - lp[wt]:+.1f})")
+        lines.append("All 19 substitutions, by predicted effect "
+                     "(log-likelihood ratio vs native in brackets):")
+        for _, text in esm.BANDS:
+            lines.append(f"  {text}: " + (", ".join(groups.get(text, [])) or "none"))
+        lines.append("This is the model's sequence constraint at the position, not an "
+                     "alignment-based conservation score.")
+
+    caveats = ["the score bands are heuristic cut-offs, not calibrated probabilities",
+               "ESM-2 scores how well a residue fits the evolutionary sequence pattern; it "
+               "cannot see binding partners, ligands, or gain-of-function effects, so a "
+               "mild score does not mean clinically or functionally harmless"]
+    if wt_rank > 3 or p_wt < 0.10:
+        caveats.insert(0, "LOW CONFIDENCE: the model does not strongly expect the native "
+                          "residue here, so this position's scores are weak evidence")
+    observed = [i for i, t in enumerate(tokens) if t is not None]
+    if idx - observed[0] < 3 or observed[-1] - idx < 3:
+        caveats.append("residue is within 3 positions of the observed chain end, where "
+                       "ESM predictions are less reliable")
+    if len(observed) < 60:
+        caveats.append(f"short chain ({len(observed)} observed residues) — little sequence "
+                       "context for the model")
+    start, end = res["window"]
+    if end - start < len(tokens):
+        caveats.append(f"chain longer than ESM-2's 1022-residue limit; scored on a "
+                       f"{end - start}-residue window around the position")
+    caveats.append("sequence taken from the residues observed in this file, not the full "
+                   "UniProt sequence")
+    caveats.extend(notes)
+    lines.append("Caveats: " + "; ".join(caveats) + ".")
     return "\n".join(lines)
 
 
@@ -4856,6 +5056,35 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "predict_mutation_effect",
+            "description": (
+                "Predict the likely effect of a single amino-acid substitution — 'what "
+                "would mutating residue 45 to alanine do', 'is H92A tolerated', 'is this "
+                "substitution damaging', 'which residues are tolerated at position 30', "
+                "'how constrained / how conserved is residue 12'. ESM-2 protein language "
+                "model, zero-shot "
+                "masked-marginal log-likelihood ratio on the loaded chain's sequence. "
+                "Needs a residue number the user gave. Omit mutant to rank all 19 "
+                "substitutions. The result is a MODEL PREDICTION: report its score, "
+                "band and caveats as given, and never present it as measured or as a "
+                "stability (ΔΔG) value."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "residue":  {"type": "string",
+                             "description": "Position as the user gave it, e.g. '45', 'A/45', "
+                                            "'HIS92', or a mutation like 'H92A'"},
+                "mutant":   {"type": "string",
+                             "description": "Substituted amino acid, e.g. 'A' or 'alanine'; "
+                                            "omit to rank all substitutions"},
+                "wildtype": {"type": "string",
+                             "description": "Native residue if the user named it, e.g. 'H'"},
+                "chain":    {"type": "string",
+                             "description": "Chain id if the user named one, e.g. 'B'"},
+            }, "required": ["residue"]}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "find_structural_neighbors",
             "description": (
                 "Find known structures this one resembles in 3D — 'what is this similar "
@@ -5344,6 +5573,9 @@ TOOL_DISPATCH = {
     "describe_structure": lambda a: tool_describe_structure(a.get("target", ""),
                                                             a.get("detail", "brief")),
     "describe_fold":     lambda a: tool_describe_fold(a.get("chain", "")),
+    "predict_mutation_effect": lambda a: tool_predict_mutation_effect(
+        str(a.get("residue", "")), a.get("mutant", ""), a.get("wildtype", ""),
+        a.get("chain", "")),
     "find_structural_neighbors": lambda a: tool_find_structural_neighbors(
         a.get("chain", ""), a.get("max_hits", 5), a.get("where", "auto")),
     "download_foldseek_database": lambda _: tool_download_foldseek_database(),
@@ -5452,6 +5684,13 @@ def _system_prompt() -> str:
         "   to the user and stop — do not choose. When the user then says to search "
         "   online → `find_structural_neighbors` with where='online'; when they say to "
         "   download the database → `download_foldseek_database`. "
+        "0a5b. Single mutations — 'what would mutating residue 45 to alanine do', 'is "
+        "   H92A tolerated', 'which substitutions are tolerated at 30', 'how conserved "
+        "   is residue 63' → ONE "
+        "   `predict_mutation_effect` call with the residue the user gave. Never answer "
+        "   these from general knowledge. Report its score, band and caveats, and call "
+        "   it an ESM-2 model prediction, not a measurement. If no residue number was "
+        "   given, ask for one. "
         "0a6. SCENE vs PROTEIN. Two different questions: "
         "   - About the LOADED FILE — 'what chain is loaded', 'which chain is HER2', "
         "     'what chains are in this structure' → answer from the 'chains' list in the "
@@ -5642,6 +5881,11 @@ TOOL_GROUPS = {
                  r"similar to|resembl|look(s)? like",
                  {"describe_fold", "find_structural_neighbors",
                   "download_foldseek_database"}),
+    "mutation": (r"mutat|substitut|variant|\bmutant|tolerat|deleterious|damaging|"
+                 r"pathogenic|conserv|constrain|\b[a-z]\d+[a-z]\b|"
+                 r"\bto (ala|gly|val|leu|ile|pro|phe|trp|met|ser|thr|cys|tyr|asn|gln|"
+                 r"asp|glu|lys|arg|his)",
+                 {"predict_mutation_effect"}),
     "superpose": (r"superpose|superimpose|align|overlay|compare|rmsd|fit\b",
                   {"superpose_structures", "clear_superposition", "list_structures",
                    "add_structure", "fetch_structure"}),
@@ -5832,7 +6076,8 @@ _TOOL_FAILED = re.compile(
 
 # Arguments that are free text or styling, never residue numbers.
 NUMBER_GATE_FREE_ARGS = {"color", "text", "name", "style", "rep_type", "filename",
-                         "quality", "operator", "profile", "types", "where"}
+                         "quality", "operator", "profile", "types", "where",
+                         "mutant", "wildtype"}
 
 
 _VIEWER_VERBS = re.compile(r"\b(colou?r|show|hide|select|highlight|label|zoom|remove|delete|"
@@ -6472,6 +6717,14 @@ def run_agent(user_prompt: str, status=None) -> str:
                 _log(f"⚠️ Unverified facts left in reply: {unsupported}", logging.WARNING)
                 reply += ("\n\n_Not verified against any tool result: "
                           + ", ".join(unsupported) + " — treat with caution._")
+            # P10: the 7B model paraphrases the ESM result without its caveats
+            # and has called it "a significant decrease in stability" — so the
+            # standard caveat rides on every reply that used the prediction.
+            if any(r"[predict_mutation_effect]: MODEL PREDICTION" in str(m.get("content", ""))
+                   for m in messages):
+                reply += ("\n\n_ESM-2 model prediction from sequence statistics "
+                          "(zero-shot masked-marginal score) — not an experimental "
+                          "measurement and not a stability (ΔΔG) estimate._")
             question = st.session_state.pop("foldseek_question", None)
             if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
                 reply = f"{reply}\n\n{question}"
@@ -6532,6 +6785,24 @@ def run_agent(user_prompt: str, status=None) -> str:
                     args.pop(k, None)
                 if unasked:
                     _log(f"🧭 Dropped unrequested protein_structures filters: {unasked}")
+
+            # predict_mutation_effect: qwen2.5:7b dropped the substitution from
+            # "mutating residue 44 to alanine" and "is H92A damaging" (sent
+            # residue='44' / 'H92', no mutant), which silently turns a single-
+            # mutation question into an all-19 scan; and it filled in chain
+            # letters nobody said. Take both from the user's own words.
+            if name == "predict_mutation_effect":
+                if not str(args.get("mutant") or "").strip():
+                    mut = _mutation_from_prompt(user_prompt, str(args.get("residue", "")))
+                    if mut:
+                        args["mutant"] = mut
+                        _log(f"🧭 Injected mutant '{mut}' from the prompt")
+                ch = str(args.get("chain") or "").strip().upper()
+                if ch and ch not in user_chains and not re.search(
+                        rf"\b{re.escape(ch)}\s*[/:]\s*\d|\d\s*[/:]\s*{re.escape(ch)}\b",
+                        user_prompt, re.I):
+                    args.pop("chain")
+                    _log(f"🧭 Dropped chain '{ch}' the user never named")
 
             # The user named one chain; a residue selection that dropped it
             # would act on that residue in every chain ("select residue 58 of

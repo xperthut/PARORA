@@ -106,5 +106,17 @@
   {
     "prompt": "what is the distance between label A and B in this protein chain",
     "grounding": "Named labels refer to selections already made in this session — call list_labels() first to resolve what 'A' and 'B' refer to before measuring a distance between them."
+  },
+  {
+    "prompt": "what would mutating residue 45 to alanine likely do",
+    "grounding": "Call predict_mutation_effect(residue='45', mutant='A') with the residue number and amino acid from this prompt — do not reuse a number from any other example. Report the score, band and caveats it returns as an ESM-2 model prediction; never call it a stability change or a measurement."
+  },
+  {
+    "prompt": "is K48R tolerated",
+    "grounding": "Call predict_mutation_effect(residue='K48R') with the mutation exactly as written in this prompt. Pass a chain only if the user named one. Report its band and caveats as an ESM-2 model prediction."
+  },
+  {
+    "prompt": "how conserved is residue 30, which substitutions are tolerated there",
+    "grounding": "Call predict_mutation_effect(residue='30') with no mutant, using the residue number from this prompt. It ranks all 19 substitutions by predicted effect. Say this is the ESM-2 model's sequence constraint, not an alignment-based conservation score."
   }
 ]

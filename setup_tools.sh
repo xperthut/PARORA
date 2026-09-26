@@ -1,6 +1,7 @@
 #!/bin/bash
 # Check this machine for the OPTIONAL tools app.py's agent can use --
-# AmberTools, PyMOL, DSSP and Foldseek (+ its reference database) -- and
+# AmberTools, PyMOL, DSSP, Foldseek (+ its reference database) and ESM-2
+# (torch env + model checkpoint) -- and
 # offer to install whichever are missing.
 #
 # None of these are required to run the app (run.sh already runs fine
@@ -8,7 +9,7 @@
 # This script exists for someone who wants the fuller feature set and would
 # rather be asked than dig the install commands out of run.sh/requirements.txt
 # themselves. It only ever touches its own named conda envs (ambertools,
-# pymol-render, dssp, foldseek) and protein-viz-agent/foldseek_db/ (or
+# pymol-render, dssp, foldseek, esm), the Hugging Face model cache and protein-viz-agent/foldseek_db/ (or
 # $FOLDSEEK_DB) -- nothing here is required for those names, run.sh's
 # existing discovery logic already looks for exactly these.
 #
@@ -88,6 +89,8 @@ STATUS_PYMOL="not checked"
 STATUS_DSSP="not checked"
 STATUS_FOLDSEEK="not checked"
 STATUS_FOLDSEEK_DB="not checked"
+STATUS_ESM="not checked"
+STATUS_ESM_MODEL="not checked"
 
 # ── 1. AmberTools ────────────────────────────────────────────────────────────
 # Needed by: prepare_structure (hydrogens via reduce), build_membrane,
@@ -292,6 +295,66 @@ else
 fi
 echo
 
+# ── 5. ESM-2 (torch + transformers env, plus the model checkpoint) ───────────
+# Needed by: predict_mutation_effect (zero-shot mutation-effect scoring).
+# torch stays out of the parora env and the Docker image; the worker runs in
+# its own env. Any env whose name mentions esm or torch and can import both
+# counts (esm_tools.py discovers it the same way). The checkpoint is fetched
+# once into the Hugging Face cache; after that the app runs it offline.
+echo "── ESM-2 ────────────────────────────────────────────────────────────────"
+ESM_MODEL_NAME="${ESM_MODEL:-facebook/esm2_t33_650M_UR50D}"
+ESM_FOUND=""
+if [ -n "${ESM_PYTHON:-}" ] && "$ESM_PYTHON" -c "import torch, transformers" >/dev/null 2>&1; then
+    ESM_FOUND="$ESM_PYTHON"
+else
+    while IFS= read -r envpath; do
+        [ -z "$envpath" ] && continue
+        if [ -x "$envpath/bin/python" ] && "$envpath/bin/python" -c "import torch, transformers" >/dev/null 2>&1; then
+            ESM_FOUND="$envpath/bin/python"
+            break
+        fi
+    done < <(conda env list | awk '$1 ~ /esm|torch/ {print $NF}')
+fi
+if [ -n "$ESM_FOUND" ]; then
+    echo "Found -- $ESM_FOUND (torch + transformers import)"
+    STATUS_ESM="found ($ESM_FOUND)"
+else
+    echo "Not found. Used by: predict_mutation_effect (ESM-2 mutation-effect scoring)."
+    if confirm "Create an 'esm' env with PyTorch + transformers now? Large download (~1-2 GB)."; then
+        if conda create -n esm -c conda-forge python=3.11 pytorch transformers -y; then
+            ESM_FOUND="$(conda env list | awk '$1=="esm" {print $NF; exit}')/bin/python"
+            STATUS_ESM="installed"
+            echo "ESM env installed."
+        else
+            STATUS_ESM="install failed"
+            echo "ESM env install failed -- see the conda output above."
+        fi
+    else
+        STATUS_ESM="skipped"
+        echo "Skipped."
+    fi
+fi
+if [ -n "$ESM_FOUND" ]; then
+    ESM_CACHED_PROBE="from huggingface_hub import try_to_load_from_cache as t; import sys
+sys.exit(0 if all(isinstance(t('$ESM_MODEL_NAME', f), str) for f in ('config.json','model.safetensors')) else 1)"
+    if "$ESM_FOUND" -c "$ESM_CACHED_PROBE" >/dev/null 2>&1; then
+        echo "Model $ESM_MODEL_NAME already downloaded."
+        STATUS_ESM_MODEL="found"
+    elif confirm "Download $ESM_MODEL_NAME from Hugging Face now (~2.6 GB, once)?"; then
+        if "$ESM_FOUND" -c "from huggingface_hub import snapshot_download
+snapshot_download('$ESM_MODEL_NAME', allow_patterns=['*.json', '*.txt', 'model.safetensors'])"; then
+            STATUS_ESM_MODEL="downloaded"
+        else
+            STATUS_ESM_MODEL="download failed"
+        fi
+    else
+        STATUS_ESM_MODEL="skipped"
+    fi
+else
+    STATUS_ESM_MODEL="not checked (no env)"
+fi
+echo
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo "── Summary ──────────────────────────────────────────────────────────────"
 printf "  %-12s %s\n" "AmberTools" "$STATUS_AMBERTOOLS"
@@ -299,6 +362,8 @@ printf "  %-12s %s\n" "PyMOL" "$STATUS_PYMOL"
 printf "  %-12s %s\n" "DSSP" "$STATUS_DSSP"
 printf "  %-12s %s\n" "Foldseek" "$STATUS_FOLDSEEK"
 printf "  %-12s %s\n" "Foldseek DB" "$STATUS_FOLDSEEK_DB"
+printf "  %-12s %s\n" "ESM-2 env" "$STATUS_ESM"
+printf "  %-12s %s\n" "ESM-2 model" "$STATUS_ESM_MODEL"
 echo
 echo "Nothing further to do -- run.sh's own discovery already looks for these"
 echo "exact conda env names (ambertools, a *pymol* name, dssp, foldseek) every time it"

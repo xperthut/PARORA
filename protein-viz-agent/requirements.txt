@@ -63,3 +63,12 @@ rdkit
 #     conda create -n foldseek -c conda-forge -c bioconda foldseek
 #     foldseek databases PDB protein-viz-agent/foldseek_db/pdb /tmp/fs
 # The PDB database is ~2.2 GB to download, ~4.2 GB on disk.
+
+# Zero-shot mutation-effect scoring (esm_tools.py / esm_worker.py,
+# predict_mutation_effect). NOT a pip dependency -- torch + transformers live
+# in their own conda env (kept out of this env and the Docker image), found
+# via ESM_PYTHON or an env whose name mentions esm/torch. The ESM-2 checkpoint
+# (ESM_MODEL, default facebook/esm2_t33_650M_UR50D, ~2.6 GB) is downloaded
+# once into the Hugging Face cache, then run offline. Set up with:
+#     conda create -n esm -c conda-forge python=3.11 pytorch transformers
+#     bash setup_tools.sh   # offers the model download

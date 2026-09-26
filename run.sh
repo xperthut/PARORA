@@ -161,6 +161,25 @@ if ! $PYMOL_FOUND; then
     echo "or run 'bash setup_tools.sh' to be walked through installing this (and AmberTools/DSSP) interactively."
 fi
 
+# ── 4.5. ESM-2 discovery (optional: predict_mutation_effect) ─────────────────
+# esm_tools.py discovers this itself on first use; exporting it here just
+# saves that probe and tells the user up front.
+if [ -z "${ESM_PYTHON:-}" ]; then
+    while IFS= read -r envpath; do
+        [ -z "$envpath" ] && continue
+        if [ -x "$envpath/bin/python" ] && "$envpath/bin/python" -c "import torch, transformers" >/dev/null 2>&1; then
+            export ESM_PYTHON="$envpath/bin/python"
+            break
+        fi
+    done < <(conda env list | awk '$1 ~ /esm|torch/ {print $NF}')
+fi
+if [ -n "${ESM_PYTHON:-}" ]; then
+    echo "ESM-2 env found -- ESM_PYTHON=$ESM_PYTHON (model is checked on first use)"
+else
+    echo "ESM-2 not found -- predict_mutation_effect will report unavailable rather than fail."
+    echo "Run 'bash setup_tools.sh' to create the env and download the model."
+fi
+
 # ── 5. Run the full agent ──────────────────────────────────────────────────────
 cd protein-viz-agent
 mkdir -p structures membranes prepared logs

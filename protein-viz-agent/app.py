@@ -36,6 +36,7 @@ import re
 import time
 import uuid
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from ollama import Client
 from analysis_tools import (
@@ -1123,6 +1124,7 @@ def tool_protein_function(name: str = "") -> str:
         lines.append("UniProt has no FUNCTION annotation for this entry — this protein "
                      "may be uncharacterized or under-studied.")
         lines.extend(_function_fallback(prof["accession"]))
+        lines.extend(_structure_function_lines(prof["accession"]))
     return "\n".join(lines)
 
 
@@ -1975,6 +1977,12 @@ def _cached_classification(pdb_id: str, schema: int):
     return topo.lookup_classification(pdb_id)
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def _cached_observed_segments(pdb_id: str, schema: int):
+    """Cache a PDB entry's observed-residue segments (PDBe polymer_coverage)."""
+    return topo.observed_segments(pdb_id)
+
+
 @st.cache_data(show_spinner=False)
 def _cached_dssp(path: str, mtime: float, schema: int):
     """Run and cache DSSP on a structure; mtime and schema bust the cache."""
@@ -1991,7 +1999,8 @@ def _cached_foldseek(path: str, mtime: float, chains: tuple, max_hits: int,
     if db == "online":
         return fsk.search_online(path, list(chains), max_hits=max_hits,
                                  exclude_pdb_id=exclude)
-    return fsk.search(path, list(chains), max_hits=max_hits, exclude_pdb_id=exclude)
+    return fsk.search(path, list(chains), max_hits=max_hits, exclude_pdb_id=exclude,
+                      db=db)
 
 
 def _foldseek_choice(entry: dict) -> str:
@@ -2059,8 +2068,268 @@ def _fold_key(c: dict):
     return ("SCOP fold", c["fold"])
 
 
+# Hits kept per chain for the fold consensus, however many are displayed
+# (Foldseek itself stops near 1000): the top hits of a well-studied protein
+# are mostly its own other depositions (6VXX spike: 552 of 586 hits are
+# >= 80% identical spike entries), which would otherwise crowd out
+# classified homologs further down.
+FOLD_POOL = 1000
+# Most hits of each kind (distant / near-identical) whose classification is
+# looked up for the vote — bounds the SIFTS round-trips per search.
+FOLD_VOTERS = 20
+# At or above this sequence identity a hit is (almost certainly) the same
+# protein — one more deposition, not independent evidence of the fold.
+NEAR_IDENTICAL = 0.95
+
+
+def _domain_text(c: dict) -> str:
+    """One CATH/SCOP domain, as reported to the model."""
+    if c["source"] == "CATH":
+        return (f"CATH {c['cath_id']} {c['name']} ({c['class']} / "
+                f"{c['architecture']} / {c['topology']} / {c['homology']})")
+    return f"SCOP {c['name']} (fold: {c['fold']})"
+
+
+def _range_text(c: dict) -> str:
+    """A domain's author-numbered residue ranges, e.g. '82-145' or '5-40, 90-120'."""
+    return ", ".join(f"{s}-{e}" for s, e in c.get("ranges", []) if s is not None)
+
+
+def _hit_domains(hits: list) -> dict:
+    """
+    For every PDB hit, the classified domains its alignment actually covers.
+
+    SIFTS lookups for all distinct hit entries run in parallel (a pool of 20
+    hits sequentially is ~20 s of HTTP round-trips). Observed-residue
+    segments are fetched only for multi-domain chains — the only case where
+    the exact numbering decides the answer.
+
+    Returns:
+        {id(hit): (all_domains_of_chain, covered_domains)}.
+    """
+    pdb_hits = [h for h in hits if h["kind"] == "pdb"]
+    ids = sorted({h["pdb_id"] for h in pdb_hits})
+    if not ids:
+        return {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        cls = dict(zip(ids, pool.map(
+            lambda i: _cached_classification(i, topo.SCHEMA_VERSION), ids)))
+        multi = sorted({h["pdb_id"] for h in pdb_hits
+                        if len(cls[h["pdb_id"]].get(h["chain"], [])) > 1})
+        segs = dict(zip(multi, pool.map(
+            lambda i: _cached_observed_segments(i, topo.SCHEMA_VERSION), multi)))
+    out = {}
+    for h in pdb_hits:
+        doms = cls[h["pdb_id"]].get(h["chain"], [])
+        seg = segs.get(h["pdb_id"], {}).get(h["chain"])
+        out[id(h)] = (doms, topo.pick_domains(doms, h["tstart"], h["tend"], seg))
+    return out
+
+
+def _spread(hits: list, n: int) -> list:
+    """
+    n hits spread evenly over the identity range, lowest identity first.
+
+    Taking the first n by E-value picks n variants of the query's own
+    protein at 90-94% identity; spreading picks distinct homolog families,
+    which are the independent evidence a fold vote needs.
+    """
+    ranked = sorted(hits, key=lambda h: h["fident"])
+    if len(ranked) <= n:
+        return ranked
+    step = len(ranked) / n
+    return [ranked[int(i * step)] for i in range(n)]
+
+
+def _fold_consensus(hits: list, doms_of: dict) -> str:
+    """
+    Which known fold(s) the classified hits in the pool point at.
+
+    Every hit votes once for each fold its aligned domain(s) belong to.
+    Near-identical hits (>= NEAR_IDENTICAL identity: the same protein again)
+    are left out of the vote whenever more distant classified hits exist, so
+    twenty copies of one protein cannot outvote real homologs — and are
+    used, but labelled, when they are all there is.
+    """
+    classified = [h for h in hits if doms_of.get(id(h), ((), ()))[1]]
+    if not classified:
+        return (f"    None of the hits checked ({len(hits)} found, classification "
+                f"looked up for up to {FOLD_VOTERS} spread across the identity "
+                "range) has a CATH/SCOP classification covering the aligned "
+                "region, so no known fold can be named from them.")
+    distant = [h for h in classified if h["fident"] < NEAR_IDENTICAL]
+    voters = distant or classified
+    votes = {}
+    for h in voters:
+        for key in {_fold_key(d) for d in doms_of[id(h)][1]}:
+            votes.setdefault(key, set()).add(h["pdb_id"].upper())
+    ranked = sorted(votes.items(), key=lambda kv: -len(kv[1]))
+    (kind, name), top = ranked[0]
+    note = (f"{len(hits)} hits found; classification looked up for up to "
+            f"{FOLD_VOTERS} spread across the identity range")
+    skipped = len(classified) - len(distant)
+    if distant and skipped:
+        note += (f"; {skipped} near-identical hit(s) (≥{NEAR_IDENTICAL:.0%} "
+                 "sequence identity, same protein) left out of the vote")
+    elif not distant:
+        note += (f"; every classified hit is ≥{NEAR_IDENTICAL:.0%} identical — "
+                 "other depositions of the same protein, not independent homologs")
+    line = (f"    Fold consensus: {len(top)} of {len(voters)} classified hits "
+            f"share {kind} ({name}) [{note}].")
+    others = [f"{k} ({n}) — {len(v)} hit(s)" for (k, n), v in ranked[1:3] if len(v) >= 2]
+    if others:
+        line += " Also aligned to: " + "; ".join(others) + "."
+    return line
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _cached_uniprot_by_chain(pdb_id: str, schema: int):
+    """Cache a PDB entry's chain -> UniProt accession map (PDBe SIFTS)."""
+    return topo.uniprot_by_chain(pdb_id)
+
+
+# Neighbours whose UniProt entry is looked up for a function to transfer.
+FUNCTION_TRANSFER_CANDIDATES = 12
+
+
+def _structure_function_lines(accession: str) -> list:
+    """
+    P13 structure-based transfer: the curated functions of the proteins a
+    loaded structure of `accession` resembles (Foldseek), for an entry with
+    no FUNCTION of its own.
+
+    Local databases only — this runs without being asked for, so it must not
+    upload the user's structure; online search stays behind
+    find_structural_neighbors' consent question. Every transferred function
+    sits under an INFERRED ... LOW CONFIDENCE heading with the evidence
+    (TM-score, identity, coverage) next to it.
+    """
+    acc = (accession or "").strip().upper()
+    entry, chains = None, []
+    for s in structures():
+        if _foldseek_exclude(s).upper() == acc:
+            entry, chains = s, list(_atoms_of(s)["chains_present"])
+            break
+        mine = [m["chain"] for m in srep.chain_molecules(s["path"])
+                if acc in [u.upper() for u in m.get("uniprot") or []]]
+        if mine:
+            entry, chains = s, mine
+            break
+    if not entry:
+        return ["Structure-based check: not run — no structure of this protein is loaded "
+                "(load it to have its structural neighbours' known functions compared)."]
+    dbs = [d for d in (fsk.find_database() if fsk.availability()[0] else None,
+                       fsk.find_afdb_database() if fsk.find_foldseek() else None) if d]
+    if not dbs:
+        return ["Structure-based check: not run — no local Foldseek database. "
+                "find_structural_neighbors can search online if the user agrees to upload "
+                "the structure."]
+
+    hits = []
+    for db in dbs:
+        ok, msg, result = _cached_foldseek(
+            entry["path"], Path(entry["path"]).stat().st_mtime, tuple(chains),
+            FOLD_POOL, _foldseek_exclude(entry), db, fsk.SCHEMA_VERSION)
+        if ok:
+            hits += [h for g in result.values() for h in g["hits"]]
+    hits.sort(key=lambda h: h["evalue"])
+    pdb_ids = sorted({h["pdb_id"] for h in hits if h["kind"] == "pdb"}
+                     )[:FUNCTION_TRANSFER_CANDIDATES * 3]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        maps = dict(zip(pdb_ids, pool.map(
+            lambda i: _cached_uniprot_by_chain(i, topo.SCHEMA_VERSION), pdb_ids)))
+    best = {}          # neighbour accession -> its best (lowest E) hit
+    for h in hits:
+        n_acc = (h.get("accession") if h["kind"] == "afdb"
+                 else maps.get(h["pdb_id"], {}).get(h["chain"]))
+        n_acc = (n_acc or "").split("-")[0].upper()
+        if n_acc and n_acc != acc and n_acc not in best:
+            best[n_acc] = h
+        if len(best) >= FUNCTION_TRANSFER_CANDIDATES:
+            break
+    if not best:
+        return ["Structure-based check: Foldseek found no confident structural neighbour "
+                "(E-value ≤ 1e-3) that maps to a UniProt entry — nothing to transfer."]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        known = list(pool.map(lambda a: pacc.known_function(a)[0], list(best)))
+    rows = [(k, best[k["accession"]]) for k in known
+            if k and k["function"] and not k["automatic"]][:3]
+    if not rows:
+        return [f"Structure-based check: {len(best)} structural neighbours checked; none has "
+                "a curated UniProt function to transfer."]
+    lines = ["INFERRED FUNCTION FROM STRUCTURAL NEIGHBOURS (LOW CONFIDENCE — Foldseek "
+             "similarity of this structure to proteins with curated functions; similar "
+             "shape does not mean same function):"]
+    for k, h in rows:
+        tm = f"TM-score {min(h['tmscore'], 1.0):.2f}, " if h["tmscore"] is not None else ""
+        cov = (h["qend"] - h["qstart"] + 1) / max(h["qlen"], 1)
+        src = (f"PDB {h['pdb_id'].upper()} chain {h['chain']}" if h["kind"] == "pdb"
+               else "AlphaFold model")
+        text = k["function"] if len(k["function"]) <= 300 else k["function"][:297] + "…"
+        lines.append(f"  {k['name']} ({k['accession']}, {k['organism']}; {src}) — {tm}"
+                     f"E={h['evalue']:.1e}, {h['fident']:.0%} sequence identity, aligned "
+                     f"over {cov:.0%} of the query: {text}")
+    lines.append("Caveat: a shared fold often goes with a shared broad role but can differ "
+                 "in substrate, partner or activity — and sequence identity below ~30% makes "
+                 "a specific transfer unreliable. Report these as candidates, not as this "
+                 "protein's function, and keep the LOW CONFIDENCE label.")
+    return lines
+
+
+def _foldseek_exclude(entry: dict) -> str:
+    """The id of the query's own entry, so it is not reported as its own neighbour."""
+    # An AlphaFold model, however it was loaded: "AF-O95905" (load_protein),
+    # "AF_O95905" (its cached file name, re-fetched or loaded locally).
+    m = re.match(r"AF[-_]([A-Za-z0-9]+)", entry["pdb_id"])
+    if m:
+        return m.group(1)
+    if entry.get("source") == "rcsb":
+        return entry["pdb_id"]
+    return ""
+
+
+def _afdb_neighbor_lines(entry: dict, chains: list, max_hits: int) -> list:
+    """
+    Foldseek hits against the local AlphaFold DB (Swiss-Prot) database.
+
+    Reaches reviewed proteins with no experimental structure — the case
+    where the PDB search finds nothing (AF-O95905: no PDB match, but its
+    mouse, plant and fly orthologs here). Hits are predicted models with no
+    CATH/SCOP classification, so they name proteins, never a fold.
+    Local only: nothing is uploaded, so no consent question is needed.
+    Returns [] when the database is not installed.
+    """
+    db = fsk.find_afdb_database()
+    if not db or not fsk.find_foldseek():
+        return []
+    ok, msg, result = _cached_foldseek(
+        entry["path"], Path(entry["path"]).stat().st_mtime, tuple(chains),
+        max_hits, _foldseek_exclude(entry), db, fsk.SCHEMA_VERSION)
+    if not ok:
+        return [f"  AlphaFold DB search failed: {msg}"]
+    lines = [f"  AlphaFold DB neighbours (Foldseek vs the local "
+             f"'{Path(db).name}' database — AlphaFold predicted models of reviewed "
+             "UniProt entries, E-value ≤ 1e-3; no CATH/SCOP classification exists "
+             "for these, so they name similar proteins, not a fold):"]
+    for group in result.values():
+        label = ", ".join(group["chains"])
+        if not group["hits"]:
+            lines.append(f"    chain {label}: no confident match here either.")
+            continue
+        lines.append(f"    chain {label}:")
+        for i, h in enumerate(group["hits"], 1):
+            tm = (f"TM-score {min(h['tmscore'], 1.0):.2f}, "
+                  if h["tmscore"] is not None else "")
+            who = (f"UniProt {h['accession']}" if h["kind"] == "afdb" else h["target"])
+            lines.append(
+                f"      {i}. {who} — {h['description']} — {tm}homology probability "
+                f"{h['prob']:.2f}, E={h['evalue']:.1e}, {h['fident']:.0%} sequence "
+                f"identity, query positions {h['qstart']}-{h['qend']} of {h['qlen']}")
+    return lines
+
+
 def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
-                               where: str = "auto") -> list:
+                               where: str = "auto", database: str = "pdb") -> list:
     """
     Foldseek hits for some chains of a structure, each annotated with the
     hit's own CATH/SCOP classification, plus a per-chain fold consensus.
@@ -2072,7 +2341,18 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
     where: "local", "online" or "auto". Auto uses the local database when
     installed, the online server only if the user already agreed to it this
     session, and otherwise returns the question of which one they want.
+
+    database: "pdb" (default) — chains with no confident PDB match then also
+    get the local AlphaFold DB search, when installed; "alphafold" — only
+    the local AlphaFold DB search.
     """
+    if database == "alphafold":
+        lines = _afdb_neighbor_lines(entry, chains, max_hits)
+        return lines or [
+            "The AlphaFold DB (Swiss-Prot) Foldseek database is not installed "
+            "(~1.6 GB download, ~2.4 GB on disk). Install: foldseek databases "
+            f"Alphafold/Swiss-Prot {fsk.DEFAULT_AFDB} /tmp/fs — or set FOLDSEEK_AFDB."]
+
     local_ok, local_msg = fsk.availability()
     online_ok = entry["path"] in st.session_state.get("foldseek_online_ok", set())
     if where == "local" and not local_ok:
@@ -2087,16 +2367,11 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
         else:
             return [_foldseek_choice(entry)]
 
-    if entry.get("source") == "rcsb":
-        exclude = entry["pdb_id"]
-    elif entry.get("source") == "alphafold":
-        exclude = entry["pdb_id"].split("-", 1)[-1]   # "AF-P12345" -> own AFDB entry
-    else:
-        exclude = ""
+    exclude = _foldseek_exclude(entry)
     db = "online" if where == "online" else fsk.find_database()
     ok, msg, result = _cached_foldseek(
         entry["path"], Path(entry["path"]).stat().st_mtime, tuple(chains),
-        max_hits, exclude, db, fsk.SCHEMA_VERSION)
+        max(max_hits, FOLD_POOL), exclude, db, fsk.SCHEMA_VERSION)
     if not ok:
         return [msg]
     st.session_state.pop("foldseek_pending", None)
@@ -2105,33 +2380,47 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
                if where == "online" else f"the local '{Path(db).name}' database")
     lines = [f"Structural neighbours (Foldseek, this structure's own coordinates vs "
              f"{against}, E-value ≤ 1e-3):"]
-    for group in result.values():
+    no_pdb_match = []
+    for rep, group in result.items():
         label = ", ".join(group["chains"])
-        hits = group["hits"]
-        if not hits:
+        pool_hits = group["hits"]
+        if not pool_hits:
             lines.append(f"  chain {label}: no confident structural match to any "
                          "entry in the database — no known fold can be named from "
                          "structural similarity.")
+            no_pdb_match.append(rep)
             continue
         lines.append(f"  chain {label}:")
-        folds = {}
-        for i, h in enumerate(hits, 1):
+        # Classify what is shown plus the distant hits (the independent
+        # evidence); near-identical ones only when no distant hit is classified.
+        shown = pool_hits[:max_hits]
+        distant = _spread([h for h in pool_hits if h["fident"] < NEAR_IDENTICAL],
+                          FOLD_VOTERS)
+        doms_of = _hit_domains(shown + [h for h in distant if h not in shown])
+        if not any(doms_of.get(id(h), ((), ()))[1] for h in distant):
+            near = [h for h in pool_hits if h["fident"] >= NEAR_IDENTICAL
+                    and id(h) not in doms_of][:FOLD_VOTERS]
+            doms_of.update(_hit_domains(near))
+        for i, h in enumerate(shown, 1):
             tm = (f"TM-score {min(h['tmscore'], 1.0):.2f}, "
                   if h["tmscore"] is not None else "")
             stats = (f"{tm}homology probability "
                      f"{h['prob']:.2f}, E={h['evalue']:.1e}, {h['fident']:.0%} sequence "
                      f"identity, query positions {h['qstart']}-{h['qend']} of {h['qlen']}")
             if h["kind"] == "pdb":
-                c = _cached_classification(h["pdb_id"], topo.SCHEMA_VERSION).get(h["chain"])
-                if c and c["source"] == "CATH":
-                    cls = (f"CATH {c['cath_id']} {c['name']} ({c['class']} / "
-                           f"{c['architecture']} / {c['topology']})")
-                elif c:
-                    cls = f"SCOP {c['name']} (fold: {c['fold']})"
-                else:
+                all_doms, covered = doms_of.get(id(h), ([], []))
+                if not all_doms:
                     cls = "no CATH/SCOP classification on file"
-                if c:
-                    folds.setdefault(_fold_key(c), []).append(h["pdb_id"].upper())
+                elif len(all_doms) == 1:
+                    cls = _domain_text(all_doms[0])
+                elif covered:
+                    cls = "; ".join(
+                        f"aligned to its domain {all_doms.index(d) + 1} of "
+                        f"{len(all_doms)} (residues {_range_text(d)}): {_domain_text(d)}"
+                        for d in covered)
+                else:
+                    cls = (f"chain has {len(all_doms)} classified domains, none "
+                           "covering the aligned region")
                 lines.append(f"    {i}. PDB {h['pdb_id'].upper()} chain {h['chain']} — "
                              f"{h['description']} — {stats} — {cls}")
             elif h["kind"] == "afdb":
@@ -2140,14 +2429,9 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
                              "CATH/SCOP lookup")
             else:
                 lines.append(f"    {i}. {h['name']} — {h['description']} — {stats}")
-        if folds:
-            n_cls = sum(len(v) for v in folds.values())
-            (kind, name), ids = max(folds.items(), key=lambda kv: len(kv[1]))
-            lines.append(f"    Fold consensus: {len(ids)} of {n_cls} classified hits "
-                         f"share {kind} ({name}).")
-        else:
-            lines.append("    None of these hits has a CATH/SCOP classification on "
-                         "file, so no known fold can be named from them.")
+        lines.append(_fold_consensus(pool_hits, doms_of))
+    if no_pdb_match:
+        lines.extend(_afdb_neighbor_lines(entry, no_pdb_match, max_hits))
     return lines
 
 
@@ -2197,25 +2481,31 @@ def tool_describe_fold(chain: str = "") -> str:
         classification = _cached_classification(entry["pdb_id"], topo.SCHEMA_VERSION)
         groups = {}
         for ch in chains:
-            c = classification.get(ch)
-            if not c:
+            doms = classification.get(ch)
+            if not doms:
                 continue
-            key = (c["source"], c.get("cath_id") or c.get("sunid"), c["name"])
-            groups.setdefault(key, {"info": c, "chains": []})["chains"].append(ch)
+            key = tuple((d["source"], d.get("cath_id") or d.get("sunid"),
+                         tuple(d["ranges"])) for d in doms)
+            groups.setdefault(key, {"doms": doms, "chains": []})["chains"].append(ch)
+
+        def _dom_line(c):
+            if c["source"] == "CATH":
+                return (f"CATH {c['cath_id']} — {c['name']} ({c['class']} / "
+                        f"{c['architecture']} / {c['topology']} / {c['homology']})")
+            return (f"SCOP — {c['name']} ({c['class']} / fold: {c['fold']} / "
+                    f"superfamily: {c['superfamily']})")
+
         if groups:
             lines.append("Existing classification (CATH/SCOP):")
-            for (src, _id, _name), g in groups.items():
-                c, chain_label = g["info"], ", ".join(g["chains"])
-                if src == "CATH":
-                    lines.append(
-                        f"  chain {chain_label}: CATH {c['cath_id']} — {c['name']} "
-                        f"({c['class']} / {c['architecture']} / {c['topology']} / "
-                        f"{c['homology']})")
-                else:
-                    lines.append(
-                        f"  chain {chain_label}: SCOP — {c['name']} "
-                        f"({c['class']} / fold: {c['fold']} / "
-                        f"superfamily: {c['superfamily']})")
+            for g in groups.values():
+                doms, chain_label = g["doms"], ", ".join(g["chains"])
+                if len(doms) == 1:
+                    lines.append(f"  chain {chain_label}: {_dom_line(doms[0])}")
+                    continue
+                lines.append(f"  chain {chain_label}: {len(doms)} domains, "
+                             "N- to C-terminal:")
+                for n, d in enumerate(doms, 1):
+                    lines.append(f"    domain {n}, residues {_range_text(d)}: {_dom_line(d)}")
         else:
             lines.append("No CATH/SCOP classification on file for this entry.")
     else:
@@ -2255,11 +2545,35 @@ def tool_describe_fold(chain: str = "") -> str:
     if unclassified:
         lines.extend(_structural_neighbor_lines(entry, unclassified, max_hits=3))
 
+    # One verdict line up front. With the classification, DSSP and the
+    # "no classification" wording all in one report, qwen2.5:7b wrote "does
+    # not have an existing fold classification... categorized as Globin-like"
+    # for 4HHB chain A, which has one.
+    classified = [ch for ch in chains if ch in classification]
+    names = []
+    for ch in classified:
+        for d in classification[ch]:
+            n = d.get("name") or d.get("fold") or ""
+            if n and n not in names:
+                names.append(n)
+    if classified and not unclassified:
+        verdict = (f"every requested chain ({', '.join(classified)}) HAS a CATH/SCOP "
+                   f"classification: {'; '.join(names)}.")
+    elif classified:
+        verdict = (f"chain(s) {', '.join(classified)} HAVE a CATH/SCOP classification "
+                   f"({'; '.join(names)}); chain(s) {', '.join(unclassified)} have "
+                   "none of their own — see the Foldseek section for those.")
+    else:
+        verdict = ("no requested chain has a CATH/SCOP classification — any fold named "
+                   "below comes from DSSP topology or structural neighbours, not a database "
+                   "entry for this structure.")
+    lines.insert(1, "SUMMARY: " + verdict)
+
     return "\n".join(lines)
 
 
 def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
-                                   where: str = "auto") -> str:
+                                   where: str = "auto", database: str = "pdb") -> str:
     """
     Find known structures that the loaded structure resembles in 3D.
 
@@ -2277,6 +2591,9 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
                   distinct protein chain.
         max_hits: Neighbours reported per chain (1-20).
         where   : "auto" (default), "local" or "online".
+        database: "pdb" (default; chains with no PDB match fall back to the
+                  local AlphaFold DB when installed) or "alphafold" (local
+                  AlphaFold DB Swiss-Prot only).
 
     Returns:
         A plain-text report, or why the search could not run.
@@ -2301,7 +2618,10 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
     where = (where or "auto").strip().lower()
     if where not in ("auto", "local", "online"):
         where = "auto"
-    lines.extend(_structural_neighbor_lines(entry, chains, max_hits, where))
+    database = (database or "pdb").strip().lower()
+    database = "alphafold" if database in ("alphafold", "afdb", "af", "swissprot",
+                                          "swiss-prot") else "pdb"
+    lines.extend(_structural_neighbor_lines(entry, chains, max_hits, where, database))
     return "\n".join(lines)
 
 
@@ -2485,6 +2805,53 @@ def _pocket_hint(target: str) -> str:
              if het else "")
     return (named + " To find candidate binding pockets from the structure's geometry "
             "— with or without a bound ligand — call find_pockets.")
+
+
+_GENERIC_LIGAND = re.compile(r"(?:the\s+|a\s+|any\s+|bound\s+|all\s+)*(?:bound\s+)?"
+                             r"(?:ligands?|small[ _-]?molecules?|inhibitors?|drugs?|"
+                             r"compounds?|het(?:ero)?(?:[ _-]?groups?|atoms?)?)", re.I)
+
+
+def _generic_ligand(target: str, action: str):
+    """
+    Resolve a target that says only "the ligand" to this file's real hetero
+    groups, before _pick() fails on it.
+
+    4HHB "what does the ligand bind to" used to fail find_contacts('ligand')
+    and the model then asked "which ligand?" without naming HEM or PO4.
+    One non-water component -> its code. Several -> ask_user with each one
+    as an option (ions and additives last). None -> (None, message).
+
+    Args:
+        target: The tool's target argument.
+        action: What the chosen option should do, e.g. "list the residues
+                within 4 Å of" — becomes each option's meaning.
+
+    Returns:
+        (target, None) with the code to use (unchanged when target is not a
+        generic ligand word), or (None, tool-result text).
+    """
+    if not _GENERIC_LIGAND.fullmatch((target or "").strip()):
+        return target, None
+    summary = structure_summary()
+    comps = (summary or {}).get("components") or []
+    if not comps:
+        return None, ("This structure has no bound ligand, cofactor or ion (waters "
+                      "aside). To find candidate binding pockets from the geometry, "
+                      "call find_pockets.")
+    if len(comps) == 1:
+        return comps[0]["code"], None
+    rank = {"ligand": 0, "cofactor": 1, "ion": 2, "additive": 3}
+    comps = sorted(comps, key=lambda c: rank.get(c.get("category"), 4))
+    options = []
+    for c in comps[:5]:
+        name = srep.pretty_chemical(c.get("name") or "") or c["code"]
+        where = ", ".join(c.get("chains") or [])
+        label = (f"{c['code']} ({name}, {c.get('count', 1)}× "
+                 f"{'chain' if len(c.get('chains') or []) == 1 else 'chains'} {where})")
+        options.append({"label": label, "meaning": f"{action} {c['code']}"})
+    return None, ask_clarification(
+        "This structure has more than one hetero group — which one do you mean?", options)
 
 
 def _pocket_target(spec: str):
@@ -3581,11 +3948,15 @@ def _pick(spec_text: str, default_entry: dict, cross: bool):
     note = ""
     if len(groups) > 1:
         others = ", ".join(l for l, _ in groups[1:4])
-        note = (f"'{spec_text}' also matches {others}"
+        # Worded so it cannot read as a second result: qwen2.5:7b reported
+        # "a match for PO4 147 in chain D ... at 3.95 Å" from the old
+        # "also matches X — measured against the first".
+        note = (f"only {label} was used. Other copies of '{spec_text}', NOT searched and "
+                f"with no results above: {others}"
                 + ("…" if len(groups) > 4 else "")
-                + " — measured against the first; add a chain to pick another")
+                + " — add a chain to use one of them")
     return {"entry": entry, "atoms": atoms, "label": label,
-            "indices": indices, "note": note}, None
+            "indices": indices, "note": note, "groups": groups}, None
 
 
 def _clean_mda_selection(selection) -> str:
@@ -3849,17 +4220,34 @@ def tool_find_interactions(target: str = "", types: str = "",
         cutoffs = {"salt_bridge": r, "hbond": r, "metal": r, "hydrophobic": r}
 
     restrict, scope_label = None, "the whole structure"
-    if (target or "").strip():
+    target = (target or "").strip()
+    # Whole-structure words are no scope at all: 'protein' failed in _pick
+    # and the model reported the failure as "no salt bridges in 4HHB".
+    if re.fullmatch(r"(the\s+)?(whole\s+|entire\s+)?(protein|structure|complex|all|"
+                    r"everything|molecule|\*)", target, re.I):
+        target = ""
+    # A chain is a scope, not a residue — and it must be checked before
+    # _pick, which read "chain A" as VAL 1 of chain A.
+    chain_m = re.fullmatch(r"(?:chain\s*)?([A-Za-z0-9])", target, re.I)
+    if chain_m and chain_m.group(1).upper() in atoms["chains_present"] and (
+            target.lower().startswith("chain") or len(target) == 1):
+        chain = chain_m.group(1).upper()
+        restrict = {(c, r, i) for c, r, i in zip(
+            atoms["chain"], atoms["resseq"], atoms["icode"]) if c == chain}
+        scope_label = f"chain {chain}"
+        target = ""
+    keys, plabel = _pocket_target(target) if target else (None, None)
+    if plabel and not keys:
+        return plabel
+    if keys:
+        restrict, scope_label, target = set(keys), plabel, ""
+    if target:
+        target, msg = _generic_ligand(target, "find the interactions of")
+        if msg:
+            return msg
         side, err = _pick(target, entry, cross=False)
         if err:
-            # A bare chain id is a scope, not a residue, and _pick cannot know.
-            chain = target.strip().upper().replace("CHAIN", "").strip()
-            if len(chain) == 1 and chain in atoms["chains_present"]:
-                restrict = {(c, r, i) for c, r, i in zip(
-                    atoms["chain"], atoms["resseq"], atoms["icode"]) if c == chain}
-                scope_label = f"chain {chain}"
-            else:
-                return err + _pocket_hint(target)
+            return err + _pocket_hint(target)
         else:
             restrict = {(atoms["chain"][i], atoms["resseq"][i], atoms["icode"][i])
                         for i in side["indices"]}
@@ -3875,11 +4263,23 @@ def tool_find_interactions(target: str = "", types: str = "",
     except (TypeError, ValueError):
         limit = 25
 
+    # Each row is one atom pair; one salt bridge is often 2-4 of them. Said
+    # plainly, or "63 salt bridge" here and detect_salt_bridges' "34 pairs"
+    # read as two different answers.
+    def _pairs(kind):
+        return len({frozenset((f["a_label"], f["b_label"])) for f in found
+                    if f["type"] == kind})
+
+    def _count(kind, n):
+        p = _pairs(kind)
+        return f"{n} atom contacts, {p} residue pairs" if p != n else f"{n}"
+
     lines = [f"Interactions in {entry['pdb_id']} — {scope_label}"]
     if not found:
         lines.append("  none found with these criteria")
     else:
-        summary = ", ".join(f"{result['counts'][k]} {ixn.TYPE_LABELS[k].lower()}"
+        summary = ", ".join(f"{ixn.TYPE_LABELS[k].lower()}: "
+                            f"{_count(k, result['counts'][k])}"
                             for k, _, _ in ixn.INTERACTION_TYPES
                             if result["counts"].get(k))
         lines.append(f"  {summary}")
@@ -3889,7 +4289,7 @@ def tool_find_interactions(target: str = "", types: str = "",
         if not hits:
             continue
         lines.append("")
-        lines.append(f"{label.upper()} ({len(hits)})")
+        lines.append(f"{label.upper()} ({_count(kind, len(hits))})")
         for f in hits[:limit]:
             row = (f"  {f['a_label']:<14} {f['a_atom']:<4} — "
                    f"{f['b_label']:<14} {f['b_atom']:<4} {f['distance']:.2f} Å")
@@ -4097,6 +4497,27 @@ def tool_find_contacts(target: str, radius: float = 4.0,
     entry = active_structure()
     if not entry:
         return "No structure is loaded — fetch one first."
+    # An empty target here is "the ligand" with the noun dropped: qwen2.5:7b
+    # sent target='' for "what does the ligand bind to" after a find_pockets
+    # turn, got "no residue was named", and told the user 4HHB has no ligand.
+    target = (target or "").strip()
+    # "pocket N" (after find_pockets): contacts of whatever the file has bound
+    # there, or the lining itself for an empty pocket. Failing on it sent the
+    # model back to find_pockets, whose report it then garbled.
+    keys, plabel = _pocket_target(target) if target else (None, None)
+    if plabel and not keys:
+        return plabel
+    if keys:
+        m = re.search(r"(\d+)", target)
+        p = st.session_state.pockets["by_rank"][int(m.group(1))]
+        if not p.get("occupants"):
+            return (f"Nothing is bound in {plabel.split(' (')[0]} of {entry['pdb_id']} — it is "
+                    f"empty in this file. Its lining residues: {_pocket_residues(p)}.")
+        occ = p["occupants"][0]
+        target = occ["label"].split(" ", 1)[1]           # "HEM B/148" -> "B/148"
+    target, msg = _generic_ligand(target or "ligand", "list the residues in contact with")
+    if msg:
+        return msg
     side, err = _pick(target, entry, cross=False)
     if err:
         return err + _pocket_hint(target)
@@ -4106,6 +4527,30 @@ def tool_find_contacts(target: str, radius: float = 4.0,
     except (TypeError, ValueError):
         radius = 4.0
     radius = max(1.0, min(radius, 15.0))
+
+    # A ligand code with several copies (4HHB: HEM in all four chains) gets
+    # every copy searched: reporting only the first led the model to invent
+    # results for the others.
+    groups = side["groups"]
+    code = groups[0][0].split()[0].upper()
+    if (len(groups) > 1 and target.strip().upper() == code
+            and code not in srep.STANDARD_AA):
+        per = 15
+        lines = [f"'{target}' has {len(groups)} copies in {entry['pdb_id']}; "
+                 f"residues within {radius:g} Å of each:"]
+        for label, indices in groups[:6]:
+            found = mz.contacts(side["atoms"], indices, radius,
+                                include_water=bool(include_water))
+            lines.append(f"{label} ({len(found)} found)" + (":" if found else
+                         f" — nothing within {radius:g} Å."))
+            for c in found[:per]:
+                lines.append(f"  {c['label']:<24} {c['distance']:.2f} Å   "
+                             f"({c['atoms'][0]} → {c['atoms'][1]})")
+            if len(found) > per:
+                lines.append(f"  …and {len(found) - per} more")
+        if len(groups) > 6:
+            lines.append(f"({len(groups) - 6} more copies not listed — add a chain to pick one.)")
+        return "\n".join(lines)
 
     found = mz.contacts(side["atoms"], side["indices"], radius,
                         include_water=bool(include_water))
@@ -4394,7 +4839,7 @@ def _format_chain_summary(df) -> str:
     return response
 
 
-def _format_salt_bridge_summary(df, cutoff: float) -> str:
+def _format_salt_bridge_summary(df, cutoff: float, max_rows: int = 100) -> str:
     """Summarize geometric acidic-basic contacts."""
     if df is None or df.empty:
         return (
@@ -4418,26 +4863,37 @@ def _format_salt_bridge_summary(df, cutoff: float) -> str:
         .reset_index(drop=True)
     )
 
-    examples = [
-        f"{row.acidic_residue}–{row.basic_residue}"
-        for row in unique_pairs.head(3).itertuples(index=False)
-    ]
+    # Every pair is listed, split by whether it joins two chains: with only
+    # three "representative" pairs, qwen2.5:7b said "four" while listing
+    # three, and called same-chain pairs inter-chain.
+    def _chain(label):
+        return str(label).rsplit(":", 1)[-1] if ":" in str(label) else ""
+
+    pairs = [(r.acidic_residue, r.basic_residue)
+             for r in unique_pairs.itertuples(index=False)]
+    inter = [p for p in pairs if _chain(p[0]) != _chain(p[1])]
+    intra = [p for p in pairs if _chain(p[0]) == _chain(p[1])]
+
+    def _list(ps):
+        shown = ", ".join(f"{a}–{b}" for a, b in ps[:40])
+        return shown + (f", …and {len(ps) - 40} more" if len(ps) > 40 else "")
 
     response = (
-        f"PARORA identified {len(df)} candidate acidic–basic atom contacts "
-        f"within a {cutoff:.1f} Å cutoff, representing "
-        f"{len(unique_pairs)} unique residue-pair interactions."
+        f"SUMMARY: {len(pairs)} candidate salt-bridge residue pairs "
+        f"({len(df)} acidic–basic atom contacts within {cutoff:.1f} Å): "
+        f"{len(intra)} within one chain, {len(inter)} between two chains."
     )
-
-    if examples:
-        response += " Representative pairs include " + ", ".join(examples) + "."
-
+    if intra:
+        response += f"\nWithin one chain ({len(intra)}): {_list(intra)}."
+    if inter:
+        response += f"\nBetween chains ({len(inter)}): {_list(inter)}."
     response += (
-        " These are geometry-based candidates rather than confirmed stable "
-        "salt bridges. The complete interaction table is shown below."
+        "\nThese are geometry-based candidates rather than confirmed stable "
+        "salt bridges. The atom-contact table is shown below"
+        + (f" (first {max_rows} of {len(df)} rows)." if len(df) > max_rows else ".")
     )
 
-    return response + "\n\n" + df.to_string(index=False)
+    return response + "\n\n" + df.head(max_rows).to_string(index=False)
 
 
 def _format_nearby_residue_summary(df, selection: str, cutoff: float) -> str:
@@ -4583,10 +5039,12 @@ def tool_detect_salt_bridges(
             u,
             chain=chain or None,
             cutoff=cutoff,
-            max_rows=max_rows,
+            # Count every contact; max_rows only trims the printed table. The
+            # detector stops at its row limit, which made pair counts wrong.
+            max_rows=10**6,
         )
 
-        summary = _format_salt_bridge_summary(df, cutoff)
+        summary = _format_salt_bridge_summary(df, cutoff, max_rows)
 
         if chain and "error" not in summary.lower():
             summary = f"Chain {chain} analysis: {summary}"
@@ -4646,6 +5104,14 @@ def tool_nearby_residues(
 
         return _format_nearby_residue_summary(df, selection, cutoff)
     except Exception as e:
+        # The model passes residue specs here ("A/HIS87", "A/87") that are not
+        # MDAnalysis syntax; find_contacts' parser reads those, so answer with it
+        # rather than fail twice and leave the model to make residues up.
+        if active_structure() and re.search(r"\d", selection) and not re.search(
+                r"\b(resid|resname|segid|name|and|or|around)\b", selection):
+            alt = tool_find_contacts(selection, radius=cutoff)
+            if not _TOOL_FAILED.search(alt[:240]):
+                return alt
         return f"Error finding nearby residues: {e}"
 
 
@@ -5149,8 +5615,10 @@ TOOLS = [
                 "ligands/chains/residues) and not structure availability (use "
                 "find_protein for what depositions exist). Report exactly what UniProt "
                 "says; never invent a function from the protein's name alone. For an "
-                "uncharacterized entry it adds family/domain/GO evidence under an "
-                "INFERRED FUNCTION (LOW CONFIDENCE) heading — report that as a guess."
+                "uncharacterized entry it adds family/domain/GO evidence, and — when a "
+                "structure of it is loaded — the curated functions of its structural "
+                "neighbours, under INFERRED ... (LOW CONFIDENCE) headings; report those "
+                "as a guess."
             ),
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string", "description": "Protein name or accession; empty reuses the last lookup"}
@@ -5587,6 +6055,9 @@ TOOLS = [
                 "Works for AlphaFold models and local files. For 'what fold is this' "
                 "use describe_fold first (it falls back to this search on its own). "
                 "Report exactly what this tool returns, including 'no confident match'. "
+                "Chains with no PDB match also get AlphaFold DB neighbours (similar "
+                "proteins, predicted models, no fold name) — report those as similar "
+                "proteins, never as a fold. "
                 "If it returns NEEDS USER CHOICE, ask the user that question and stop."
             ),
             "parameters": {"type": "object", "properties": {
@@ -5596,7 +6067,11 @@ TOOLS = [
                              "description": "Neighbours per chain, default 5"},
                 "where": {"type": "string", "enum": ["auto", "local", "online"],
                           "description": ("'online' ONLY when the user said to search "
-                                          "online / upload; otherwise omit")}
+                                          "online / upload; otherwise omit")},
+                "database": {"type": "string", "enum": ["pdb", "alphafold"],
+                             "description": ("'alphafold' ONLY when the user asks to "
+                                             "search AlphaFold DB / predicted models / "
+                                             "Swiss-Prot; otherwise omit")}
             }}
         }
     },
@@ -6091,7 +6566,8 @@ TOOL_DISPATCH = {
         str(a.get("residue", "")), a.get("mutant", ""), a.get("wildtype", ""),
         a.get("chain", "")),
     "find_structural_neighbors": lambda a: tool_find_structural_neighbors(
-        a.get("chain", ""), a.get("max_hits", 5), a.get("where", "auto")),
+        a.get("chain", ""), a.get("max_hits", 5), a.get("where", "auto"),
+        a.get("database", "pdb")),
     "download_foldseek_database": lambda _: tool_download_foldseek_database(),
     "find_pockets":      lambda a: tool_find_pockets(a.get("chain", ""),
                                                      a.get("max_pockets", 5)),
@@ -6184,8 +6660,9 @@ def _system_prompt() -> str:
         "   ligands, chains, residues, not biological role) and do NOT invent a function "
         "   from the protein's name or general knowledge. If `protein_function` reports no "
         "   FUNCTION annotation, say so first; then, only if it lists an INFERRED "
-        "   FUNCTION (LOW CONFIDENCE) section, give that as a low-confidence "
-        "   computational guess from family/domain matches — never as the known "
+        "   FUNCTION ... (LOW CONFIDENCE) section, give that as a low-confidence "
+        "   computational guess from family/domain matches or structural neighbours "
+        "   (name the neighbour and its similarity) — never as the known "
         "   function — and add nothing it does not list. GO terms it lists as "
         "   recorded (experimental codes) are observations; say which is which. "
         "0a4. Fold/topology — 'what fold is this', 'describe the topology of chain A', "
@@ -6194,7 +6671,8 @@ def _system_prompt() -> str:
         "   these from describe_structure (that reports composition, not fold) and do "
         "   NOT invent a fold name from the protein's name or general knowledge. Report "
         "   exactly what `describe_fold` returns, including when it says no "
-        "   classification is available. "
+        "   classification is available. When it lists several domains for a chain, "
+        "   name each with its residue range — never one fold for the whole chain. "
         "0a5. Structural similarity — 'what is this similar to', 'find structural "
         "   homologs / neighbours', 'what known structures look like this', 'run "
         "   Foldseek' → ONE `find_structural_neighbors` call. Name a fold only when a "
@@ -6583,7 +7061,19 @@ def _unsupported_facts(reply: str, evidence: str) -> list:
         places, value = len(num.split(".")[1]), float(num)
         if not any(abs(round(e, places) - value) < 1e-9 for e in ev_nums):
             bad.append(num)
+    # Named residues ("GLN86", "Asp 88"): after two failed nearby_residues
+    # calls qwen2.5:7b answered "near HIS 87: GLN86, ASP88" — neither is in
+    # 4HHB at those positions. Name and number must appear together somewhere.
+    ev_res = {(r.upper(), n) for r, n in _RESIDUE_TOKEN.findall(evidence)}
+    for r, n in sorted(set(_RESIDUE_TOKEN.findall(reply))):
+        if (r.upper(), n) not in ev_res and f"{r.upper()}{n}" not in bad:
+            bad.append(f"{r.upper()}{n}")
     return bad
+
+
+_RESIDUE_TOKEN = re.compile(
+    r"\b(ALA|ARG|ASN|ASP|CYS|GLN|GLU|GLY|HIS|ILE|LEU|LYS|MET|PHE|PRO|SER|THR|TRP|"
+    r"TYR|VAL)\s?-?(\d{1,5})\b", re.IGNORECASE)
 
 
 # Tools whose string arguments are identifiers or free text, not residue
@@ -7102,6 +7592,14 @@ def run_agent(user_prompt: str, status=None) -> str:
         w in prompt_lower for w in
         ("correctly", "properly", "will", "process", "pathway")
     )
+    # "fold" as a verb is the same dynamics question ("will this protein fold
+    # correctly" skipped the gate and was only declined thanks to a RAG
+    # example); "fold" as a noun ("what fold is this", "does this have a
+    # known fold") must not match.
+    folding_is_dynamics = folding_is_dynamics or bool(re.search(
+        r"\bmisfold|\bfolds?\s+(correctly|properly|incorrectly|at all|in (water|"
+        r"solution|vivo|vitro|the cell))\b|\b(will|does|do|would|can|could|should)\s+"
+        r"(?:\w+\s+){1,2}fold\b(?!\s*(class|type|famil|topolog))", prompt_lower))
     # P11 split (todo.txt): a stability question that names a mutation
     # ("would mutating residue 45 to alanine destabilize this", "is H92A
     # destabilizing") has something to compute against, so it gets P10's
@@ -7286,14 +7784,28 @@ def run_agent(user_prompt: str, status=None) -> str:
             # and domain matches — it must never read as the known function.
             pf = [str(m.get("content", "")) for m in messages
                   if "[protein_function]:" in str(m.get("content", ""))]
-            if any("INFERRED FUNCTION (LOW CONFIDENCE" in c for c in pf):
+            if any(re.search(r"INFERRED FUNCTION[^\n]*\(LOW CONFIDENCE", c) for c in pf):
+                basis = "sequence-family, domain and electronic GO matches"
+                if any("INFERRED FUNCTION FROM STRUCTURAL NEIGHBOURS" in c for c in pf):
+                    basis += ", or from structurally similar proteins (Foldseek)"
                 reply += ("\n\n_UniProt has no curated function for this protein. Any role "
-                          "above marked as inferred comes from sequence-family, domain and "
-                          "electronic GO matches — a low-confidence computational guess, not "
-                          "an established function._")
+                          f"above marked as inferred comes from {basis} — a low-confidence "
+                          "computational guess, not an established function._")
             elif any("AUTOMATIC annotation" in c for c in pf):
                 reply += ("\n\n_This function text is UniProt's automatic (rule-based) "
                           "annotation for an unreviewed entry, not curator-reviewed._")
+            # P9 follow-up: qwen2.5:7b called AlphaFold DB hits "known
+            # structures" and dropped that no PDB entry matched — so the
+            # provenance rides on every reply that used them.
+            afdb = [str(m.get("content", "")) for m in messages
+                    if "AlphaFold DB neighbours (Foldseek" in str(m.get("content", ""))]
+            if afdb:
+                no_pdb = any("no confident structural match to any entry" in c for c in afdb)
+                reply += ("\n\n_" + ("No experimental (PDB) structure matched confidently. "
+                                     if no_pdb else "")
+                          + "The AlphaFold DB neighbours are predicted models of reviewed "
+                          "UniProt entries, not experimental structures, and have no "
+                          "CATH/SCOP fold classification._")
             question = st.session_state.pop("foldseek_question", None)
             if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
                 reply = f"{reply}\n\n{question}"
@@ -7305,12 +7817,28 @@ def run_agent(user_prompt: str, status=None) -> str:
             pocket_reports = [p[len("find_pockets: "):] for p in summary_parts
                               if p.startswith("find_pockets: Candidate binding pockets")]
             if pocket_reports:
-                if all(p.startswith("find_pockets: ") for p in summary_parts):
+                # A failed call that led to find_pockets (find_contacts on
+                # 'pocket 30') still leaves a pocket-only answer.
+                if all(p.startswith("find_pockets: ") for p in summary_parts
+                       if not _TOOL_FAILED.search(p.split(": ", 1)[-1][:240])):
                     return pocket_reports[-1]
                 summary = next((l for l in pocket_reports[-1].splitlines()
                                 if l.startswith("SUMMARY:")), "")
                 if summary:
                     reply += f"\n\n_fpocket: {summary[len('SUMMARY:'):].strip()}_"
+            # Same for salt bridges: the model miscounted pairs and called
+            # same-chain pairs inter-chain, so the tool's own count rides along.
+            sb = [p for p in summary_parts if p.startswith("detect_salt_bridges: ")
+                  and "SUMMARY:" in p]
+            if sb:
+                body = sb[-1].split("SUMMARY:", 1)[1].splitlines()
+                reply += f"\n\n_Salt-bridge detector: {body[0].strip()}_"
+                # Short pair lists ride along too — asked to "list the salt
+                # bridges between chains", the model repeated the count only.
+                for ln in body[1:3]:
+                    m = re.match(r"(Within one chain|Between chains) \((\d+)\): (.*)", ln)
+                    if m and int(m.group(2)) <= 12:
+                        reply += f"\n_{m.group(1)}: {m.group(3)}_"
             return reply
 
         tool_results = []
@@ -7377,7 +7905,10 @@ def run_agent(user_prompt: str, status=None) -> str:
             # find_pockets: qwen2.5:7b sent chain='A' for "find the hidden
             # binding pocket" on single- and multi-chain structures alike,
             # which would silently drop every pocket not lined by chain A.
-            if name == "find_pockets":
+            # detect_salt_bridges: same habit, live — after a turn about chain B
+            # it scoped "which salt bridges stabilize this protein" to chain B
+            # and reported 9 pairs of 4HHB's 34.
+            if name in ("find_pockets", "detect_salt_bridges"):
                 ch = str(args.get("chain") or "").strip().upper()
                 if ch and ch not in user_chains:
                     args.pop("chain")
@@ -7584,7 +8115,9 @@ def run_agent(user_prompt: str, status=None) -> str:
             follow_up = (
                 "These calls FAILED and changed nothing: "
                 + "; ".join(f"{r['tool']} ({str(r['result'])[:120]})" for r in failed)
-                + ". Never say they worked. Retry once with corrected arguments if the "
+                + ". Never say they worked — and a failed call found nothing either way, "
+                "so never report its absence of results as a finding ('no salt bridges "
+                "were found'). Retry once with corrected arguments if the "
                 "error shows how, otherwise tell the user plainly what failed and why. "
                 + ("" if show_rep_fired else follow_up))
         messages.append({

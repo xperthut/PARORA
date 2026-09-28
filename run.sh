@@ -141,6 +141,17 @@ else
     echo "(The app itself also asks, the first time it's needed: search online at"
     echo "search.foldseek.com, which uploads the structure, or download the database.)"
 fi
+# Optional AlphaFold DB (Swiss-Prot) database: FOLDSEEK_AFDB, else
+# protein-viz-agent/foldseek_db/afdb_swissprot. Never downloaded from here.
+FS_AFDB="${FOLDSEEK_AFDB:-$PWD/protein-viz-agent/foldseek_db/afdb_swissprot}"
+if [ -f "$FS_AFDB.dbtype" ]; then
+    export FOLDSEEK_AFDB="$FS_AFDB"
+    echo "Foldseek AlphaFold DB (Swiss-Prot) found -- FOLDSEEK_AFDB=$FOLDSEEK_AFDB"
+elif [ -n "${FOLDSEEK_BIN:-}" ]; then
+    echo "Optional: AlphaFold DB (Swiss-Prot) Foldseek database not installed -- chains with no"
+    echo "  PDB match get no predicted-model neighbours. foldseek databases Alphafold/Swiss-Prot"
+    echo "  $FS_AFDB /tmp/fs   (~1.6 GB download, ~2.4 GB on disk)"
+fi
 
 # ── 3.7. fpocket discovery (optional: find_pockets) ────────────────────────────
 # Single binary, same PATH/conda-env-name scan as DSSP.

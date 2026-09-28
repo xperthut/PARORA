@@ -907,6 +907,39 @@ def _uniprot_evidence_raw(accession: str) -> str:
     return json.dumps(data)
 
 
+@lru_cache(maxsize=256)
+def _uniprot_function_raw(accession: str) -> str:
+    """Name, organism and FUNCTION of one entry — nothing else, cached."""
+    data = _http_json("GET", UNIPROT_ENTRY.format(acc=urllib.parse.quote(accession)),
+                      params={"fields": "accession,protein_name,organism_name,"
+                                        "cc_function,reviewed"})
+    return json.dumps(data)
+
+
+def known_function(accession: str):
+    """
+    A neighbour's function, for structure-based transfer to a protein that
+    has none on file.
+
+    Returns:
+        ({"accession", "name", "organism", "function", "automatic",
+          "reviewed"}, None) or (None, error). "function" is "" when the
+        entry has no FUNCTION comment either.
+    """
+    acc = (accession or "").strip().upper()
+    try:
+        entry = json.loads(_uniprot_function_raw(acc))
+    except LookupFailed as e:
+        return None, str(e)
+    name, _ = _names_of(entry.get("proteinDescription") or {})
+    return {"accession": acc, "name": name,
+            "organism": (entry.get("organism") or {}).get("scientificName", ""),
+            "function": _function_of(entry),
+            "automatic": _function_is_automatic(entry),
+            "reviewed": "reviewed" in str(entry.get("entryType", "")).lower()
+                        and "unreviewed" not in str(entry.get("entryType", "")).lower()}, None
+
+
 def function_evidence(accession: str):
     """
     Collect what UniProt still knows about an entry that has no FUNCTION text.

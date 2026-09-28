@@ -35,6 +35,10 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 
 DEFAULT_DB = Path(__file__).resolve().parent / "foldseek_db" / "pdb"
+# Optional second database: AlphaFold models of reviewed UniProt entries
+# (`foldseek databases Alphafold/Swiss-Prot`, ~1.6 GB download). Reaches
+# proteins with no experimental structure — no CATH/SCOP behind its hits.
+DEFAULT_AFDB = Path(__file__).resolve().parent / "foldseek_db" / "afdb_swissprot"
 
 # Columns requested from easy-search, in order. alntmscore is the TM-score
 # normalised by alignment length; prob is Foldseek's probability that query
@@ -46,7 +50,8 @@ _FORMAT = ["query", "target", "fident", "alntmscore", "evalue", "prob",
 # PDB100 target names look like "7ard-assembly1.cif.gz_A" (or plain
 # "1abc_A" in custom databases); AlphaFold DB ones like "AF-P12345-F1-model_v4".
 _PDB_TARGET = re.compile(r"^([0-9][A-Za-z0-9]{3})(?:[-_.][^_]*)?_([A-Za-z0-9]+)")
-_AFDB_TARGET = re.compile(r"^AF-([A-Z0-9]+)-F\d+")
+# Isoform models carry the isoform number: "AF-O95905-3-F1-model_v6".
+_AFDB_TARGET = re.compile(r"^AF-([A-Z0-9]+(?:-\d+)?)-F\d+")
 
 _STANDARD_AA = {
     "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
@@ -98,6 +103,18 @@ def find_database():
         The database prefix as a string, or None.
     """
     for prefix in (os.getenv("FOLDSEEK_DB"), str(DEFAULT_DB)):
+        if prefix and Path(prefix + ".dbtype").exists():
+            return prefix
+    return None
+
+
+def find_afdb_database():
+    """
+    Locate the optional AlphaFold DB (Swiss-Prot) Foldseek database:
+    FOLDSEEK_AFDB env var, else DEFAULT_AFDB. None when not installed —
+    never downloaded implicitly.
+    """
+    for prefix in (os.getenv("FOLDSEEK_AFDB"), str(DEFAULT_AFDB)):
         if prefix and Path(prefix + ".dbtype").exists():
             return prefix
     return None
@@ -201,13 +218,14 @@ def parse_target(target: str) -> dict:
 
 def search(pdb_path: str, chains=None, max_hits: int = 10,
            max_evalue: float = 1e-3, exclude_pdb_id: str = "",
-           max_chains: int = 8, timeout: int = 900) -> tuple:
+           max_chains: int = 8, timeout: int = 900, db: str = "") -> tuple:
     """
     Run `foldseek easy-search` of a structure's protein chains against the
     configured database.
 
     Args:
         pdb_path  : Local .pdb file.
+        db        : Database prefix to search; empty = find_database() (PDB).
         chains    : Chain ids to search; None or empty for every protein chain.
         max_hits  : Hits kept per chain after filtering (best E-value first).
         max_evalue: Hits weaker than this are dropped — a weak hit is noise,
@@ -229,13 +247,19 @@ def search(pdb_path: str, chains=None, max_hits: int = 10,
         Never raises — a missing binary/database, a crash or a timeout all
         come back as ok=False with a message.
     """
-    ok, msg = availability()
-    if not ok:
-        return False, msg, {}
+    if db:
+        if not find_foldseek():
+            return False, availability()[1], {}
+        if not Path(db + ".dbtype").exists():
+            return False, f"Foldseek database not found: {db}", {}
+    else:
+        ok, msg = availability()
+        if not ok:
+            return False, msg, {}
     if not Path(pdb_path).exists():
         return False, f"Structure file not found: {pdb_path}", {}
 
-    exe, db = find_foldseek(), find_database()
+    exe, db = find_foldseek(), db or find_database()
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         query = tmp / "query.pdb"
@@ -303,7 +327,9 @@ def _finalize(hits: dict, groups: dict, exclude_pdb_id: str, max_hits: int) -> d
         best = {}
         for h in sorted(hits.get(ch, []), key=lambda h: h["evalue"]):
             key = h.get("pdb_id") or h.get("accession") or h["target"]
-            if (skip and key.lower() == skip) or key in best:
+            # An isoform of the query's own UniProt entry ("O95905-3") is
+            # still the query's own protein.
+            if (skip and key.lower().split("-")[0] == skip) or key in best:
                 continue
             best[key] = h
         out[ch] = {"chains": groups[ch], "hits": list(best.values())[:max_hits]}

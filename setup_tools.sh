@@ -89,6 +89,7 @@ STATUS_PYMOL="not checked"
 STATUS_DSSP="not checked"
 STATUS_FOLDSEEK="not checked"
 STATUS_FOLDSEEK_DB="not checked"
+STATUS_FOLDSEEK_AFDB="not checked"
 STATUS_FPOCKET="not checked"
 STATUS_ESM="not checked"
 STATUS_ESM_MODEL="not checked"
@@ -294,6 +295,34 @@ elif [ -n "$fs_bin" ] && [ -x "$fs_bin" ]; then
 else
     STATUS_FOLDSEEK_DB="not checked (no binary)"
 fi
+
+# Optional second database: AlphaFold models of reviewed UniProt entries.
+# Used when a chain has no PDB match (e.g. AF-O95905) or when asked for
+# AlphaFold DB explicitly. Asked separately -- another ~1.6 GB.
+FOLDSEEK_AFDB_PREFIX="${FOLDSEEK_AFDB:-$PWD/protein-viz-agent/foldseek_db/afdb_swissprot}"
+if [ -f "$FOLDSEEK_AFDB_PREFIX.dbtype" ]; then
+    echo "AlphaFold DB (Swiss-Prot) database found -- $FOLDSEEK_AFDB_PREFIX"
+    STATUS_FOLDSEEK_AFDB="found ($FOLDSEEK_AFDB_PREFIX)"
+elif [ -n "$fs_bin" ] && [ -x "$fs_bin" ]; then
+    echo "Optional AlphaFold DB (Swiss-Prot) database not found at $FOLDSEEK_AFDB_PREFIX."
+    if confirm "Download it now? ~1.6 GB download, ~2.4 GB on disk (optional)."; then
+        mkdir -p "$(dirname "$FOLDSEEK_AFDB_PREFIX")"
+        fs_tmp="$(mktemp -d)"
+        if "$fs_bin" databases Alphafold/Swiss-Prot "$FOLDSEEK_AFDB_PREFIX" "$fs_tmp"; then
+            STATUS_FOLDSEEK_AFDB="downloaded ($FOLDSEEK_AFDB_PREFIX)"
+            echo "AlphaFold DB (Swiss-Prot) database ready."
+        else
+            STATUS_FOLDSEEK_AFDB="download failed"
+            echo "Database download failed -- see the output above."
+        fi
+        rm -rf "$fs_tmp"
+    else
+        STATUS_FOLDSEEK_AFDB="skipped"
+        echo "Skipped. Later: foldseek databases Alphafold/Swiss-Prot $FOLDSEEK_AFDB_PREFIX /tmp/fs"
+    fi
+else
+    STATUS_FOLDSEEK_AFDB="not checked (no binary)"
+fi
 echo
 
 # ── 4.5. fpocket ─────────────────────────────────────────────────────────────
@@ -400,6 +429,7 @@ printf "  %-12s %s\n" "PyMOL" "$STATUS_PYMOL"
 printf "  %-12s %s\n" "DSSP" "$STATUS_DSSP"
 printf "  %-12s %s\n" "Foldseek" "$STATUS_FOLDSEEK"
 printf "  %-12s %s\n" "Foldseek DB" "$STATUS_FOLDSEEK_DB"
+printf "  %-12s %s\n" "AFDB (opt.)" "$STATUS_FOLDSEEK_AFDB"
 printf "  %-12s %s\n" "fpocket" "$STATUS_FPOCKET"
 printf "  %-12s %s\n" "ESM-2 env" "$STATUS_ESM"
 printf "  %-12s %s\n" "ESM-2 model" "$STATUS_ESM_MODEL"

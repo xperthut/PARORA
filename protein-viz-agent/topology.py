@@ -31,7 +31,7 @@ from pathlib import Path
 
 import requests
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2   # 2: lookup_classification returns every domain per chain
 
 SIFTS_BASE = "https://www.ebi.ac.uk/pdbe/api/mappings"
 
@@ -259,59 +259,220 @@ def lookup_classification(pdb_id: str, timeout: int = 10) -> dict:
         pdb_id : 4-character PDB accession.
         timeout: Seconds before giving up on each of the two requests.
 
+    Every domain of a chain is kept, not just the first: a multi-domain
+    chain (2HCK chain A: SH3, SH2 and two kinase-lobe CATH domains) would
+    otherwise report its N-terminal domain as the whole chain's fold.
+
     Returns:
-        {chain_id: {"source": "CATH", "class": ..., "architecture": ...,
-                     "topology": ..., "homology": ..., "name": ...}}
-        or the SCOP-shaped equivalent
-        ({"source": "SCOP", "class": ..., "fold": ..., "superfamily": ...,
-          "name": ...}) when only SCOP has a hit for that chain. CATH is
-        preferred over SCOP per chain when both exist — it is the more
-        actively maintained of the two. Empty dict when neither has
-        anything for this entry.
+        {chain_id: [domain, ...]}, domains ordered by where they start in
+        the chain. A CATH domain is
+        {"source": "CATH", "cath_id", "class", "architecture", "topology",
+         "homology", "name", "ranges", "seq_ranges"}; a SCOP one
+        {"source": "SCOP", "sunid", "class", "fold", "superfamily", "name",
+         "ranges", "seq_ranges"}. "ranges" are the domain's segments in
+        author residue numbers (what the file and viewer show), "seq_ranges"
+        the same segments in SIFTS residue_number (1-based position in the
+        full deposited sequence) — see pick_domains(). CATH is preferred
+        over SCOP per chain when both exist — it is the more actively
+        maintained of the two. Empty dict when neither has anything for
+        this entry.
     """
     pid = (pdb_id or "").strip().lower()
     if not pid:
         return {}
 
-    by_chain = {}
-
-    try:
-        r = requests.get(f"{SIFTS_BASE}/cath/{pid}", timeout=timeout)
-        if r.status_code == 200:
-            entry = (r.json().get(pid) or {}).get("CATH") or {}
-            for cath_id, dom in entry.items():
-                for m in dom.get("mappings", []):
-                    ch = m.get("chain_id")
-                    if ch and ch not in by_chain:
-                        by_chain[ch] = {
-                            "source": "CATH",
-                            "cath_id": cath_id,
-                            "class": dom.get("class", ""),
-                            "architecture": dom.get("architecture", ""),
-                            "topology": dom.get("topology", ""),
-                            "homology": dom.get("homology", ""),
-                            "name": dom.get("identifier", ""),
-                        }
-    except requests.RequestException:
-        pass
-
-    try:
-        r = requests.get(f"{SIFTS_BASE}/scop/{pid}", timeout=timeout)
-        if r.status_code == 200:
-            entry = (r.json().get(pid) or {}).get("SCOP") or {}
-            for sun_id, dom in entry.items():
-                for m in dom.get("mappings", []):
-                    ch = m.get("chain_id")
-                    if ch and ch not in by_chain:
-                        by_chain[ch] = {
-                            "source": "SCOP",
-                            "sunid": sun_id,
-                            "class": (dom.get("class") or {}).get("description", ""),
-                            "fold": (dom.get("fold") or {}).get("description", ""),
-                            "superfamily": (dom.get("superfamily") or {}).get("description", ""),
-                            "name": dom.get("description", ""),
-                        }
-    except requests.RequestException:
-        pass
-
+    cath = _sifts_domains(pid, "cath", timeout)
+    scop = _sifts_domains(pid, "scop", timeout)
+    by_chain = dict(cath)
+    for ch, doms in scop.items():
+        by_chain.setdefault(ch, doms)
     return by_chain
+
+
+def _sifts_domains(pid: str, source: str, timeout: int) -> dict:
+    """
+    {chain: [domain, ...]} from one SIFTS mapping endpoint ("cath"/"scop").
+
+    A domain can be split into several segments (separate mapping rows
+    sharing one domain id, e.g. CATH "1abcA02"); those are merged into one
+    domain with several ranges.
+    """
+    try:
+        r = requests.get(f"{SIFTS_BASE}/{source}/{pid}", timeout=timeout)
+        if r.status_code != 200:
+            return {}
+        entry = (r.json().get(pid) or {}).get(source.upper()) or {}
+    except (requests.RequestException, ValueError):
+        return {}
+
+    domains = {}   # (chain, domain id) -> domain dict
+    for class_id, dom in entry.items():
+        for m in dom.get("mappings", []):
+            ch = m.get("chain_id")
+            if not ch:
+                continue
+            dom_id = m.get("domain") or m.get("scop_id") or class_id
+            d = domains.get((ch, dom_id))
+            if d is None:
+                if source == "cath":
+                    d = {
+                        "source": "CATH",
+                        "cath_id": class_id,
+                        "class": dom.get("class", ""),
+                        "architecture": dom.get("architecture", ""),
+                        "topology": dom.get("topology", ""),
+                        "homology": dom.get("homology", ""),
+                        "name": dom.get("identifier", ""),
+                    }
+                else:
+                    d = {
+                        "source": "SCOP",
+                        "sunid": class_id,
+                        "class": (dom.get("class") or {}).get("description", ""),
+                        "fold": (dom.get("fold") or {}).get("description", ""),
+                        "superfamily": (dom.get("superfamily") or {}).get("description", ""),
+                        "name": dom.get("description", ""),
+                    }
+                d["ranges"], d["seq_ranges"] = [], []
+                domains[(ch, dom_id)] = d
+            start, end = m.get("start") or {}, m.get("end") or {}
+            if start.get("residue_number") is not None and end.get("residue_number") is not None:
+                d["seq_ranges"].append((start["residue_number"], end["residue_number"]))
+                d["ranges"].append((start.get("author_residue_number"),
+                                    end.get("author_residue_number")))
+
+    by_chain = {}
+    for (ch, _), d in domains.items():
+        by_chain.setdefault(ch, []).append(d)
+    for doms in by_chain.values():
+        for d in doms:
+            order = sorted(range(len(d["seq_ranges"])), key=lambda i: d["seq_ranges"][i])
+            d["seq_ranges"] = [d["seq_ranges"][i] for i in order]
+            d["ranges"] = [d["ranges"][i] for i in order]
+        doms.sort(key=lambda d: d["seq_ranges"][0] if d["seq_ranges"] else (10**9, 0))
+    return by_chain
+
+
+def uniprot_by_chain(pdb_id: str, timeout: int = 10) -> dict:
+    """
+    {chain_id: UniProt accession} for a PDB entry, from SIFTS. A chain
+    mapped to several accessions (a fusion) keeps the one covering most
+    residues. {} when the lookup fails or nothing maps.
+    """
+    pid = (pdb_id or "").strip().lower()
+    if not pid:
+        return {}
+    try:
+        r = requests.get(f"{SIFTS_BASE}/uniprot/{pid}", timeout=timeout)
+        if r.status_code != 200:
+            return {}
+        entry = (r.json().get(pid) or {}).get("UniProt") or {}
+    except (requests.RequestException, ValueError):
+        return {}
+    best = {}   # chain -> (covered residues, accession)
+    for acc, info in entry.items():
+        for m in info.get("mappings", []):
+            ch = m.get("chain_id")
+            s = (m.get("start") or {}).get("residue_number")
+            e = (m.get("end") or {}).get("residue_number")
+            if not ch or s is None or e is None:
+                continue
+            n = e - s + 1
+            if n > best.get(ch, (0, ""))[0]:
+                best[ch] = (n, acc)
+    return {ch: acc for ch, (_, acc) in best.items()}
+
+
+def observed_segments(pdb_id: str, timeout: int = 10) -> dict:
+    """
+    Which stretches of each chain's deposited sequence have coordinates,
+    from PDBe's polymer_coverage API.
+
+    Foldseek numbers a target's residues by position among the residues
+    that are actually in the file (tstart/tend), while SIFTS domain
+    boundaries use the position in the full deposited sequence. These
+    segments convert one into the other (see pick_domains).
+
+    Returns:
+        {chain_id: [(seq_start, seq_end), ...]} in sequence order, or {}
+        when the lookup fails — callers then treat the two numberings as
+        equal, which is exact whenever nothing before the aligned region
+        is missing from the model.
+    """
+    pid = (pdb_id or "").strip().lower()
+    if not pid:
+        return {}
+    try:
+        r = requests.get(f"https://www.ebi.ac.uk/pdbe/api/pdb/entry/polymer_coverage/{pid}",
+                         timeout=timeout)
+        if r.status_code != 200:
+            return {}
+        mols = (r.json().get(pid) or {}).get("molecules") or []
+    except (requests.RequestException, ValueError):
+        return {}
+
+    out = {}
+    for mol in mols:
+        for c in mol.get("chains", []):
+            ch = c.get("chain_id")
+            if not ch or ch in out:     # first copy of an author chain id only
+                continue
+            segs = []
+            for o in c.get("observed", []):
+                s = (o.get("start") or {}).get("residue_number")
+                e = (o.get("end") or {}).get("residue_number")
+                if s is not None and e is not None:
+                    segs.append((s, e))
+            out[ch] = sorted(segs)
+    return out
+
+
+def _observed_to_seq(idx: int, segments: list) -> int:
+    """1-based index among observed residues -> SIFTS residue_number."""
+    seen = 0
+    for s, e in segments:
+        n = e - s + 1
+        if idx <= seen + n:
+            return s + (idx - seen) - 1
+        seen += n
+    return segments[-1][1] if segments else idx
+
+
+def pick_domains(domains: list, tstart: int, tend: int, segments=None,
+                 min_cover: float = 0.3) -> list:
+    """
+    The domains of a hit chain that a Foldseek alignment actually covers.
+
+    Args:
+        domains : That chain's domain list from lookup_classification().
+        tstart, tend: The alignment's span on the target, as Foldseek
+                  reports it (1-based among the target's observed residues).
+        segments: That chain's observed_segments() entry, to convert
+                  tstart/tend to SIFTS numbering; None/empty = no conversion.
+        min_cover: Keep a domain only if the alignment covers at least this
+                  fraction of it, or it covers at least this fraction of the
+                  alignment — so a 20-residue overhang into the next domain
+                  does not count as aligning to it.
+
+    Returns:
+        The covered domains, most-covered first; [] when none qualifies.
+        A single-domain chain's only domain is returned whenever it
+        overlaps the alignment at all.
+    """
+    if not domains:
+        return []
+    if segments:
+        tstart, tend = _observed_to_seq(tstart, segments), _observed_to_seq(tend, segments)
+    aln_len = max(tend - tstart + 1, 1)
+    scored = []
+    for d in domains:
+        dom_len = sum(e - s + 1 for s, e in d.get("seq_ranges", [])) or 1
+        overlap = sum(max(0, min(e, tend) - max(s, tstart) + 1)
+                      for s, e in d.get("seq_ranges", []))
+        if overlap <= 0:
+            continue
+        if (len(domains) == 1 or overlap / dom_len >= min_cover
+                or overlap / aln_len >= min_cover):
+            scored.append((overlap, d))
+    scored.sort(key=lambda t: -t[0])
+    return [d for _, d in scored]

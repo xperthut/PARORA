@@ -32,10 +32,28 @@ def _resolve_host(host: str) -> str:
     return host
 
 
+def _resolve_think(raw):
+    """
+    Ollama's `think` flag for reasoning models (qwen3, ...): True/False or
+    "low"/"medium"/"high". None means "don't send it" -- non-thinking models
+    such as qwen2.5 never see the parameter.
+    """
+    if raw is None or isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in ("", "none", "null"):
+        return None
+    if s in ("true", "1", "yes", "on"):
+        return True
+    if s in ("false", "0", "no", "off"):
+        return False
+    return s
+
+
 def get_config(entry_point: str) -> dict:
     """
     Resolved Ollama settings for one entry point: "server", "app_lite" or
-    "app". Returns model, ollama_host, temperature, num_ctx, keep_alive.
+    "app". Returns model, ollama_host, temperature, num_ctx, keep_alive, think.
     """
     section = _RAW.get(entry_point, {})
     host = os.getenv("OLLAMA_HOST", _RAW.get("ollama_host", "http://localhost:11434"))
@@ -50,4 +68,6 @@ def get_config(entry_point: str) -> dict:
             "PARORA_NUM_CTX", _DEFAULTS.get("num_ctx", 16384))),
         "keep_alive": os.environ.get(
             "PARORA_KEEP_ALIVE", _DEFAULTS.get("keep_alive", "30m")),
+        "think": _resolve_think(os.environ.get(
+            "PARORA_THINK", section.get("think", _DEFAULTS.get("think")))),
     }

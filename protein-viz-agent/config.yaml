@@ -10,6 +10,9 @@
 #   PARORA_TEMPERATURE  -- sampling temperature (all entry points)
 #   PARORA_NUM_CTX      -- context window tokens (all entry points)
 #   PARORA_KEEP_ALIVE   -- how long Ollama keeps the model loaded (all entry points)
+#   PARORA_THINK        -- reasoning-model thinking: true/false/low/medium/high;
+#                          unset = flag not sent (qwen2.5 has no thinking mode).
+#                          Per-entry-point `think:` below overrides `defaults`.
 #   PARORA_MODEL_SERVER / PARORA_MODEL_APP_LITE / PARORA_MODEL_APP
 #                       -- per-entry-point model override
 #
@@ -31,5 +34,9 @@ server:
 app_lite:
   model: llama3.2:latest
 
+# app.py: qwen2.5:14b chosen by the S2 benchmark (suggestion.txt, 2026-09-28):
+# evals/run.py 97.2% vs 92.5% for 7b, median 6.2 s/turn, ~12 GB loaded.
+# qwen3:14b 96.3%, qwen2.5:32b 95.3%, qwen3:32b 97.2% at 2x the latency,
+# qwen3:8b 89.7%. num_ctx 32768 scored identically, so defaults stay 16k.
 app:
-  model: qwen2.5:7b
+  model: qwen2.5:14b

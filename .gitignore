@@ -87,3 +87,8 @@ yarn-error.log*
 # Text files
 todo.txt
 suggestion.txt
+# Eval harness run output (evals/run.py)
+evals/reports/
+
+# run.sh first-launch marker for setup_tools.sh
+.tools_checked

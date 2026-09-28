@@ -204,6 +204,10 @@ OLLAMA_OPTIONS = {"temperature": _CFG["temperature"], "num_ctx": _CFG["num_ctx"]
 # Hold the model in memory between messages, so a pause in the conversation
 # does not cost a reload from disk on the next one.
 KEEP_ALIVE = _CFG["keep_alive"]
+
+# Reasoning models (qwen3) think before every tool call unless told not to;
+# None leaves the flag unsent for models that have no thinking mode.
+THINK = _CFG["think"]
 ollama_client = Client(host=OLLAMA_HOST)
 
 
@@ -7456,6 +7460,18 @@ def _log(msg: str, level: int = logging.INFO) -> None:
     log.log(level, msg)
 
 
+def _trace(event: dict) -> None:
+    """
+    Record one tool-call decision of the current run_agent() call.
+
+    st.session_state.agent_trace is reset at the start of every request and
+    holds, in order, each call the model made: ran (with its final, gate-
+    rewritten args and result), blocked by a gate, or skipped as a duplicate.
+    Nothing in the UI reads it; evals/run.py scores the agent from it.
+    """
+    st.session_state.setdefault("agent_trace", []).append(event)
+
+
 def _progress(status, msg: str) -> None:
     """
     Mirror one high-level agent-loop step into the live "working" dialog.
@@ -7502,6 +7518,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     """
     _log(f"📨 User: {user_prompt}")
     _progress(status, "Reading your request…")
+    st.session_state.agent_trace = []
 
     # A reply to the question asked last turn: turn "2" back into the original
     # request with the chosen meaning spelled out, so every gate and the model
@@ -7702,6 +7719,7 @@ def run_agent(user_prompt: str, status=None) -> str:
                 tools=active_tools,
                 options=OLLAMA_OPTIONS,
                 keep_alive=KEEP_ALIVE,
+                think=THINK,
             )
         except ConnectionError:
             err = f"Cannot reach Ollama at {OLLAMA_HOST}. Start Ollama with `ollama serve`."
@@ -8080,7 +8098,18 @@ def run_agent(user_prompt: str, status=None) -> str:
                 status.write(f"{'✓' if ok else '✗'} {name.replace('_', ' ')}")
             _log(f"🔧 {name}({args}) → {result}", level)
             summary_parts.append(f"{name}: {result}")
-            tool_results.append({"tool": name, "result": result})
+            tool_results.append({"tool": name, "result": result,
+                                 "args": dict(args), "ms": round(elapsed_ms)})
+
+        # Every call above appended exactly one result, in call order.
+        for tc, r in zip(tool_calls, tool_results):
+            res = str(r["result"])
+            _trace({"turn": turn, "tool": r["tool"],
+                    "args": r.get("args", _tc_args(tc)),
+                    "status": ("ran" if "ms" in r else
+                               "blocked" if res.startswith("Blocked") else "skipped"),
+                    "failed": "ms" in r and bool(_TOOL_FAILED.search(res[:240])),
+                    "result": res[:800], "ms": r.get("ms")})
 
         # A question for the user (ask_user, or a tool that found the request
         # ambiguous) ends the request here: the answer decides what runs next,

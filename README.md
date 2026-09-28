@@ -67,7 +67,7 @@ The production server streams each action to the browser as an SSE event, so the
 | --- | --- |
 | Backend | [FastAPI](https://fastapi.tiangolo.com/) + [Uvicorn](https://www.uvicorn.org/) |
 | Frontend | Vanilla JS + NGL.js (single-page, no framework) |
-| LLM Runtime | [Ollama](https://ollama.com/) — `qwen2.5:7b` (`server.py`, `app.py`) and `llama3.2` (`app_lite.py`) |
+| LLM Runtime | [Ollama](https://ollama.com/) — `qwen2.5:14b` (`app.py`), `qwen2.5:7b` (`server.py`) and `llama3.2` (`app_lite.py`) |
 | Structural Analysis | [MDAnalysis](https://www.mdanalysis.org/), plus optional [AmberTools](https://ambermd.org/AmberTools.php) / [PyMOL](https://pymol.org/) / [DSSP](https://swift.cmbi.umcn.nl/gv/dssp/) |
 | 3D Visualization | [NGL.js v2](https://nglviewer.org/) (WebGL via CDN) |
 | PDB Data Source | [RCSB PDB API](https://www.rcsb.org/) (`rcsb-api`), [UniProt](https://www.uniprot.org/), [PDBe SIFTS](https://www.ebi.ac.uk/pdbe/docs/sifts/) |
@@ -145,7 +145,8 @@ curl -fsSL https://ollama.com/install.sh | sh
 **Pull the required models (all platforms)** — after installation, open a terminal and run:
 
 ```bash
-ollama pull qwen2.5:7b   # used by server.py and app.py
+ollama pull qwen2.5:14b  # used by app.py
+ollama pull qwen2.5:7b   # used by server.py
 ollama pull llama3.2     # used by app_lite.py
 ```
 
@@ -160,10 +161,10 @@ bash ollama.sh
 **Verify:**
 
 ```bash
-ollama list   # should show qwen2.5:7b and llama3.2
+ollama list   # should show qwen2.5:14b, qwen2.5:7b and llama3.2
 ```
 
-> **Note:** `qwen2.5:7b` is ~4.7 GB and `llama3.2` is ~2.0 GB. A one-time internet connection is required for this step (and for `run.sh`'s conda/pip setup, and for `describe_fold`'s CATH/SCOP lookup at runtime). Structure search and everything else runs entirely offline once models are pulled — no API keys, nothing sent to a cloud LLM provider.
+> **Note:** `qwen2.5:14b` is ~9 GB, `qwen2.5:7b` is ~4.7 GB and `llama3.2` is ~2.0 GB. A one-time internet connection is required for this step (and for `run.sh`'s conda/pip setup, and for `describe_fold`'s CATH/SCOP lookup at runtime). Structure search and everything else runs entirely offline once models are pulled — no API keys, nothing sent to a cloud LLM provider.
 
 ---
 
@@ -463,7 +464,7 @@ None of these are required — every entry point works with its documented defau
 | `PARORA_KEEP_ALIVE` | all | `30m` | How long Ollama keeps the model loaded in memory. |
 | `PARORA_MODEL_SERVER` | `server.py` | `qwen2.5:7b` | Override just this entry point's model. |
 | `PARORA_MODEL_APP_LITE` | `app_lite.py` | `llama3.2:latest` | Override just this entry point's model. |
-| `PARORA_MODEL_APP` | `app.py` | `qwen2.5:7b` | Override just this entry point's model. |
+| `PARORA_MODEL_APP` | `app.py` | `qwen2.5:14b` | Override just this entry point's model. |
 | `PARORA_LOG_LEVEL` | all | `INFO` | Logging verbosity. |
 | `PARORA_LOG_DIR` | all | `protein-viz-agent/logs/` | Where `parora.log` is written. |
 | `PACKMOL_MEMGEN` | `app.py` | auto-discovered | Path to AmberTools' `packmol-memgen`, if it lives somewhere `run.sh`/`setup_tools.sh` wouldn't find on their own. |
@@ -480,7 +481,7 @@ None of these are required — every entry point works with its documented defau
 Ensure Ollama is running. On macOS, the installer registers it as a background service; on Linux it runs as a systemd service after `curl -fsSL https://ollama.com/install.sh | sh`. Verify with `ollama list`; if it's not running, launch the desktop app or run `ollama serve`.
 
 **Model not found**
-Run `bash ollama.sh` to pull both `qwen2.5:7b` and `llama3.2` before starting any entry point.
+Run `bash ollama.sh` to pull `qwen2.5:14b`, `qwen2.5:7b` and `llama3.2` before starting any entry point.
 
 **`run.sh` says "Could not find a conda installation"**
 Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) (or Miniforge/Anaconda) first — `run.sh` looks for it at `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, or a few common system paths, but doesn't install conda itself. See [Conda](#3-conda-for-runsh-the-recommended-local-path).
@@ -489,7 +490,7 @@ Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) (or Miniforg
 On macOS, the container connects to `host.docker.internal:11434` automatically. On Linux, add `--add-host=host.docker.internal:host-gateway` to the `docker run` command in `deploy.sh`.
 
 **Slow responses**
-`qwen2.5:7b` runs on CPU by default if no compatible GPU is detected. For faster inference on Apple Silicon, ensure the Ollama version supports Metal acceleration (included by default in recent Ollama releases). The model requires approximately 6 GB of memory to run.
+`qwen2.5:14b` runs on CPU by default if no compatible GPU is detected. For faster inference on Apple Silicon, ensure the Ollama version supports Metal acceleration (included by default in recent Ollama releases). `qwen2.5:14b` needs about 12 GB of memory while loaded (16k context); on a smaller machine set `PARORA_MODEL_APP=qwen2.5:7b` (~6 GB, 92.5% vs 97.2% on the eval harness).
 
 **MDAnalysis not available**
 The `app.py` full-featured agent gracefully degrades if MDAnalysis fails to import. Re-install with `pip install MDAnalysis` in your environment.

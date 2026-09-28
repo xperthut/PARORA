@@ -63,12 +63,19 @@ if ! curl -s -o /dev/null --max-time 2 http://localhost:11434; then
     exit 1
 fi
 
-for model in qwen2.5:7b llama3.2; do
+for model in qwen2.5:14b llama3.2; do
     if ! ollama list | awk '{print $1}' | grep -qx "$model" && ! ollama list | awk '{print $1}' | grep -qx "${model}:latest"; then
         echo "Pulling $model..."
         ollama pull "$model"
     fi
 done
+
+# Optional tools: offer to install missing ones on first launch only.
+# Asks before each (multi-GB) download; skips silently without a terminal.
+# Re-run any time with: bash setup_tools.sh
+if [ ! -f .tools_checked ]; then
+    bash setup_tools.sh && touch .tools_checked
+fi
 
 # ── 3. AmberTools discovery (optional: prepare_structure / build_membrane / simulation, quantum, oniom) ──
 # `conda env list` only prints a name for envs under the currently-preferred

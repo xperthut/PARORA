@@ -6269,7 +6269,8 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "detect_salt_bridges",
-            "description": "Detect candidate salt bridges between acidic and basic residues.",
+            "description": ("Detect candidate salt bridges between acidic and basic residues. "
+                            "Not for disulfide bonds — use find_interactions."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -6290,7 +6291,8 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "detect_hydrogen_bonds",
-            "description": "Detect candidate hydrogen bonds using a distance-based donor/acceptor screen.",
+            "description": ("Detect candidate hydrogen bonds using a distance-based donor/acceptor "
+                            "screen. Not for disulfide bonds — use find_interactions."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -7663,13 +7665,29 @@ def run_agent(user_prompt: str, status=None) -> str:
                                      f"{clarify_note}Newest request: {user_prompt}")}
     ]
 
+    def _request_evidence() -> str:
+        # What this request actually saw: the user's words, scene, history and
+        # tool results — minus the retrieved few-shot examples. Their numbers
+        # belong to other prompts: "what happens if I mutate it to alanine"
+        # ran predict_mutation_effect(residue='45') off the "mutating residue
+        # 45" example, and the number gate counted 45 as user-supplied (S2a).
+        text = "\n".join(str(m.get("content", "")) for m in messages
+                         if m.get("role") == "user")
+        return text.replace(grounding, "") if grounding else text
+
     active_tools, tools_are_subset = TOOLS, False
     _log(
         f"🧰 {len(active_tools)}/{len(TOOLS)} tool schemas sent")
 
     # Gate: destructive tools only when user explicitly asked for hiding
     DESTRUCTIVE_TOOLS = {"hide_all", "hide"}
-    hide_requested = any(w in prompt_lower for w in {"hide", "clear", "remove", "delete", "clean", "erase", "reset"})
+    hide_requested = any(w in prompt_lower for w in {"hide", "clear", "remove", "delete", "clean", "erase"})
+    # "reset the view/scene" may mean start over; "reset the colors to
+    # default" does not — qwen2.5:14b answered it with hide_all + show
+    # cartoon, wiping every rep the user had drawn (S2a).
+    if "reset" in prompt_lower and not re.search(
+            r"colou?r|transparen|opacity|zoom|camera|orientation|label", prompt_lower):
+        hide_requested = True
 
     # Gate: write/side-effect tools only when explicitly requested by the user
     WRITE_TOOLS = {"save_structure", "remove_solvent", "align_structures"}
@@ -7705,6 +7723,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     show_rep_fired = False                 # True once any non-ball+stick show has executed
     protein_nudged = False                 # One retry for a tool-less protein-level answer
     fact_checked = False                   # One correction pass for unsupported facts
+    disulfide_nudged = False               # One retry for a disulfide answer with no finder run
     user_chains = {c.upper() for c in re.findall(r"\bchain\s+([A-Za-z0-9])\b", user_prompt, re.I)}
 
     for turn in range(MAX_TURNS):
@@ -7763,14 +7782,32 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "in the PDB beyond the loaded file. Call `protein_structures` (no filters) "
                     "and answer from its result, grouped by region.")})
                 continue
+            # Disulfides come from find_interactions only. For "find the
+            # disulfide bonds" on 1CRN, qwen2.5:14b ran the salt-bridge and
+            # H-bond screens, read the SG–SG line of the H-bond table and
+            # reported 2 of the 3 bonds; the fact check passed it, since
+            # CYS3/CYS40 were in that table (S2a).
+            disulfide_re = r"disulf|disulph|\bs-s\b|\bss[ -]bond|cystine"
+            if (not disulfide_nudged and st.session_state.pdb_id
+                    and (re.search(disulfide_re, prompt_lower)
+                         or re.search(disulfide_re, final_text.lower()))
+                    and not any("[find_interactions]:" in str(m.get("content", ""))
+                                for m in messages if m.get("role") == "user")):
+                disulfide_nudged = True
+                _log("↻ Disulfide answer with no find_interactions run — nudging")
+                messages.append({"role": "assistant", "content": final_text})
+                messages.append({"role": "user", "content": (
+                    "Disulfide bonds are identified only by `find_interactions` "
+                    "(types='disulfide'); the hydrogen-bond and salt-bridge screens do not "
+                    "detect them. Call find_interactions(types='disulfide') and answer from "
+                    "its result only. Do not mention this note.")})
+                continue
             # Fact check: every PDB id, accession and decimal number in the
             # reply has to appear in something this request actually saw — the
             # scene, the working context, the user's words or a tool result.
             # One chance to correct it; after that, flag what is unverified
             # rather than pass it off as fact.
-            evidence = "\n".join(str(m.get("content", "")) for m in messages
-                                 if m.get("role") == "user")
-            unsupported = _unsupported_facts(final_text, evidence)
+            unsupported = _unsupported_facts(final_text, _request_evidence())
             if unsupported and not fact_checked:
                 fact_checked = True
                 _log(f"🔎 Reply states unsupported facts {unsupported} — asking for a correction")
@@ -7969,8 +8006,7 @@ def run_agent(user_prompt: str, status=None) -> str:
             # scene, or a tool result in this request; otherwise block and
             # have the model ask.
             if name not in NUMBER_GATE_EXEMPT:
-                seen = set(re.findall(r"\d+", "\n".join(
-                    str(m.get("content", "")) for m in messages if m.get("role") == "user")))
+                seen = set(re.findall(r"\d+", _request_evidence()))
                 invented = sorted({n for k, v in args.items()
                                    if isinstance(v, str) and k not in NUMBER_GATE_FREE_ARGS
                                    for n in re.findall(r"\d+", v)} - seen, key=int)

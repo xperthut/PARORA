@@ -138,5 +138,17 @@
   {
     "prompt": "what does this uncharacterized protein do",
     "grounding": "Call protein_function (empty name reuses the last lookup). If it reports no FUNCTION annotation, say so first; give any INFERRED FUNCTION (LOW CONFIDENCE) items only as a computational guess from family/domain matches, and keep recorded GO terms (experimental codes) separate as observations. Add nothing it does not list."
+  },
+  {
+    "prompt": "what happens if I mutate it to alanine",
+    "grounding": "Applies only when the newest request names no residue ('it', 'this protein'): do not call predict_mutation_effect and do not pick a position yourself — call ask_user to ask which residue (number, and chain if there are several) should be mutated to alanine."
+  },
+  {
+    "prompt": "find the disulfide bonds",
+    "grounding": "Call find_interactions(types='disulfide') — it is the only tool that identifies disulfide bonds; detect_hydrogen_bonds and detect_salt_bridges do not. Report the bonds and their count exactly as the tool lists them."
+  },
+  {
+    "prompt": "reset the colors to default",
+    "grounding": "Colour-only request: call color(selection='protein', color='chainname') (or the default scheme) and nothing else. Do not call hide_all, hide, clear_scene or show — the user's representations stay as they are."
   }
 ]

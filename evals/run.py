@@ -26,7 +26,9 @@ Case format (one JSON object per line; '#'-lines and blank lines ignored):
               guardrail | multiturn
     groups    TOOL_GROUPS names the case exercises (coverage report)
     source    "log" (seeded from logs/parora.log) or "synthetic"
-    requires  optional: network, fpocket, foldseek, esm, dssp, pymol
+    requires  optional: network, fpocket, foldseek, esm, dssp, pymol, amber;
+              "!name" = only when that backend is absent (e.g. "!amber" for
+              the "AmberTools not installed" path)
     preload   optional list run before the first turn, without the model:
               "1CRN" (fetch_structure) or {"tool": name, "args": {...}}
     turns     list of prompts; an item may be {"prompt": ..., "expect": {...}}
@@ -67,6 +69,30 @@ CASES = HERE / "prompts.jsonl"
 REPORTS = HERE / "reports"
 COURTESY = re.compile(r"anything else|let me know|can i (help|assist) you|"
                       r"further (help|assist)", re.I)
+DISCOVERED = ("PACKMOL_MEMGEN", "DSSP_BIN", "FOLDSEEK_BIN", "FOLDSEEK_DB", "FOLDSEEK_AFDB",
+              "FPOCKET_BIN", "PYMOL_PYTHON", "ESM_PYTHON")
+
+
+def discover_tools() -> None:
+    """
+    Export what run.sh's tool discovery finds, so the eval sees the backends
+    the app does. Without it, a plain `python evals/run.py` found none of
+    AmberTools, fpocket, Foldseek or DSSP and skipped or mis-scored their cases.
+    Variables already set win.
+    """
+    import subprocess
+    script = HERE.parent / "discover_tools.sh"
+    if not script.exists():
+        return
+    try:
+        out = subprocess.run(["bash", "-c", f'source "{script}" >/dev/null 2>&1; env -0'],
+                             capture_output=True, timeout=120).stdout
+    except Exception:
+        return
+    for item in out.decode(errors="replace").split("\0"):
+        key, _, value = item.partition("=")
+        if key in DISCOVERED and value and not os.getenv(key):
+            os.environ[key] = value
 
 
 def load_cases(path: Path) -> list:
@@ -258,11 +284,13 @@ def availability() -> dict:
         "esm": lambda: (__import__("esm_tools").find_esm_python() or (None,))[0],
         "dssp": lambda: __import__("topology").find_dssp(),
         "pymol": lambda: __import__("pymol_render").find_pymol_python(),
+        "amber": lambda: __import__("simulation").available(),
     }.items():
         try:
             out[name] = bool(probe())
         except Exception:
             out[name] = False
+    out.update({f"!{k}": not v for k, v in list(out.items())})
     return out
 
 
@@ -361,7 +389,8 @@ def main():
         os.environ["PARORA_MODEL_APP"] = a.model
     if a.think:
         os.environ["PARORA_THINK"] = a.think
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    discover_tools()                      # before app.py is imported
+    stamp =dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out_dir = REPORTS / stamp
     out_dir.mkdir(parents=True, exist_ok=True)
 

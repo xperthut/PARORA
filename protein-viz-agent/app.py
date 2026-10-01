@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import re
+import shutil
 import time
 import uuid
 import requests
@@ -1657,6 +1658,706 @@ def tool_membrane_status() -> str:
             f"{minutes:.1f} minutes. {mem.summary_text(summary)} "
             f"It is at {job['output']}; load it from the Membrane tab "
             f"(the viewer copy leaves the water out).")
+
+
+# ── Simulation setup ─────────────────────────────────────────────────────────
+# One code path for the Simulate panels and the agent (suggestion.txt S3):
+# the *_ui panels collect widget values and call these; the tool_* wrappers
+# below collect tool arguments and call the same ones.
+
+PREPARED_SUFFIXES = ("_PREP", "_MEM", "_MEMBRANE")
+
+
+def default_simulation_name() -> str:
+    """The newest prepared copy in the scene, else the active structure."""
+    names = [x["pdb_id"] for x in structures()]
+    if not names:
+        return ""
+    prepared = [n for n in names if n.upper().endswith(PREPARED_SUFFIXES)]
+    if prepared:
+        return prepared[-1]
+    active = active_structure()
+    return active["pdb_id"] if active else names[0]
+
+
+def simulation_target(target: str = ""):
+    """(name, entry) to set a calculation up from; (None, None) if not loaded."""
+    entry = find_structure(target or default_simulation_name())
+    return (entry["pdb_id"], entry) if entry else (None, None)
+
+
+def write_simulation_files(files: dict, dest: Path) -> Path:
+    """
+    Write a setup's files into `dest`, and the same set as `dest`.zip.
+
+    Same value convention as sim.bundle: a Path is copied, str/bytes is content.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    for fname, content in files.items():
+        if content is None:
+            continue
+        out = dest / fname
+        if isinstance(content, Path):
+            if content.exists() and content.resolve() != out.resolve():
+                shutil.copyfile(content, out)
+        elif isinstance(content, (bytes, bytearray)):
+            out.write_bytes(content)
+        else:
+            out.write_text(str(content))
+    archive = dest.with_suffix(".zip")
+    archive.write_bytes(sim.bundle(files))
+    return archive
+
+
+def parameterize_ligand(name: str, entry: dict, code: str, charge: int,
+                        method: str = "bcc") -> dict:
+    """Run antechamber + parmchk2 on one component; stores and returns the record."""
+    work = SIMULATIONS_DIR / f"{name}_params" / code
+    ligand_pdb, _, _ = sim.extract_residue(entry["path"], code, work / f"{code}_raw.pdb")
+    mol2, frcmod, log, err = sim.run_antechamber(
+        ligand_pdb, work, code, net_charge=charge, charge_method=method)
+    stored = {
+        "mol2": mol2, "frcmod": frcmod, "charge": charge,
+        "error": err, "log": log,
+        "guessed": sim.missing_parameters(frcmod) if frcmod else [],
+    }
+    st.session_state.ligand_params[(name, code)] = stored
+    return stored
+
+
+def stored_ligand_params(name: str, entry: dict) -> tuple:
+    """([(code, mol2, frcmod)] parameterised, [codes still without parameters])."""
+    params, missing = [], []
+    for lig in sim.ligand_candidates(entry["path"]):
+        stored = st.session_state.ligand_params.get((name, lig["code"]))
+        # A prepared copy (3PTB_PREP) keeps its source's ligand coordinates,
+        # so the source's parameters apply: "parameterize BEN", then a
+        # prepare_structure the model ran itself, made setup_amber refuse.
+        base = name
+        while not (stored and not stored.get("error")):
+            suffix = next((s for s in PREPARED_SUFFIXES if base.upper().endswith(s)), None)
+            if not suffix:
+                break
+            base = base[:-len(suffix)]
+            stored = st.session_state.ligand_params.get((base, lig["code"]))
+        if stored and not stored.get("error"):
+            params.append((lig["code"], stored["mol2"], stored["frcmod"]))
+        else:
+            missing.append(lig["code"])
+    return params, missing
+
+
+def build_amber_system(name: str, entry: dict, params: list, ff: str, water: str,
+                       shape: str, buffer_a: float, salt: float, pair: str) -> dict:
+    """Write the leap script and run tleap; stores and returns the result."""
+    cation, anion, _ = sim.ION_PAIRS[pair]
+    source_pdb = entry["path"]
+    work = SIMULATIONS_DIR / f"{name}_amber"
+    work.mkdir(parents=True, exist_ok=True)
+    structure_path = source_pdb
+    combine = []
+    ligand_codes = [code for code, _, _ in params]
+    if ligand_codes:
+        # The ligand comes in from its mol2, so it has to come out of the
+        # PDB: antechamber renames atoms when it reads real bond orders,
+        # and leap matches residues by atom name.
+        stripped = work / (Path(source_pdb).stem + "_noligand.pdb")
+        structure_path, _ = sim.strip_components(source_pdb, ligand_codes, stripped)
+        combine = [(code, mol2) for code, mol2, _ in params]
+    # tleap reads CONECT records as covalent bonds (unprepared 3PTB: "no bond
+    # parameter for Ca2+ - OW"); the script's disulfide bond commands need
+    # CYX, which only prepare_structure renamed (SH - SH otherwise), and
+    # sequential numbering, without which tleap_script comments them out
+    # (3PTB's chymotrypsin numbering: 12 CYX, zero S-S bonds). Fix those three
+    # and change nothing else, so an unprepared file builds too.
+    leap_in, _ = prp.prepare(structure_path, work / (Path(structure_path).stem + "_leapin.pdb"),
+                             altloc="keep", keep_waters=True, keep_ions=True,
+                             keep_ligands=True, keep_additives=True, hydrogens="keep",
+                             cys_to_cyx=True, renumber=True)
+    structure_path = leap_in or structure_path
+    finding = prp.inspect(structure_path)
+    script = prp.tleap_script(
+        structure_path, finding, unit="prot", ff=ff, water=water,
+        solvate=True, box=buffer_a, box_shape=shape,
+        neutralise=True, cation=cation, anion=anion,
+        ion_counts=sim.ion_counts(
+            sim.estimate_waters(structure_path, buffer_a, shape), salt,
+            cation, anion, sim.estimate_charge(structure_path)),
+        ligand_params=params, combine_units=combine,
+        lipid=bool(mem.membrane_planes(structure_path)),
+        outputs=("system.prmtop", "system.inpcrd"))
+    extra = [structure_path] + [p for _, m, f in params for p in (m, f)]
+    result = sim.run_tleap(script, work, extra_files=extra)
+    result["script"] = script
+    result["name"] = name
+    st.session_state.amber_build = result
+    return result
+
+
+def amber_run_files(entry: dict, build, params: list, temperature: float,
+                    pressure: float, ns: float, engine: str) -> dict:
+    """The five mdin stages, run.sh, and the topology when `build` succeeded."""
+    is_membrane = bool(mem.membrane_planes(entry["path"]))
+    files = {filename: sim.amber_mdin(stage, membrane_system=is_membrane,
+                                      temperature=temperature, pressure=pressure,
+                                      nanoseconds=ns)
+             for filename, stage in sim.AMBER_STAGES}
+    if build and build.get("ok"):
+        files["system.prmtop"] = Path(build["prmtop"])
+        files["system.inpcrd"] = Path(build["inpcrd"])
+        files["build.leap"] = build.get("script", "")
+        files["leap.log"] = build["log"]
+        for code, mol2, frcmod in params:
+            files[f"{code}.mol2"] = Path(mol2)
+            files[f"{code}.frcmod"] = Path(frcmod)
+    files["run.sh"] = sim.amber_run_script("system.prmtop", "system.inpcrd", engine)
+    return files
+
+
+def gromacs_run_files(entry: dict, temperature: float, pressure: float,
+                      ns: float) -> dict:
+    """em/nvt/npt/md .mdp files plus the topology-conversion README."""
+    is_membrane = bool(mem.membrane_planes(entry["path"]))
+    files = {filename: sim.gromacs_mdp(stage, temperature, pressure, ns,
+                                       membrane_system=is_membrane)
+             for filename, stage in sim.GROMACS_STAGES}
+    files["README.txt"] = sim.GROMACS_CONVERSION_NOTE
+    return files
+
+
+def rosetta_job_files(name: str, entry: dict, code: str, chain: str,
+                      nstruct: int) -> dict:
+    """Ligand-docking XML, options, params command, README, the structure, mol2 if any."""
+    files = {
+        "dock.xml": sim.rosetta_ligand_docking_xml(code, chain),
+        "dock.options": sim.rosetta_options(Path(entry["path"]).name, code, nstruct),
+        "params_command.txt": sim.rosetta_params_command(code),
+        "README.txt": sim.ROSETTA_README,
+        Path(entry["path"]).name: Path(entry["path"]),
+    }
+    stored = st.session_state.ligand_params.get((name, code))
+    if stored and not stored.get("error"):
+        files[f"{code}.mol2"] = Path(stored["mol2"])
+    return files
+
+
+def build_qm_region(name: str, entry: dict, codes: list, residue_keys: list,
+                    side_chains_only: bool, center_keys=None) -> dict:
+    """Cut the QM cluster out; stores and returns the region."""
+    region = qm.build_region(entry["path"], center_codes=codes, center_keys=center_keys,
+                             residue_keys_wanted=residue_keys,
+                             side_chains_only=side_chains_only)
+    region["name"] = name
+    st.session_state.qm_region = region
+    return region
+
+
+def qm_input_files(region: dict, charge: int, multiplicity: int, method: str,
+                   basis: str, job: str, solvent: str, processors: int,
+                   memory_gb: int, freeze: bool) -> dict:
+    """Gaussian, ORCA, Psi4 and xyz inputs for one region, plus its notes."""
+    return {
+        "region.gjf": qm.gaussian_input(region, charge, multiplicity, method, basis,
+                                         job, solvent, processors, memory_gb, freeze),
+        "region.inp": qm.orca_input(region, charge, multiplicity, method, basis,
+                                     job, solvent, processors, memory_gb * 1000 // 8,
+                                     freeze),
+        "region.psi4": qm.psi4_input(region, charge, multiplicity, method, basis,
+                                      job, memory_gb),
+        "region.xyz": qm.xyz_file(region),
+        "region_notes.txt": qm.region_report(region),
+    }
+
+
+def oniom_pairing(build: dict):
+    """(leap_pdb, paired, error) for a successful Amber build."""
+    # The file this build's own `savepdb` wrote: a glob picked a stale
+    # *_leap.pdb from an earlier build of another input name (38,414 vs
+    # 38,454 atoms on 3PTB).
+    saved = re.search(r"^savepdb\s+\S+\s+(\S+)", build.get("script", ""), re.M)
+    leap_pdbs = ([Path(build["dir"]) / saved.group(1)] if saved else
+                 sorted(Path(build["dir"]).glob("*_leap.pdb"),
+                        key=lambda p: p.stat().st_mtime, reverse=True))
+    leap_pdbs = [p for p in leap_pdbs if p.exists()]
+    if not leap_pdbs:
+        return None, None, ("The build directory has no leap-written PDB. Rebuild the "
+                            "topology — `savepdb` is what makes the atom order match.")
+    paired = oniom.pair_with_structure(leap_pdbs[0], oniom.read_topology(build["prmtop"]))
+    if not paired["ok"]:
+        return leap_pdbs[0], None, paired["error"]
+    return leap_pdbs[0], paired, None
+
+
+def build_oniom_model(build: dict, paired: dict, codes: list, residue_keys: list,
+                      side_chains_only: bool, sphere: float) -> dict:
+    """Assign QM/MM layers and the boundary; stores and returns the model."""
+    layered = oniom.assign_layers(paired, residue_keys, high_codes=codes,
+                                  side_chains_only=side_chains_only,
+                                  sphere_radius=sphere)
+    model = {
+        "layered": layered,
+        "boundary": oniom.find_boundary(layered),
+        "bonds": oniom.topology_bonds(build["prmtop"]),
+        "name": build.get("name"),
+    }
+    st.session_state.oniom_model = model
+    return model
+
+
+def oniom_input_files(model: dict, method: str, embedding: str, job: str,
+                      charge: int, multiplicity: int, processors: int,
+                      freeze_mm: bool) -> dict:
+    """The Gaussian ONIOM input and its notes."""
+    layered, boundary = model["layered"], model["boundary"]
+    text = oniom.gaussian_oniom_input(
+        layered, boundary, method, embedding, charge, multiplicity,
+        job=job, freeze_mm=freeze_mm, processors=processors, bonds=model["bonds"])
+    return {"oniom.gjf": text, "oniom_notes.txt": oniom.report(layered, boundary)}
+
+
+# ── Simulation setup: agent tools ────────────────────────────────────────────
+
+def _pick_option(value, options, default: str = ""):
+    """Case/punctuation-insensitive match of `value` to a key of `options`."""
+    if not _given(value):
+        return default
+    norm = lambda s: re.sub(r"[^a-z0-9+]", "", str(s).lower())
+    want = norm(value)
+    return next((k for k in options if norm(k) == want), None)
+
+
+def _bad_option(what: str, value, options) -> str:
+    return (f"Error: unknown {what} '{value}'. Options: " + ", ".join(options) + ".")
+
+
+# Common words for components whose dictionary name does not contain them
+# (HEM is "PROTOPORPHYRIN IX CONTAINING FE").
+_LIGAND_WORDS = {
+    "heme": {"HEM", "HEC", "HEA", "HEB"}, "haem": {"HEM", "HEC", "HEA", "HEB"},
+    "hemes": {"HEM", "HEC", "HEA", "HEB"},
+}
+
+
+def _pick_ligand(entry: dict, code: str, purpose: str):
+    """
+    (code, None) for the component to use, or (None, message).
+
+    Empty `code` means "the ligand": the only component, or the only one that
+    is not a crystallisation additive; several real candidates → ask_user.
+    """
+    candidates = sim.ligand_candidates(entry["path"])
+    if code:
+        hit = next((c for c in candidates if c["code"].upper() == str(code).strip().upper()), None)
+        if hit:
+            return hit["code"], None
+        # A word for the ligand instead of its code: qwen2.5:14b sent
+        # setup_qm(center='HEME') for "QM around the heme" on 4HHB (HEM).
+        word = str(code).strip().upper()
+        codes = _LIGAND_WORDS.get(word.lower(), set())
+        named = [c for c in candidates
+                 if c["code"] in codes
+                 or (len(c["code"]) >= 3 and word.startswith(c["code"]))
+                 or (len(word) >= 4 and word in str(c.get("name", "")).upper())]
+        if len({c["code"] for c in named}) == 1:
+            return named[0]["code"], None
+        have = ", ".join(c["code"] for c in candidates) or "none"
+        return None, (f"Error: {entry['pdb_id']} has no component '{code}'. "
+                      f"Components that could be used: {have}.")
+    if not candidates:
+        return None, (f"{entry['pdb_id']} has no ligand or cofactor to {purpose} — "
+                      f"nothing was set up.")
+    real = [c for c in candidates if c["kind"] != "additive"] or candidates
+    if len(real) == 1:
+        return real[0]["code"], None
+    return None, ask_clarification(
+        f"{entry['pdb_id']} has several components. Which one should I {purpose}?",
+        [{"label": f"{c['code']} — {srep.pretty_chemical(c['name']) or c['kind']}",
+          "meaning": f"use {c['code']}"} for c in real])
+
+
+def _unprepared_note(name: str) -> str:
+    if name.upper().endswith(PREPARED_SUFFIXES):
+        return ""
+    return (f"Note: {name} is not a prepared copy — alternate conformations, extra "
+            f"NMR states and additives become clashes here, not errors. Run "
+            f"prepare_structure first for a production setup. ")
+
+
+def _dictionary_charge(code: str):
+    """Formal charge from the PDB chemical dictionary, or None if unknown."""
+    try:
+        info = sim.chem_component(code) or {}
+    except Exception:
+        return None
+    q = info.get("charge")
+    return int(q) if q is not None else None
+
+
+def _dictionary_note(code: str) -> str:
+    q = _dictionary_charge(code)
+    if q is None:
+        return f"The PDB chemical dictionary records no charge for {code}."
+    return (f"The PDB chemical dictionary records {q:+d} for the deposited form, which "
+            f"is not necessarily its state at pH 7.")
+
+
+def _files_line(files: dict, dest: Path, archive: Path) -> str:
+    return (f"Files written to {dest}/ ({', '.join(sorted(files))}); "
+            f"the same set zipped as {archive}.")
+
+
+def tool_parameterize_ligand(ligand: str = "", net_charge=None,
+                             charge_method: str = "bcc", target: str = "") -> str:
+    """
+    GAFF2 parameters and AM1-BCC charges for one ligand (antechamber + parmchk2).
+
+    The net charge is never guessed: the user's number, else ask. The PDB
+    chemical dictionary's value is quoted in the question, not used — it is
+    the deposited form (ATP is recorded as 0, not -4 at pH 7).
+    """
+    if not structures():
+        return "No structure is loaded — fetch one first."
+    tools = sim.tools_available()
+    if not (tools["antechamber"] and tools["parmchk2"]):
+        return ("Cannot parameterise: AmberTools (antechamber, parmchk2) is not "
+                "installed here. Install it with setup_tools.sh, then ask again.")
+    name, entry = simulation_target(target)
+    if not entry:
+        return f"No structure called '{target}' is loaded."
+    code, msg = _pick_ligand(entry, ligand, "parameterise")
+    if not code:
+        return msg
+    method = _pick_option(charge_method, {"bcc": 0, "gas": 0}, "bcc")
+    if not method:
+        return _bad_option("charge method", charge_method, ["bcc", "gas"])
+
+    if not _given(net_charge):
+        return ask_clarification(
+            f"What net charge should {code} have? antechamber builds whatever charge "
+            f"it is given. {_dictionary_note(code)}", [])
+    charge = int(_num(net_charge, 0))
+
+    stored = parameterize_ligand(name, entry, code, charge, method)
+    if stored.get("error"):
+        return f"antechamber failed on {code} in {name}: {stored['error']}"
+    out = [f"Parameterised {code} in {name} with GAFF2 and "
+           f"{'AM1-BCC' if method == 'bcc' else 'Gasteiger'} charges, net charge "
+           f"{charge:+d} (given): {Path(stored['mol2']).name} and "
+           f"{Path(stored['frcmod']).name} in {Path(stored['mol2']).parent}/."]
+    note = (stored.get("log") or "").splitlines()
+    if note and "hydrogens were added" in note[0]:
+        shift = [n for n in note[1:4] if n.startswith("To reach the stated net charge")]
+        out.append(" ".join([note[0]] + shift)
+                   + " Check that this is the protonation state intended.")
+    if stored["guessed"]:
+        out.append(f"parmchk2 guessed {len(stored['guessed'])} parameter(s) it had no "
+                   f"data for — check the geometry after minimisation.")
+    if method == "gas":
+        out.append("Gasteiger charges are crude: fine to test a setup, not for production.")
+    return " ".join(out)
+
+
+def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
+                     water_model: str = "", box_shape: str = "octahedron",
+                     buffer: float = 12.0, salt_concentration: float = 0.15,
+                     ions: str = "Na+/Cl-", temperature: float = 300.0,
+                     pressure: float = 1.0, nanoseconds: float = 100.0,
+                     engine: str = "pmemd.cuda") -> str:
+    """
+    Build an Amber system with tleap and write the run inputs.
+
+    Topology + coordinates (solvated, neutralised, salted), the five mdin
+    stages (two minimisations, heating, NPT equilibration, production) and a
+    run.sh. Without tleap the run inputs are still written, and the result
+    says the topology was not built.
+    """
+    if not structures():
+        return "No structure is loaded — fetch one first."
+    name, entry = simulation_target(target)
+    if not entry:
+        return f"No structure called '{target}' is loaded."
+    ff = _pick_option(force_field, sim.PROTEIN_FFS, "ff19SB")
+    if not ff:
+        return _bad_option("force field", force_field, sim.PROTEIN_FFS)
+    water = _pick_option(water_model, sim.WATER_MODELS, sim.PROTEIN_FFS[ff]["water"])
+    if not water:
+        return _bad_option("water model", water_model, sim.WATER_MODELS)
+    shape = _pick_option(box_shape, sim.BOX_SHAPES, "octahedron")
+    if not shape:
+        return _bad_option("box shape", box_shape, sim.BOX_SHAPES)
+    pair = _pick_option(ions, sim.ION_PAIRS, "Na+/Cl-") or {
+        "nacl": "Na+/Cl-", "na": "Na+/Cl-", "sodium": "Na+/Cl-",
+        "kcl": "K+/Cl-", "k": "K+/Cl-", "potassium": "K+/Cl-",
+    }.get(re.sub(r"[^a-z]", "", str(ions).lower()))
+    if not pair:
+        return _bad_option("ion pair", ions, sim.ION_PAIRS)
+    engines = ["pmemd.cuda", "pmemd.MPI", "sander"]
+    eng = _pick_option(engine, engines, "pmemd.cuda")
+    if not eng:
+        return _bad_option("engine", engine, engines)
+    buffer_a = min(max(_num(buffer, 12.0), 8.0), 25.0)
+    salt = min(max(_num(salt_concentration, 0.15), 0.0), 1.0)
+    temp = _num(temperature, 300.0)
+    press = _num(pressure, 1.0)
+    ns = _num(nanoseconds, 100.0)
+
+    params, missing = stored_ligand_params(name, entry)
+    tleap = sim.tools_available()["tleap"]
+    if tleap and missing:
+        return (f"Cannot build the Amber topology for {name} yet: {', '.join(missing)} "
+                f"has no parameters. Call parameterize_ligand for each (it needs the "
+                f"net charge), or prepare the structure without ligands.")
+
+    out = [_unprepared_note(name).strip()] if _unprepared_note(name) else []
+    build = None
+    if tleap:
+        build = build_amber_system(name, entry, params, ff, water, shape,
+                                   buffer_a, salt, pair)
+        if build["ok"]:
+            out.append(
+                f"Built the Amber system for {name} ({ff}, {water}, {shape} box, "
+                f"{buffer_a:g} Å buffer, {salt:g} M {pair}): {build['atoms']:,} atoms, "
+                f"{build['residues']:,} residues, {build['waters']:,} waters, net charge "
+                f"{build['charge']:+.3f}, {build['disulfides']} disulfide(s).")
+            if abs(build["charge"]) > 0.01:
+                out.append(f"WARNING: the system is not neutral ({build['charge']:+.3f}) — "
+                           f"check the ion counts and the ligand charges.")
+        else:
+            errs = "; ".join(build["errors"][:3]) or "see leap.log"
+            out.append(f"tleap failed to build a topology for {name}: {errs}")
+    files = amber_run_files(entry, build, params, temp, press, ns, eng)
+    dest = SIMULATIONS_DIR / f"{name}_amber"
+    archive = write_simulation_files(files, dest)
+    out.append(f"Run inputs: two minimisations, heating to {temp:g} K, NPT "
+               f"equilibration at {press:g} bar, {ns:g} ns production, run.sh for "
+               f"{eng}. " + _files_line(files, dest, archive))
+    if not tleap:
+        out.append("NO topology: AmberTools (tleap) is not installed here, so "
+                   "system.prmtop/system.inpcrd were NOT built — install AmberTools "
+                   "(setup_tools.sh) and ask again.")
+        if missing:
+            out.append(f"{', '.join(missing)} will also need parameters (parameterize_ligand).")
+    return " ".join(out)
+
+
+def tool_setup_gromacs(target: str = "", temperature: float = 300.0,
+                       pressure: float = 1.0, nanoseconds: float = 100.0) -> str:
+    """GROMACS .mdp files (em, nvt, npt, md). No topology — the README says how."""
+    if not structures():
+        return "No structure is loaded — fetch one first."
+    name, entry = simulation_target(target)
+    if not entry:
+        return f"No structure called '{target}' is loaded."
+    temp = _num(temperature, 300.0)
+    press = _num(pressure, 1.0)
+    ns = _num(nanoseconds, 100.0)
+    files = gromacs_run_files(entry, temp, press, ns)
+    dest = SIMULATIONS_DIR / f"{name}_gromacs"
+    archive = write_simulation_files(files, dest)
+    membrane = mem.membrane_planes(entry["path"])
+    return (_unprepared_note(name)
+            + f"Wrote GROMACS run parameters for {name}: energy minimisation, NVT "
+            f"and NPT equilibration, and {ns:g} ns production at {temp:g} K, "
+            f"{press:g} bar ({'semi-isotropic, membrane' if membrane else 'isotropic'} "
+            f"pressure coupling). " + _files_line(files, dest, archive)
+            + " No GROMACS topology was made: PARORA does not build one. README.txt "
+            "has the commands — pdb2gmx on the prepared PDB, or convert an Amber "
+            "topology (setup_amber) with ParmEd/acpype.")
+
+
+def tool_setup_rosetta_docking(target: str = "", ligand: str = "",
+                               ligand_chain: str = "X", nstruct: int = 100) -> str:
+    """RosettaLigand docking job files. Written, not run: Rosetta is not installed."""
+    if not structures():
+        return "No structure is loaded — fetch one first."
+    name, entry = simulation_target(target)
+    if not entry:
+        return f"No structure called '{target}' is loaded."
+    code, msg = _pick_ligand(entry, ligand, "dock")
+    if not code:
+        return msg
+    chain = (str(ligand_chain or "X").strip() or "X")[:1].upper()
+    n = min(max(int(_num(nstruct, 100)), 1), 100000)
+    files = rosetta_job_files(name, entry, code, chain, n)
+    dest = SIMULATIONS_DIR / f"{name}_rosetta"
+    archive = write_simulation_files(files, dest)
+    out = [f"Wrote RosettaLigand docking files for {code} in {name} (ligand chain "
+           f"{chain}, {n} output structures). " + _files_line(files, dest, archive),
+           "Rosetta is not installed here, so the job is written, not run — "
+           "README.txt has the commands."]
+    if f"{code}.mol2" not in files:
+        out.append(f"No {code}.mol2 yet: params_command.txt needs one "
+                   f"(parameterize_ligand makes it).")
+    prepared = st.session_state.prepared.get(re.sub(r"_PREP$", "", name, flags=re.I))
+    if not prepared or prepared.get("profile") != "rosetta":
+        out.append("Prepare it with the rosetta profile first: mixed deposited and "
+                   "rebuilt hydrogens cause duplicate-atom errors.")
+    return " ".join(out)
+
+
+def _region_keys(path, code: str, radius: float, center_keys=None) -> list:
+    if radius <= 0:
+        return []
+    near = (qm.residues_near(path, center_keys=center_keys, radius=radius) if center_keys
+            else qm.residues_near(path, center_codes=[code], radius=radius))
+    return [key for key, _, _ in near]
+
+
+def _copy_keys(path, code: str) -> list:
+    """Residue keys of every copy of component `code`, in file order."""
+    atoms = mz.read_atoms(path)
+    keys = []
+    for key, res in zip(qm.residue_keys(atoms), atoms["resname"]):
+        if res.upper() == code and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _residue_names(region: dict, limit: int = 25) -> str:
+    names = [f"{res}{key[1]}{key[2]}({key[0]})" for key, res in region["residues"]]
+    more = f" and {len(names) - limit} more" if len(names) > limit else ""
+    return ", ".join(names[:limit]) + more
+
+
+def tool_setup_qm(target: str = "", center: str = "", chain: str = "",
+                  radius: float = 4.0,
+                  side_chains_only: bool = True, charge=None, multiplicity: int = 1,
+                  method: str = "B3LYP-D3", basis: str = "6-31G(d)",
+                  job: str = "opt freq", solvent: str = "none", cores: int = 8,
+                  memory_gb: int = 16) -> str:
+    """
+    Cut a QM cluster model around a ligand and write Gaussian/ORCA/Psi4 inputs.
+
+    Charge: the user's number, else ask — quoting the residues' formal charge
+    sum and the dictionary's value for the ligand, never adding them up
+    silently. Several copies
+    of the ligand (4HHB's four hemes) and no chain given → ask which one.
+    """
+    if not structures():
+        return "No structure is loaded — fetch one first."
+    name, entry = simulation_target(target)
+    if not entry:
+        return f"No structure called '{target}' is loaded."
+    code, msg = _pick_ligand(entry, center, "centre the QM region on")
+    if not code:
+        return msg
+    meth = _pick_option(method, qm.METHODS, "B3LYP-D3")
+    if not meth:
+        return _bad_option("method", method, qm.METHODS)
+    bas = _pick_option(basis, qm.BASIS_SETS, "6-31G(d)")
+    if not bas:
+        return _bad_option("basis set", basis, qm.BASIS_SETS)
+    jb = _pick_option(job, qm.JOB_TYPES, "opt freq")
+    if not jb:
+        return _bad_option("job type", job, qm.JOB_TYPES)
+    solv = _pick_option(solvent, qm.SOLVENT_MODELS, "none")
+    if not solv:
+        return _bad_option("solvent model", solvent, qm.SOLVENT_MODELS)
+    r = min(max(_num(radius, 4.0), 0.0), 12.0)
+
+    copies = _copy_keys(entry["path"], code)
+    ch = str(chain or "").strip().upper()
+    if ch == "ALL" or len(copies) <= 1:
+        keys = None
+    elif ch:
+        keys = [k for k in copies if str(k[0]).upper() == ch]
+        if not keys:
+            return (f"Error: {code} in {name} is in chain(s) "
+                    f"{', '.join(sorted({str(k[0]) for k in copies}))}, not {ch}.")
+    else:
+        opts = [{"label": f"{code} {k[1]}{k[2]} in chain {k[0]}",
+                 "meaning": f"use the {code} copy in chain {k[0]}"} for k in copies[:4]]
+        opts.append({"label": f"All {len(copies)} copies together",
+                     "meaning": f"use all copies of {code} (chain='all')"})
+        return ask_clarification(
+            f"{name} has {len(copies)} copies of {code}. Which one should the QM "
+            f"region be built around?", opts)
+
+    region = build_qm_region(name, entry, [code] if keys is None else [],
+                             _region_keys(entry["path"], code, r, keys),
+                             bool(side_chains_only), center_keys=keys)
+    if not _given(charge):
+        return ask_clarification(
+            f"What total charge should the QM region around {code} have? Its "
+            f"{len(region['residues'])} residues carry {region['charge']:+d} at neutral "
+            f"pH; {code}'s own charge is not in that sum. {_dictionary_note(code)}", [])
+    total = int(_num(charge, 0))
+    charge_note = f"charge {total:+d} (given)"
+    mult = max(int(_num(multiplicity, 1)), 1)
+
+    files = qm_input_files(region, total, mult, meth, bas, jb, solv,
+                           max(int(_num(cores, 8)), 1), max(int(_num(memory_gb, 16)), 1),
+                           True)
+    dest = SIMULATIONS_DIR / f"{name}_qm"
+    dest.mkdir(parents=True, exist_ok=True)
+    files["region.pdb"] = Path(qm.region_pdb(region, dest / "region.pdb"))
+    archive = write_simulation_files(files, dest)
+    where = f" in chain {ch}" if keys else (f" (all {len(copies)} copies)" if len(copies) > 1 else "")
+    out = [f"Built a QM cluster model of {name} around {code}{where} "
+           f"({'residues within ' + format(r, 'g') + ' Å' if r else 'the ligand alone'}, "
+           f"{'side chains only' if side_chains_only else 'whole residues'}): "
+           f"{len(region['atoms'])} atoms incl. {len(region['links'])} link hydrogens, "
+           f"formula {region['formula']}, {charge_note}, multiplicity {mult}."]
+    if region["residues"]:
+        out.append(f"Residues: {_residue_names(region)}.")
+    out.append(f"Level: {meth}/{bas}, job '{jb}', solvent {solv}, link atoms frozen. "
+               + _files_line(files, dest, archive))
+    out += [f"Caution: {w}" for w in region["warnings"]]
+    return " ".join(out)
+
+
+def tool_setup_oniom(center: str = "", radius: float = 4.0,
+                     side_chains_only: bool = True, mm_radius: float = 15.0,
+                     method: str = "B3LYP/6-31G(d):Amber",
+                     embedding: str = "electronic", job: str = "opt",
+                     charge=None, multiplicity: int = 1, cores: int = 8) -> str:
+    """
+    A Gaussian ONIOM (QM/MM) input on the Amber system built by setup_amber.
+
+    MM atom types and charges come from that topology, so it must exist.
+    """
+    build = st.session_state.amber_build
+    if not (build and build.get("ok")):
+        return ("Cannot set up ONIOM yet: it needs an Amber topology for the MM "
+                "layer's atom types and charges. Build one first with setup_amber "
+                "(needs AmberTools and, for a ligand, parameterize_ligand).")
+    meth = _pick_option(method, oniom.ONIOM_METHODS, "B3LYP/6-31G(d):Amber")
+    if not meth:
+        return _bad_option("ONIOM method", method, oniom.ONIOM_METHODS)
+    emb = _pick_option(embedding, oniom.EMBEDDING, "electronic")
+    if not emb:
+        return _bad_option("embedding", embedding, oniom.EMBEDDING)
+    jb = _pick_option(job, ["opt", "sp", "opt freq"], "opt")
+    if not jb:
+        return _bad_option("job type", job, ["opt", "sp", "opt freq"])
+    leap_pdb, paired, err = oniom_pairing(build)
+    if err:
+        return f"Cannot set up ONIOM: {err}"
+    code, msg = _pick_ligand({"path": str(leap_pdb), "pdb_id": build.get("name", "")},
+                             center, "put in the QM layer")
+    if not code:
+        return msg
+    r = min(max(_num(radius, 4.0), 0.0), 12.0)
+    sphere = min(max(_num(mm_radius, 15.0), 0.0), 30.0)
+    model = build_oniom_model(build, paired, [code], _region_keys(leap_pdb, code, r),
+                              bool(side_chains_only), sphere)
+    layered = model["layered"]
+    q = int(_num(charge, 0)) if _given(charge) else int(round(layered["charge_high"]))
+    mult = max(int(_num(multiplicity, 1)), 1)
+    files = oniom_input_files(model, meth, emb, jb, q, mult,
+                              max(int(_num(cores, 8)), 1), True)
+    dest = SIMULATIONS_DIR / f"{build.get('name', 'system')}_oniom"
+    archive = write_simulation_files(files, dest)
+    n_copies = len(_copy_keys(leap_pdb, code))
+    return (f"Built an ONIOM model on {build.get('name')}'s Amber system around {code}"
+            f"{f' (all {n_copies} copies are in the QM layer)' if n_copies > 1 else ''}: "
+            f"{layered['high']} QM atoms, {layered['low']} MM atoms "
+            f"({'MM layer within ' + format(sphere, 'g') + ' Å' if sphere else 'whole system'}), "
+            f"{layered['dropped']} left out, {len(model['boundary'])} link atoms. "
+            f"{meth}, {emb} embedding, job '{jb}', QM charge {q:+d} "
+            f"({'given' if _given(charge) else 'from the topology partial charges'}), "
+            f"multiplicity {mult}, MM layer frozen. Residue numbers are leap's (from 1). "
+            + _files_line(files, dest, archive))
 
 
 DEFAULT_REPS = [
@@ -5729,6 +6430,140 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "parameterize_ligand",
+            "description": (
+                "Make GAFF2 force-field parameters and AM1-BCC charges for a ligand "
+                "with antechamber (mol2 + frcmod), needed before setup_amber can build "
+                "a system that contains it. Use for 'parameterize the ligand', "
+                "'make GAFF parameters for HEM', 'the ligand has charge -1'. Pass "
+                "net_charge ONLY if the user stated it; otherwise leave it out."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "ligand": {"type": "string", "description": "3-letter component code, e.g. BEN; empty for the structure's only ligand"},
+                "net_charge": {"type": "integer", "description": "net formal charge, only if the user said it"},
+                "charge_method": {"type": "string", "enum": ["bcc", "gas"],
+                                  "description": "bcc = AM1-BCC (default); gas = Gasteiger, quick test only"},
+                "target": {"type": "string", "description": "structure; empty for the prepared copy or the active one"}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "setup_amber",
+            "description": (
+                "Set up an Amber molecular dynamics run: build the solvated, "
+                "neutralised topology with tleap and write the minimisation, heating, "
+                "equilibration and production inputs plus run.sh. Use for 'set up an "
+                "Amber MD run', 'build an Amber topology', 'run 50 ns of MD in Amber', "
+                "'solvate it in a TIP3P box'. Writes files; answers about which force "
+                "field or settings to use need no tool."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "structure; empty for the prepared copy or the active one"},
+                "force_field": {"type": "string", "enum": ["ff19SB", "ff14SB", "ff15ipq"]},
+                "water_model": {"type": "string", "enum": ["opc", "tip3p", "tip4pew", "spce"],
+                                "description": "empty for the force field's own water model"},
+                "box_shape": {"type": "string", "enum": ["octahedron", "cubic"]},
+                "buffer": {"type": "number", "description": "solute-to-box-edge clearance in Å, default 12"},
+                "salt_concentration": {"type": "number", "description": "molar, default 0.15"},
+                "ions": {"type": "string", "enum": ["Na+/Cl-", "K+/Cl-"]},
+                "temperature": {"type": "number", "description": "kelvin, default 300"},
+                "pressure": {"type": "number", "description": "bar, default 1"},
+                "nanoseconds": {"type": "number", "description": "production length in ns, default 100"},
+                "engine": {"type": "string", "enum": ["pmemd.cuda", "pmemd.MPI", "sander"]}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "setup_gromacs",
+            "description": (
+                "Write GROMACS run-parameter files (em.mdp, nvt.mdp, npt.mdp, md.mdp) "
+                "for an MD run of the structure. Use for 'set up a 100 ns GROMACS run', "
+                "'give me GROMACS mdp files at 310 K'. Does not build a GROMACS "
+                "topology; the README it writes says how."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "structure; empty for the prepared copy or the active one"},
+                "temperature": {"type": "number", "description": "kelvin, default 300"},
+                "pressure": {"type": "number", "description": "bar, default 1"},
+                "nanoseconds": {"type": "number", "description": "production length in ns, default 100"}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "setup_rosetta_docking",
+            "description": (
+                "Write RosettaLigand docking job files (dock.xml, options, params "
+                "command, README) for a ligand in the structure. Use for 'set up "
+                "Rosetta docking', 'redock the ligand with Rosetta', 'generate 500 "
+                "docking poses'. Rosetta is not installed, so the job is written, "
+                "not run."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "structure; empty for the prepared copy or the active one"},
+                "ligand": {"type": "string", "description": "3-letter component code; empty for the only ligand"},
+                "ligand_chain": {"type": "string", "description": "chain letter for the ligand, default X"},
+                "nstruct": {"type": "integer", "description": "number of output poses, default 100"}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "setup_qm",
+            "description": (
+                "Cut a quantum-mechanics cluster model around a ligand (plus residues "
+                "within a radius, link hydrogens capping cut bonds) and write "
+                "Gaussian, ORCA, Psi4 and xyz inputs. Use for 'set up a DFT "
+                "calculation on the active site', 'QM region within 5 Å of the "
+                "ligand', 'write a Gaussian input for the ligand'. Pass charge only "
+                "if the user stated it."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "target": {"type": "string", "description": "structure; empty for the prepared copy or the active one"},
+                "center": {"type": "string", "description": "3-letter ligand code to centre on; empty for the only ligand"},
+                "chain": {"type": "string", "description": "chain of the ligand copy, when the ligand occurs more than once; 'all' for every copy"},
+                "radius": {"type": "number", "description": "include residues within this many Å, default 4; 0 = ligand alone"},
+                "side_chains_only": {"type": "boolean", "description": "cut residues at CA-CB (default true)"},
+                "charge": {"type": "integer", "description": "total charge, only if the user said it"},
+                "multiplicity": {"type": "integer", "description": "spin multiplicity, default 1"},
+                "method": {"type": "string", "enum": ["B3LYP", "B3LYP-D3", "M06-2X", "wB97XD", "PBE0", "HF", "MP2"]},
+                "basis": {"type": "string", "enum": ["6-31G(d)", "6-311+G(d,p)", "def2-SVP", "def2-TZVP", "cc-pVDZ", "cc-pVTZ"]},
+                "job": {"type": "string", "enum": ["sp", "opt", "opt freq", "freq"]},
+                "solvent": {"type": "string", "enum": ["none", "water", "protein-like"]},
+                "cores": {"type": "integer"},
+                "memory_gb": {"type": "integer"}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "setup_oniom",
+            "description": (
+                "Write a Gaussian ONIOM (QM/MM) input: the ligand and nearby residues "
+                "as the QM layer, the rest of the Amber system as MM. Needs an Amber "
+                "topology from setup_amber first. Use for 'set up QM/MM', 'ONIOM "
+                "calculation on the binding site'."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "center": {"type": "string", "description": "3-letter ligand code for the QM layer; empty for the only ligand"},
+                "radius": {"type": "number", "description": "QM layer: residues within this many Å, default 4"},
+                "side_chains_only": {"type": "boolean"},
+                "mm_radius": {"type": "number", "description": "MM layer radius in Å, default 15; 0 keeps everything"},
+                "method": {"type": "string", "enum": ["B3LYP/6-31G(d):Amber", "wB97XD/6-31G(d):Amber",
+                                                      "M06-2X/6-31G(d):Amber", "B3LYP/6-311+G(d,p):Amber",
+                                                      "PM6:Amber"]},
+                "embedding": {"type": "string", "enum": ["electronic", "mechanical"]},
+                "job": {"type": "string", "enum": ["opt", "sp", "opt freq"]},
+                "charge": {"type": "integer", "description": "QM-layer charge, only if the user said it"},
+                "multiplicity": {"type": "integer"},
+                "cores": {"type": "integer"}
+            }, "required": []}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "membrane_status",
             "description": (
                 "Report how the running membrane build is getting on, or describe the "
@@ -6442,6 +7277,26 @@ def _safe_float(value, default):
         return default
     return float(value)
 
+
+def _num(value, default: float) -> float:
+    """A number from a tool argument: 100, "100", "100 ns"; default otherwise."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    m = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+    return float(m.group(0)) if m else default
+
+
+def _given(value) -> bool:
+    """False for an argument the model left empty ("", None, "null", "none")."""
+    return value is not None and str(value).strip().lower() not in ("", "none", "null")
+
+
+def _known_args(fn, args: dict) -> dict:
+    """The tool arguments `fn` accepts — a stray key must not crash the call."""
+    import inspect
+    accepted = inspect.signature(fn).parameters
+    return {k: v for k, v in (args or {}).items() if k in accepted}
+
 TOOL_DISPATCH = {
     "ask_user": lambda a: tool_ask_user(a.get("question", ""), a.get("options") or []),
     # ---------- Analysis tools from analysis_tools.py ----------
@@ -6524,7 +7379,14 @@ TOOL_DISPATCH = {
                                                        a.get("lipids", ""),
                                                        a.get("ratios", "")),
     "membrane_status":   lambda _: tool_membrane_status(),
-    "find_protein":      lambda a: tool_find_protein(a.get("name", "") or a.get("protein", ""),
+    "parameterize_ligand":   lambda a: tool_parameterize_ligand(**_known_args(tool_parameterize_ligand, a)),
+    "setup_amber":           lambda a: tool_setup_amber(**_known_args(tool_setup_amber, a)),
+    "setup_gromacs":         lambda a: tool_setup_gromacs(**_known_args(tool_setup_gromacs, a)),
+    "setup_rosetta_docking": lambda a: tool_setup_rosetta_docking(
+                                 **_known_args(tool_setup_rosetta_docking, a)),
+    "setup_qm":              lambda a: tool_setup_qm(**_known_args(tool_setup_qm, a)),
+    "setup_oniom":           lambda a: tool_setup_oniom(**_known_args(tool_setup_oniom, a)),
+    "find_protein":     lambda a: tool_find_protein(a.get("name", "") or a.get("protein", ""),
                                                      a.get("organism", "human")),
     "protein_structures": lambda a: tool_protein_structures(
         a.get("name", ""), a.get("method", ""), a.get("max_resolution", 0.0),
@@ -6738,6 +7600,24 @@ def _system_prompt() -> str:
         "     hours, runs in the background). Say that it is running; do NOT claim "
         "     it is finished. "
         "   - 'is it done' → `membrane_status`. Report what it returns. "
+        "0e2. Simulation setup — 'set up an MD run / Amber / GROMACS', 'build a "
+        "   topology', 'Rosetta docking', 'QM / DFT region', 'QM/MM / ONIOM': "
+        "   - Amber → `setup_amber`; GROMACS → `setup_gromacs`; Rosetta ligand "
+        "     docking → `setup_rosetta_docking`; QM cluster → `setup_qm`; QM/MM → "
+        "     `setup_oniom` (needs `setup_amber` first). Pass the user's numbers "
+        "     (ns, K, bar, Å, poses) as arguments; leave the rest at their defaults. "
+        "   - If the structure is not a prepared copy (name ends _PREP) and the "
+        "     user asked to prepare it too, call `prepare_structure` FIRST, then the "
+        "     setup tool on the prepared copy. "
+        "   - A ligand needs parameters before `setup_amber` can build: if "
+        "     `setup_amber` says so, call `parameterize_ligand` for each, then "
+        "     `setup_amber` again. Never invent a net charge or QM charge — pass "
+        "     one only if the user said it. "
+        "   - Report what the tool returned: the directory written, and anything "
+        "     it says was NOT built or not installed. Never claim a topology, "
+        "     a finished run or results exist unless the tool said so. "
+        "   - A question about settings ('which force field should I use') is "
+        "     answered in words, without calling a setup tool. "
         "0b. Composition questions — 'what ligands are in this', 'how many residues', "
         "   'what are the cofactors', 'any non-standard residues', 'what is in this "
         "   structure', 'describe it' — are answered by ONE `describe_structure` call. "
@@ -6884,6 +7764,13 @@ TOOL_GROUPS = {
                  r"nmr|ready|amber|rosetta|simulat|solvent|water|save|write|export",
                  {"inspect_preparation", "prepare_structure", "save_structure",
                   "remove_solvent"}),
+    "simulate": (r"simulat|\bmd\b|molecular dynamics|amber|tleap|prmtop|gromacs|\bmdp\b|"
+                 r"rosetta|docking|\bdock\b|\bqm\b|quantum|\bdft\b|gaussian|\borca\b|psi4|"
+                 r"oniom|qm/mm|force ?field|gaff|antechamber|parameteri[sz]|"
+                 r"production run|equilibrat|\d+\s*ns\b|nanosecond",
+                 {"parameterize_ligand", "setup_amber", "setup_gromacs",
+                  "setup_rosetta_docking", "setup_qm", "setup_oniom",
+                  "prepare_structure", "inspect_preparation"}),
     "membrane": (r"membrane|bilayer|lipid|popc|pope|cholesterol|embed|orient|opm",
                  {"orient_membrane", "build_membrane", "membrane_status",
                   "add_label", "clear_labels", "list_labels"}),
@@ -7092,6 +7979,10 @@ NUMBER_GATE_EXEMPT = {
     "clear_superposition", "describe_structure", "list_structures", "clear_scene",
     "prepare_structure", "inspect_preparation", "orient_membrane", "build_membrane",
     "membrane_status", "clear_labels", "list_labels", "describe_fold",
+    # Simulation setup: component codes (08Q, 1PE) and physical settings, no
+    # residue selections.
+    "parameterize_ligand", "setup_amber", "setup_gromacs", "setup_rosetta_docking",
+    "setup_qm", "setup_oniom",
 }
 
 # A tool result that means nothing happened.
@@ -7719,11 +8610,13 @@ def run_agent(user_prompt: str, status=None) -> str:
     MAX_TURNS = 16
     summary_parts = []
     called_sigs: set[str] = set()          # Tracks (name, args) pairs to avoid exact repeats
+    failed_sigs: dict[str, str] = {}       # sig -> result, for calls that failed
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight
     show_rep_fired = False                 # True once any non-ball+stick show has executed
     protein_nudged = False                 # One retry for a tool-less protein-level answer
     fact_checked = False                   # One correction pass for unsupported facts
     disulfide_nudged = False               # One retry for a disulfide answer with no finder run
+    zoom_nudged = False                    # One retry for a zoom request with no zoom call
     user_chains = {c.upper() for c in re.findall(r"\bchain\s+([A-Za-z0-9])\b", user_prompt, re.I)}
 
     for turn in range(MAX_TURNS):
@@ -7787,10 +8680,18 @@ def run_agent(user_prompt: str, status=None) -> str:
             # H-bond screens, read the SG–SG line of the H-bond table and
             # reported 2 of the 3 bonds; the fact check passed it, since
             # CYS3/CYS40 were in that table (S2a).
+            # A reply that only repeats a tool's own disulfide count (setup_amber,
+            # prepare_structure) is not a disulfide answer: nudging it replaced
+            # "built ... 6 disulfide(s)" with a wrong "no disulfides" (S3 eval).
             disulfide_re = r"disulf|disulph|\bs-s\b|\bss[ -]bond|cystine"
+            tool_said_disulfide = any(
+                str(m.get("content", "")).startswith("Tool results:")
+                and re.search(disulfide_re, str(m.get("content", "")).lower())
+                for m in messages if m.get("role") == "user")
             if (not disulfide_nudged and st.session_state.pdb_id
                     and (re.search(disulfide_re, prompt_lower)
-                         or re.search(disulfide_re, final_text.lower()))
+                         or (re.search(disulfide_re, final_text.lower())
+                             and not tool_said_disulfide))
                     and not any("[find_interactions]:" in str(m.get("content", ""))
                                 for m in messages if m.get("role") == "user")):
                 disulfide_nudged = True
@@ -7801,6 +8702,23 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "(types='disulfide'); the hydrogen-bond and salt-bridge screens do not "
                     "detect them. Call find_interactions(types='disulfide') and answer from "
                     "its result only. Do not mention this note.")})
+                continue
+            # Zoom happens only through the zoom tool. For "fetch 1UBQ, show
+            # lysine 48 as sticks and zoom to it" qwen2.5:14b ran fetch and
+            # select, then replied "highlighted ... and zoomed to" (S3 eval).
+            zoom_re = r"\bzoom(?:ed|ing|s)?\b"
+            if (not zoom_nudged and st.session_state.pdb_id
+                    and (re.search(zoom_re, prompt_lower)
+                         or re.search(zoom_re, final_text.lower()))
+                    and not any("[zoom]:" in str(m.get("content", ""))
+                                for m in messages if m.get("role") == "user")):
+                zoom_nudged = True
+                _log("↻ Zoom requested or claimed with no zoom call — nudging")
+                messages.append({"role": "assistant", "content": final_text})
+                messages.append({"role": "user", "content": (
+                    "The camera moves only through the `zoom` tool, and it was not called. "
+                    "Call zoom(selection=...) on what the user asked to zoom to, then "
+                    "answer from the tool results. Do not mention this note.")})
                 continue
             # Fact check: every PDB id, accession and decimal number in the
             # reply has to appear in something this request actually saw — the
@@ -8079,7 +8997,13 @@ def run_agent(user_prompt: str, status=None) -> str:
             sig = f"{name}:{json.dumps(args, sort_keys=True)}"
             if sig in called_sigs:
                 _log(f"⏭ Skipped duplicate: {name}")
-                tool_results.append({"tool": name, "result": "Already called — skipped."})
+                # Worded as a failure when the first one failed: a bare
+                # "Already called" let qwen2.5:14b report an ONIOM setup that
+                # never ran as "completed successfully" (S3 eval).
+                prior = failed_sigs.get(sig)
+                tool_results.append({"tool": name, "result": (
+                    f"Skipped — this exact call already failed and nothing has changed "
+                    f"since: {prior[:150]}" if prior else "Already called — skipped.")})
                 continue
 
             # ── Dedup: ball+stick show for an already-selected NGL string ───
@@ -8136,6 +9060,14 @@ def run_agent(user_prompt: str, status=None) -> str:
             summary_parts.append(f"{name}: {result}")
             tool_results.append({"tool": name, "result": result,
                                  "args": dict(args), "ms": round(elapsed_ms)})
+            # A call that succeeds may have fixed what an earlier one lacked
+            # (parameterize_ligand, then setup_amber again), so failed calls
+            # become retryable; one that fails stays blocked until then.
+            if _TOOL_FAILED.search(str(result)[:240]):
+                failed_sigs[sig] = str(result)
+            else:
+                called_sigs.difference_update(failed_sigs)
+                failed_sigs.clear()
 
         # Every call above appended exactly one result, in call order.
         for tc, r in zip(tool_calls, tool_results):
@@ -10729,11 +11661,7 @@ def quantum_ui() -> None:
 
     if st.button("✂️ Build the region", key="qm_build", type="primary",
                  disabled=not codes):
-        region = qm.build_region(
-            entry["path"], center_codes=codes, residue_keys_wanted=chosen,
-            side_chains_only=(mode == "Side chains only"))
-        region["name"] = name
-        st.session_state.qm_region = region
+        build_qm_region(name, entry, codes, chosen, mode == "Side chains only")
         st.rerun()
 
     region = st.session_state.qm_region
@@ -10796,17 +11724,8 @@ def quantum_ui() -> None:
                               "relaxes into a shape the protein would never allow, "
                               "because the protein is not there.")
 
-    files = {
-        "region.gjf": qm.gaussian_input(region, charge, multiplicity, method, basis,
-                                         job, solvent, processors, memory, freeze),
-        "region.inp": qm.orca_input(region, charge, multiplicity, method, basis,
-                                     job, solvent, processors, memory * 1000 // 8,
-                                     freeze),
-        "region.psi4": qm.psi4_input(region, charge, multiplicity, method, basis,
-                                      job, memory),
-        "region.xyz": qm.xyz_file(region),
-        "region_notes.txt": qm.region_report(region),
-    }
+    files = qm_input_files(region, charge, multiplicity, method, basis, job, solvent,
+                           processors, memory, freeze)
     tabs = st.tabs(["Gaussian", "ORCA", "Psi4", "xyz"])
     for tab, key in zip(tabs, ("region.gjf", "region.inp", "region.psi4",
                                "region.xyz")):
@@ -10843,20 +11762,14 @@ def oniom_ui() -> None:
                 "wrote alongside it.")
         return
 
-    work = Path(build["dir"])
-    leap_pdbs = sorted(work.glob("*_leap.pdb"))
-    if not leap_pdbs:
-        st.warning("The build directory has no leap-written PDB. Rebuild the "
-                   "topology — `savepdb` is what makes the atom order match.")
+    leap_pdb, paired, err = oniom_pairing(build)
+    if not leap_pdb:
+        st.warning(err)
         return
-    leap_pdb = leap_pdbs[0]
     st.caption(f"Using `{Path(build['prmtop']).name}` and `{leap_pdb.name}` — "
                f"{build['atoms']:,} atoms.")
-
-    topology = oniom.read_topology(build["prmtop"])
-    paired = oniom.pair_with_structure(leap_pdb, topology)
-    if not paired["ok"]:
-        st.error(paired["error"])
+    if err:
+        st.error(err)
         return
 
     st.markdown("**1 · The QM layer**")
@@ -10878,16 +11791,8 @@ def oniom_ui() -> None:
 
     if st.button("🧩 Assign layers", key="on_build", type="primary",
                  disabled=not codes):
-        layered = oniom.assign_layers(
-            paired, chosen, high_codes=codes,
-            side_chains_only=(mode == "Side chains only"), sphere_radius=sphere)
-        model = {
-            "layered": layered,
-            "boundary": oniom.find_boundary(layered),
-            "bonds": oniom.topology_bonds(build["prmtop"]),
-            "name": build.get("name"),
-        }
-        st.session_state.oniom_model = model
+        build_oniom_model(build, paired, codes, chosen, mode == "Side chains only",
+                          sphere)
         st.rerun()
 
     model = st.session_state.oniom_model
@@ -10930,12 +11835,9 @@ def oniom_ui() -> None:
                                  "crystallographer put it, and the optimisation "
                                  "finishes this decade.")
 
-    text = oniom.gaussian_oniom_input(
-        layered, boundary, method, embedding, charge_high, mult_high,
-        job=job, freeze_mm=freeze_mm, processors=processors,
-        bonds=model["bonds"])
-    files = {"oniom.gjf": text,
-             "oniom_notes.txt": oniom.report(layered, boundary)}
+    files = oniom_input_files(model, method, embedding, job, charge_high, mult_high,
+                              processors, freeze_mm)
+    text = files["oniom.gjf"]
 
     with st.expander("The input file (first 200 lines)", expanded=False):
         st.code("\n".join(text.splitlines()[:200]), language="text")
@@ -10972,16 +11874,13 @@ def _simulation_target(key_prefix: str):
     names = [x["pdb_id"] for x in structures()]
     if not names:
         return None, None
-    prepared = [n for n in names if n.endswith(("_PREP", "_MEM", "_MEMBRANE"))]
-    default = prepared[-1] if prepared else names[
-        next((i for i, x in enumerate(structures())
-              if x["sid"] == st.session_state.active_sid), 0)]
+    default = default_simulation_name()
     choice = st.selectbox("Structure", names, index=names.index(default),
                           key=f"{key_prefix}_target",
                           help="Set this up from a prepared structure, not a raw "
                                "download — the Prepare tab is the step before this one.")
     entry = find_structure(choice)
-    if not any(choice.endswith(suffix) for suffix in ("_PREP", "_MEM", "_MEMBRANE")):
+    if not choice.upper().endswith(PREPARED_SUFFIXES):
         st.caption("⚠️ This looks like an unprepared structure. Run it through the "
                    "Prepare tab first: alternate conformations and extra NMR states "
                    "become clashes and nonsense here, not error messages.")
@@ -11046,19 +11945,9 @@ def _ligand_parameter_ui(name: str, entry: dict) -> list:
                 if st.button(f"Parameterise {code}", key=f"par_{name}_{code}",
                              use_container_width=True,
                              disabled=not sim.tools_available()["antechamber"]):
-                    work = SIMULATIONS_DIR / f"{name}_params" / code
                     with st.spinner(f"antechamber on {code} — AM1-BCC takes "
                                     f"seconds to minutes…"):
-                        ligand_pdb, _, _ = sim.extract_residue(
-                            entry["path"], code, work / f"{code}_raw.pdb")
-                        mol2, frcmod, log, err = sim.run_antechamber(
-                            ligand_pdb, work, code, net_charge=charge,
-                            charge_method=method)
-                    st.session_state.ligand_params[key] = {
-                        "mol2": mol2, "frcmod": frcmod, "charge": charge,
-                        "error": err, "log": log,
-                        "guessed": sim.missing_parameters(frcmod) if frcmod else [],
-                    }
+                        parameterize_ligand(name, entry, code, charge, method)
                     st.rerun()
 
             if stored:
@@ -11157,7 +12046,6 @@ def amber_ui() -> None:
         cation, anion, ion_note = sim.ION_PAIRS[pair]
         st.caption(ion_note)
 
-    ligand_codes = [code for code, _, _ in params]
     source_pdb = entry["path"]
     charge = sim.estimate_charge(source_pdb)
     est_waters = sim.estimate_waters(source_pdb, buffer_a, shape)
@@ -11171,35 +12059,9 @@ def amber_ui() -> None:
     st.markdown("**3 · Build the topology**")
     if st.button("⚙️ Run tleap", key="amb_build", type="primary",
                  disabled=not tools["tleap"]):
-        work = SIMULATIONS_DIR / f"{name}_amber"
-        work.mkdir(parents=True, exist_ok=True)
-        structure_path = source_pdb
-        combine = []
-        if ligand_codes:
-            # The ligand comes in from its mol2, so it has to come out of the
-            # PDB: antechamber renames atoms when it reads real bond orders,
-            # and leap matches residues by atom name.
-            stripped = work / (Path(source_pdb).stem + "_noligand.pdb")
-            structure_path, _ = sim.strip_components(source_pdb, ligand_codes,
-                                                     stripped)
-            combine = [(code, mol2) for code, mol2, _ in params]
-        finding = prp.inspect(structure_path)
-        script = prp.tleap_script(
-            structure_path, finding, unit="prot", ff=ff, water=water,
-            solvate=True, box=buffer_a, box_shape=shape,
-            neutralise=True, cation=cation, anion=anion,
-            ion_counts=sim.ion_counts(
-                sim.estimate_waters(structure_path, buffer_a, shape), salt,
-                cation, anion, sim.estimate_charge(structure_path)),
-            ligand_params=params, combine_units=combine,
-            lipid=bool(mem.membrane_planes(structure_path)),
-            outputs=("system.prmtop", "system.inpcrd"))
-        extra = [structure_path] + [p for _, m, f in params for p in (m, f)]
         with st.spinner("tleap is building the system…"):
-            result = sim.run_tleap(script, work, extra_files=extra)
-        result["script"] = script
-        result["name"] = name
-        st.session_state.amber_build = result
+            build_amber_system(name, entry, params, ff, water, shape, buffer_a,
+                               salt, pair)
         st.rerun()
 
     build = st.session_state.amber_build
@@ -11250,22 +12112,7 @@ def amber_ui() -> None:
                    "surface tension set to zero — coupling a bilayer isotropically "
                    "squeezes it.")
 
-    files = {}
-    for filename, stage in sim.AMBER_STAGES:
-        files[filename] = sim.amber_mdin(stage, membrane_system=is_membrane,
-                                         temperature=temperature, pressure=pressure,
-                                         nanoseconds=ns)
-    if build and build.get("ok"):
-        files["system.prmtop"] = Path(build["prmtop"])
-        files["system.inpcrd"] = Path(build["inpcrd"])
-        files["build.leap"] = build.get("script", "")
-        files["leap.log"] = build["log"]
-        for code, mol2, frcmod in params:
-            files[f"{code}.mol2"] = Path(mol2)
-            files[f"{code}.frcmod"] = Path(frcmod)
-        files["run.sh"] = sim.amber_run_script("system.prmtop", "system.inpcrd", engine)
-    else:
-        files["run.sh"] = sim.amber_run_script("system.prmtop", "system.inpcrd", engine)
+    files = amber_run_files(entry, build, params, temperature, pressure, ns, engine)
 
     with st.expander("Preview the production input", expanded=False):
         st.code(files["05_prod.in"], language="text")
@@ -11314,10 +12161,7 @@ def gromacs_ui() -> None:
                    "semi-isotropic — a bilayer coupled isotropically is squeezed "
                    "in the plane it is supposed to stay flat in.")
 
-    files = {filename: sim.gromacs_mdp(stage, temperature, pressure, ns,
-                                       membrane_system=is_membrane)
-             for filename, stage in sim.GROMACS_STAGES}
-    files["README.txt"] = sim.GROMACS_CONVERSION_NOTE
+    files = gromacs_run_files(entry, temperature, pressure, ns)
 
     st.markdown("**Getting a topology**")
     st.code(sim.GROMACS_CONVERSION_NOTE, language="text")
@@ -11367,16 +12211,8 @@ def rosetta_ui() -> None:
                                        "is a redocking sanity check; a real search "
                                        "into an apo site wants thousands.")
 
-    files = {
-        "dock.xml": sim.rosetta_ligand_docking_xml(code, chain),
-        "dock.options": sim.rosetta_options(Path(entry["path"]).name, code, nstruct),
-        "params_command.txt": sim.rosetta_params_command(code),
-        "README.txt": sim.ROSETTA_README,
-        Path(entry["path"]).name: Path(entry["path"]),
-    }
-    stored = st.session_state.ligand_params.get((name, code))
-    if stored and not stored.get("error"):
-        files[f"{code}.mol2"] = Path(stored["mol2"])
+    files = rosetta_job_files(name, entry, code, chain, nstruct)
+    if f"{code}.mol2" in files:
         st.caption(f"The mol2 from the Amber tab is included — molfile_to_params.py "
                    f"can read it directly.")
 

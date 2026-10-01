@@ -314,7 +314,9 @@ def _hydrogen_bonds(atoms, cutoff, with_hydrogens):
 
 def _disulfides(atoms, cutoff):
     """Cysteine SG pairs close enough to be bonded."""
-    sg = _select_indices(atoms, lambda i: atoms["resname"][i] == "CYS"
+    # CYX/CYM: an Amber-prepared copy (prepare_structure) renames bonded
+    # cysteines, and the check found "none" in trypsin's six (3PTB_PREP).
+    sg = _select_indices(atoms, lambda i: atoms["resname"][i] in ("CYS", "CYX", "CYM")
                          and atoms["name"][i] == "SG")
     out, seen = [], set()
     for a, b, d in _grid_pairs(atoms["xyz"][sg], atoms["xyz"][sg], cutoff):

@@ -150,5 +150,49 @@
   {
     "prompt": "reset the colors to default",
     "grounding": "Colour-only request: call color(selection='protein', color='chainname') (or the default scheme) and nothing else. Do not call hide_all, hide, clear_scene or show — the user's representations stay as they are."
+  },
+  {
+    "prompt": "set up a 100 ns GROMACS run for this protein",
+    "grounding": "Call setup_gromacs(nanoseconds=100) — one call; pass temperature/pressure only if the user gave them. Report the directory it wrote and that it made no GROMACS topology (its README says how)."
+  },
+  {
+    "prompt": "prepare it for Amber and set up a 50 ns MD simulation at 310 K",
+    "grounding": "Two steps, in order: prepare_structure(profile='amber'), then setup_amber(nanoseconds=50, temperature=310) on the prepared copy. Report what setup_amber returned, including anything it says was NOT built."
+  },
+  {
+    "prompt": "build an Amber topology in a TIP3P box with ff14SB",
+    "grounding": "Call setup_amber(force_field='ff14SB', water_model='tip3p'). If it says a ligand has no parameters, call parameterize_ligand for that ligand, then setup_amber again. Never claim a topology exists unless the tool said it was built."
+  },
+  {
+    "prompt": "parameterize the ligand, its charge is -1",
+    "grounding": "Call parameterize_ligand(net_charge=-1) (ligand empty for the only one, or its 3-letter code). Pass net_charge only when the user states it."
+  },
+  {
+    "prompt": "set up Rosetta docking for the ligand with 500 poses",
+    "grounding": "Call setup_rosetta_docking(nstruct=500), ligand empty for the only ligand or its 3-letter code. Say the job files were written, not run — Rosetta is not installed."
+  },
+  {
+    "prompt": "write a Gaussian DFT input for the active site within 5 Å of the ligand",
+    "grounding": "Call setup_qm(radius=5) — it writes Gaussian, ORCA and Psi4 inputs together; add method/basis/charge only if the user named them. If it asks which copy of the ligand or what the charge is, relay that question."
+  },
+  {
+    "prompt": "set up a QM/MM ONIOM calculation on the binding site",
+    "grounding": "Call setup_oniom. It needs an Amber topology: if it says none exists, call setup_amber first (and parameterize_ligand if setup_amber asks), then setup_oniom again. Report any step that could not run."
+  },
+  {
+    "prompt": "which force field should I use for an MD simulation of this protein",
+    "grounding": "Advice question: answer in words (ff19SB with OPC water is the current Amber default; ff14SB with TIP3P is the long-standing one). Do not call setup_amber or any other setup tool."
+  },
+  {
+    "prompt": "zoom in on the heme in chain B",
+    "grounding": "Call zoom(selection='HEM and :B') — 'zoom in on' means the zoom tool, not highlight. A ligand named in words maps to its residue code (heme → HEM) and the named chain is kept."
+  },
+  {
+    "prompt": "load chain A",
+    "grounding": "A chain was named but no structure (no PDB id or protein name). If nothing is loaded, call ask_user(question='Which structure should chain A come from?', options=[]) — never guess a structure or reply without asking. If a structure is already loaded, show only that chain instead."
+  },
+  {
+    "prompt": "fetch lysozyme 2LZM, show tyrosine 88 as sticks and zoom to it",
+    "grounding": "Three steps, one per instruction, nothing else (no remove_solvent): fetch_structure(pdb_id='2LZM'), then show(rep_type='licorice', selection='88'), then zoom(selection='88'). 'zoom to it' needs its own zoom call — never say the view zoomed without calling zoom."
   }
 ]

@@ -398,7 +398,9 @@ def chem_component(code: str):
         "code": code,
         "name": info.get("name", ""),
         "formula": (info.get("formula") or "").strip(),
-        "charge": info.get("formal_charge"),
+        # RCSB's field is pdbx_formal_charge; "formal_charge" never exists,
+        # so reading only that one reported every charge as unknown.
+        "charge": info.get("pdbx_formal_charge", info.get("formal_charge")),
         "smiles": smiles,
         "weight": info.get("formula_weight"),
     }
@@ -413,7 +415,8 @@ def electron_count(pdb_path, net_charge: int = 0) -> int:
     return total - int(net_charge)
 
 
-def protonate_ligand(ligand_pdb, dest, code: str = "", smiles: str = "") -> tuple:
+def protonate_ligand(ligand_pdb, dest, code: str = "", smiles: str = "",
+                     net_charge=None) -> tuple:
     """
     Add hydrogens to a ligand lifted out of a crystal structure.
 
@@ -435,12 +438,15 @@ def protonate_ligand(ligand_pdb, dest, code: str = "", smiles: str = "") -> tupl
       incomplete for others: on benzamidine it adds seven of the eight,
       leaving an amidine nitrogen with one hydrogen where it should have two.
 
-    Neither picks a protonation state for you. The dictionary's state is the
-    deposited one, and for anything ionisable that is a chemical decision --
-    benzamidine is neutral in the dictionary and an amidinium cation at pH 7.
+    Neither picks a protonation state on its own. The dictionary's state is
+    the deposited one, and for anything ionisable that is a chemical decision
+    -- benzamidine is neutral in the dictionary and an amidinium cation at
+    pH 7. When the user states `net_charge` and it differs from the
+    dictionary's, the RDKit route moves protons to reach it
+    (_shift_charge) and says which atoms it changed.
 
     Returns:
-        (path, hydrogens added, error). The path is `dest`.
+        (path, hydrogens added, error, notes). The path is `dest`.
     """
     dest = Path(dest)
     before = sum(1 for l in prp.read_lines(ligand_pdb)
@@ -459,6 +465,11 @@ def protonate_ligand(ligand_pdb, dest, code: str = "", smiles: str = "") -> tupl
             template = Chem.MolFromSmiles(smiles)
             if mol is not None and template is not None:
                 fixed = AllChem.AssignBondOrdersFromTemplate(template, mol)
+                notes = []
+                if net_charge is not None:
+                    fixed, notes, err = _shift_charge(fixed, int(net_charge))
+                    if err:
+                        return None, 0, err, []
                 fixed = Chem.AddHs(fixed, addCoords=True)
                 Chem.SanitizeMol(fixed)
                 Chem.MolToPDBFile(fixed, str(dest))
@@ -469,12 +480,107 @@ def protonate_ligand(ligand_pdb, dest, code: str = "", smiles: str = "") -> tupl
                 after = sum(1 for l in prp.read_lines(dest)
                             if prp._is_coord(l) and prp._is_hydrogen(l))
                 if after > before:
-                    return str(dest), after - before, None
+                    return str(dest), after - before, None, notes
         except Exception:
             pass        # fall through to reduce rather than failing outright
 
     path, added, err = prp.add_hydrogens(ligand_pdb, dest, flip=True, his=False)
-    return path, added, err
+    return path, added, err, []
+
+
+def _shift_charge(mol, target: int):
+    """
+    Add or remove protons on a heavy-atom molecule (bond orders assigned, no
+    hydrogens yet) until its formal charge is `target`.
+
+    Only the textbook sites, most basic / most acidic first, so the choice is
+    predictable and reported: amidine/guanidine imine N, then aliphatic
+    amine N, then pyridine-type aromatic N for a proton; carboxylic, then
+    phosphoric/sulfonic acid OH for its removal. Anything else (a charge the
+    molecule has no such sites for) is an error, never a guess.
+
+    Returns:
+        (mol, notes, error).
+    """
+    from rdkit import Chem
+    mol = Chem.RWMol(mol)
+    mol.UpdatePropertyCache(strict=False)
+    current = sum(a.GetFormalCharge() for a in mol.GetAtoms())
+    delta = target - current
+    if delta == 0:
+        return mol, [], None
+
+    def label(a):
+        info = a.GetPDBResidueInfo()
+        return info.GetName().strip() if info else f"{a.GetSymbol()}{a.GetIdx() + 1}"
+
+    def is_amide_n(a):
+        for nb in a.GetNeighbors():
+            if nb.GetSymbol() in ("C", "S", "P"):
+                for b in nb.GetBonds():
+                    o = b.GetOtherAtom(nb)
+                    if o.GetSymbol() == "O" and b.GetBondTypeAsDouble() == 2:
+                        return True
+        return False
+
+    def base_rank(a):
+        if a.GetSymbol() != "N" or a.GetFormalCharge() != 0 or is_amide_n(a):
+            return None
+        double_c = [b.GetOtherAtom(a) for b in a.GetBonds()
+                    if b.GetBondTypeAsDouble() == 2 and b.GetOtherAtom(a).GetSymbol() == "C"]
+        if double_c and not a.GetIsAromatic():
+            c = double_c[0]
+            if any(n.GetSymbol() == "N" and n.GetIdx() != a.GetIdx() for n in c.GetNeighbors()):
+                return 0                                      # amidine / guanidine
+            return None                                       # plain imine: leave it
+        if (not a.GetIsAromatic() and a.GetDegree() < 4
+                and all(b.GetBondTypeAsDouble() == 1 for b in a.GetBonds())
+                and not any(n.GetIsAromatic() for n in a.GetNeighbors())):
+            return 1                                          # aliphatic amine
+        if a.GetIsAromatic() and a.GetTotalNumHs() == 0 and a.GetDegree() == 2:
+            return 2                                          # pyridine-type
+        return None
+
+    def acid_rank(a):
+        if a.GetSymbol() != "O" or a.GetFormalCharge() != 0 or a.GetTotalNumHs() != 1:
+            return None
+        nbs = list(a.GetNeighbors())
+        if len(nbs) != 1:
+            return None
+        x = nbs[0]
+        has_oxo = any(b.GetOtherAtom(x).GetSymbol() == "O" and b.GetBondTypeAsDouble() == 2
+                      for b in x.GetBonds())
+        if not has_oxo:
+            return None
+        return {"C": 0, "P": 1, "S": 1}.get(x.GetSymbol())
+
+    rank = base_rank if delta > 0 else acid_rank
+    sites = sorted((r, a.GetIdx()) for a in mol.GetAtoms()
+                   if (r := rank(a)) is not None)
+    if len(sites) < abs(delta):
+        kind = ("basic nitrogens to protonate" if delta > 0
+                else "acidic OH groups to deprotonate")
+        return None, [], (
+            f"Cannot reach a net charge of {target:+d}: the dictionary form is "
+            f"{current:+d}, which needs {abs(delta)} {kind}, and the molecule "
+            f"has {len(sites)}. Check the charge, or supply a protonated ligand.")
+    notes = []
+    for _, idx in sites[:abs(delta)]:
+        a = mol.GetAtomWithIdx(idx)
+        if delta > 0:
+            a.SetFormalCharge(1)
+            a.SetNumExplicitHs(a.GetTotalNumHs() + 1)
+            notes.append(f"protonated {label(a)}")
+        else:
+            a.SetFormalCharge(-1)
+            a.SetNumExplicitHs(0)
+            notes.append(f"deprotonated {label(a)}")
+        a.SetNoImplicit(True)
+    mol.UpdatePropertyCache(strict=False)
+    Chem.SanitizeMol(mol)
+    return mol.GetMol(), [
+        f"To reach the stated net charge {target:+d} (dictionary form "
+        f"{current:+d}): " + ", ".join(notes) + "."], None
 
 
 def run_antechamber(ligand_pdb, out_dir, code: str, net_charge: int = 0,
@@ -515,14 +621,20 @@ def run_antechamber(ligand_pdb, out_dir, code: str, net_charge: int = 0,
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / f"{code}_in.pdb"
     shutil.copyfile(ligand_pdb, src)
+    # electron_count/extract_formula read PDB records only; src may become
+    # an SDF below, which they would count as 0 electrons ("is  with a net
+    # charge of 1, which is -1 electrons" for 3PTB's benzamidine).
+    count_pdb = src
 
     notes = []
     sdf = out_dir / f"{code}.sdf"
     has_h = any(prp._is_hydrogen(l) for l in prp.read_lines(src)
                 if prp._is_coord(l))
     if add_hydrogens and not has_h:
-        protonated, added, err = protonate_ligand(src, out_dir / f"{code}_h.pdb",
-                                                  code=code)
+        protonated, added, err, shift = protonate_ligand(
+            src, out_dir / f"{code}_h.pdb", code=code, net_charge=net_charge)
+        if err and err.startswith("Cannot reach"):
+            return None, None, "", f"{code}: {err}"
         if err or not added:
             return None, None, "", (
                 f"{code} has no hydrogens, and they could not be added "
@@ -532,8 +644,10 @@ def run_antechamber(ligand_pdb, out_dir, code: str, net_charge: int = 0,
                 "ligand with an ionisable group it is the decision that matters "
                 "most.")
         shutil.copyfile(protonated, src)
+        count_pdb = src
         notes.append(f"{added} hydrogens were added to {code} before "
                      "parameterisation.")
+        notes.extend(shift)
         if Path(str(protonated)).with_suffix(".sdf").exists():
             shutil.copyfile(Path(str(protonated)).with_suffix(".sdf"), sdf)
             src = sdf
@@ -541,9 +655,9 @@ def run_antechamber(ligand_pdb, out_dir, code: str, net_charge: int = 0,
     # sqm cannot run an open shell from antechamber, so an odd electron count
     # is a dead end -- and saying so here, with the arithmetic, beats the
     # "Cannot properly run sqm" that comes out of it two minutes later.
-    electrons = electron_count(src, net_charge)
+    electrons = electron_count(count_pdb, net_charge)
     if electrons % 2 and int(multiplicity) == 1:
-        formula = extract_formula(src)
+        formula = extract_formula(count_pdb)
         return None, None, "\n".join(notes), (
             f"{code} as it stands is {formula} with a net charge of {net_charge}, "
             f"which is {electrons} electrons — an odd number, so it cannot be a "

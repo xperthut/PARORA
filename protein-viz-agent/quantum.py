@@ -260,7 +260,9 @@ def build_region(pdb_path, center_codes=None, center_keys=None,
     out_atoms.extend(links)
 
     charge, breakdown = region_charge(residues, side_chains_only)
-    if not any(a["element"] == "H" for a in out_atoms):
+    # Link atoms are hydrogens too, but placed by us: they must not count, or
+    # an unprotonated X-ray file (3PTB) passes as protonated.
+    if not any(a["element"] == "H" and not a["link"] for a in out_atoms):
         warnings.append(
             "There is not a single hydrogen in this region. A QM calculation on "
             "heavy atoms alone is meaningless — protonate the structure first "

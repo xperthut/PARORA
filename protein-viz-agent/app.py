@@ -835,6 +835,97 @@ def resolve_selection(sel_name_or_expr: str) -> str:
 # Tool implementations
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class ToolResult(str):
+    """
+    What every tool_* returns (suggestion.txt S4): {ok, summary, data, files,
+    next_hints}.
+
+    A str whose text is `summary` — what the model reads — so the panels that
+    show a tool's reply (st.toast, st.markdown, *_msg session keys) work
+    unchanged. run_agent's guards read the fields instead of re-parsing that
+    text with regexes:
+      ok          False: the call failed and changed nothing.
+      data        ids, counts, measured values and flags the result rests on;
+                  added to the fact check's evidence (_unsupported_facts).
+      files       paths the call wrote.
+      next_hints  follow-ups the model may offer the user, never run unasked.
+    Concatenating or formatting one returns a plain str without the fields —
+    build a new result instead.
+    """
+
+    def __new__(cls, summary="", ok: bool = True, data: dict = None,
+                files=None, next_hints=None):
+        obj = super().__new__(cls, str(summary))
+        obj.ok = bool(ok)
+        obj.data = dict(data or {})
+        obj.files = [str(f) for f in (files or []) if f]
+        obj.next_hints = [str(h) for h in (next_hints or []) if h]
+        return obj
+
+    @property
+    def summary(self) -> str:
+        return str.__str__(self)
+
+    def as_dict(self) -> dict:
+        return {"ok": self.ok, "summary": self.summary, "data": self.data,
+                "files": self.files, "next_hints": self.next_hints}
+
+
+def _ok(summary, data: dict = None, files=None, hints=None) -> ToolResult:
+    """A successful tool result. A ToolResult passed in keeps its own status."""
+    if isinstance(summary, ToolResult):
+        return summary
+    return ToolResult(summary, True, data, files, hints)
+
+
+def _fail(summary, data: dict = None, hints=None) -> ToolResult:
+    """
+    A failed tool result: nothing happened. A ToolResult passed in keeps its
+    own status — a helper's `err` may be a question for the user (see
+    ask_clarification), which is not a failure.
+    """
+    if isinstance(summary, ToolResult):
+        return summary
+    return ToolResult(summary, False, data, None, hints)
+
+
+NO_STRUCTURE = "No structure is loaded — fetch one first."
+
+
+# Migration fallback only: a tool that still returns a bare string is read
+# the way every result was before S4. run_agent logs each one it meets.
+_LEGACY_FAILED = re.compile(
+    r"^(error|tool error|blocked|warning|unknown tool|no structure|nothing)|"
+    r"could not|couldn't|cannot|not found|no such|failed|must be different|"
+    r"matched 0 atoms|nothing was", re.IGNORECASE)
+
+
+def as_tool_result(raw) -> ToolResult:
+    """Any tool return value as a ToolResult (adapter for old string returns)."""
+    if isinstance(raw, ToolResult):
+        return raw
+    text = "" if raw is None else str(raw)
+    return ToolResult(text, not _LEGACY_FAILED.search(text[:240]))
+
+
+def _blocked(text: str) -> ToolResult:
+    """A call a run_agent gate stopped before it ran."""
+    return ToolResult(text, False, {"status": "blocked"})
+
+
+def _skipped(text: str, ok: bool = True) -> ToolResult:
+    """A duplicate call run_agent did not repeat; ok=False if the first one failed."""
+    return ToolResult(text, ok, {"status": "skipped"})
+
+
+def _for_model(result: ToolResult) -> str:
+    """A result as the model reads it: the summary, then any follow-up hints."""
+    if not result.next_hints:
+        return result.summary
+    return (f"{result.summary}\n(Possible follow-ups — offer them, do not run them unasked: "
+            + "; ".join(result.next_hints) + ")")
+
+
 # ── Protein lookup: name → UniProt → every PDB structure of that protein ─────
 # The PDB's own text search answers "which titles contain these words", which
 # is a different question from "which structures are of this protein" and
@@ -865,8 +956,11 @@ def _cached_protein_profile(accession: str, schema: int):
 #              written as an instruction the agent can act on}]
 #   request   the user message that raised the question
 
-def ask_clarification(question: str, options: list, request: str = "") -> str:
-    """Record a question for the user; returns the tool-result text for it."""
+def ask_clarification(question: str, options: list, request: str = "") -> ToolResult:
+    """
+    Record a question for the user; returns the tool result for it. Asking is
+    not a failure (ok=True); data["needs_user_choice"] marks it.
+    """
     opts = []
     for o in options:
         if isinstance(o, dict):
@@ -877,13 +971,15 @@ def ask_clarification(question: str, options: list, request: str = "") -> str:
         if label:
             opts.append({"label": label, "meaning": meaning})
     if len(opts) == 1:
-        return "ask_user needs at least two distinct options, or none for an open question."
+        return _fail("ask_user needs at least two distinct options, or none for an open question.")
     st.session_state.clarify = {
         "question": question.strip(),
         "options": opts[:5],
         "request": request or st.session_state.get("current_request", ""),
     }
-    return "NEEDS USER CHOICE — asked the user: " + clarification_text()
+    return _ok("NEEDS USER CHOICE — asked the user: " + clarification_text(),
+               {"needs_user_choice": True,
+                "options": [o["label"] for o in opts[:5]]})
 
 
 def clarification_text() -> str:
@@ -984,7 +1080,7 @@ def resolve_protein(name: str, organism: str = "human"):
     return prof, None
 
 
-def tool_find_protein(name: str, organism: str = "human") -> str:
+def tool_find_protein(name: str, organism: str = "human") -> ToolResult:
     """
     Identify a protein by name and summarise the structures available for it.
 
@@ -1002,7 +1098,7 @@ def tool_find_protein(name: str, organism: str = "human") -> str:
     """
     prof, err = resolve_protein(name, organism)
     if err:
-        return err
+        return _fail(err)
     lines = [pacc.as_brief(prof)]
     if prof["regions"]:
         lines.append("Regions of the sequence with structures:")
@@ -1016,12 +1112,19 @@ def tool_find_protein(name: str, organism: str = "human") -> str:
     if others:
         lines.append("Other UniProt matches: " + ", ".join(
             f"{h['accession']} ({h['gene'] or h['protein_name']})" for h in others))
-    return "\n".join(x for x in lines if x)
+    return _ok("\n".join(x for x in lines if x),
+               {"accession": prof["accession"], "gene": prof.get("gene"),
+                "structures": prof["totals"].get("structures"),
+                "regions": [[r["start"], r["end"], r["count"], r["best"]]
+                            for r in prof["regions"][:6]],
+                "other_matches": [h["accession"] for h in others]},
+               hints=["load_protein to load the best structure",
+                      "protein_structures to list them"])
 
 
 def tool_protein_structures(name: str = "", method: str = "",
                             max_resolution: float = 0.0,
-                            ligands_only: bool = False, limit: int = 10) -> str:
+                            ligands_only: bool = False, limit: int = 10) -> ToolResult:
     """
     List the PDB structures of a protein as a table, best first.
 
@@ -1039,14 +1142,16 @@ def tool_protein_structures(name: str = "", method: str = "",
     if name or prof is None:
         prof, err = resolve_protein(name or st.session_state.protein_query)
         if err:
-            return err
+            return _fail(err)
     rows = pacc.filter_structures(
         prof["structures"], method=method,
         max_resolution=max_resolution if max_resolution and max_resolution > 0 else None,
         ligands_only=ligands_only, loadable_only=True)
     if not rows:
-        return (f"No structure of {prof['protein_name']} matches those criteria "
-                f"({prof['totals']['structures']} exist in total).")
+        return _ok(f"No structure of {prof['protein_name']} matches those criteria "
+                   f"({prof['totals']['structures']} exist in total).",
+                   {"accession": prof["accession"], "matching": 0,
+                    "total": prof["totals"]["structures"]})
     who = prof.get("gene") or "this protein"
 
     def row_line(r):
@@ -1087,10 +1192,11 @@ def tool_protein_structures(name: str = "", method: str = "",
     rest = len(rows) - len(shown)
     if rest > 0:
         out.append(f"{rest} more not listed; filter by method, resolution or ligands to narrow.")
-    return "\n".join(out)
+    return _ok("\n".join(out), {"accession": prof["accession"], "matching": len(rows),
+                                "listed": sorted(shown)})
 
 
-def tool_protein_function(name: str = "") -> str:
+def tool_protein_function(name: str = "") -> ToolResult:
     """
     Report a protein's biological role from UniProt's curated annotation.
 
@@ -1114,7 +1220,7 @@ def tool_protein_function(name: str = "") -> str:
     if name or prof is None:
         prof, err = resolve_protein(name or st.session_state.protein_query)
         if err:
-            return err
+            return _fail(err)
     lines = [f"{prof['protein_name']} ({prof['accession']})"]
     if prof["function"]:
         if prof.get("function_automatic"):
@@ -1125,12 +1231,21 @@ def tool_protein_function(name: str = "") -> str:
             lines.append("Function: " + prof["function"])
     if prof["subunit"]:
         lines.append("Subunit structure: " + prof["subunit"])
+    data = {"accession": prof["accession"], "curated_function": bool(prof["function"]),
+            "automatic": bool(prof["function"] and prof.get("function_automatic")),
+            "inferred": False, "structural_neighbours": False}
     if not prof["function"]:
         lines.append("UniProt has no FUNCTION annotation for this entry — this protein "
                      "may be uncharacterized or under-studied.")
-        lines.extend(_function_fallback(prof["accession"]))
-        lines.extend(_structure_function_lines(prof["accession"]))
-    return "\n".join(lines)
+        fallback = _function_fallback(prof["accession"])
+        neighbours = _structure_function_lines(prof["accession"])
+        lines.extend(fallback)
+        lines.extend(neighbours)
+        # run_agent's caveat footer keys on these, not on the heading text.
+        data["inferred"] = any(l.startswith("INFERRED FUNCTION") for l in fallback + neighbours)
+        data["structural_neighbours"] = any(
+            l.startswith("INFERRED FUNCTION FROM STRUCTURAL NEIGHBOURS") for l in neighbours)
+    return _ok("\n".join(lines), data)
 
 
 # P13: only reached when UniProt has no FUNCTION text; never shown next to one.
@@ -1195,7 +1310,7 @@ def _function_fallback(accession: str) -> list:
 
 
 def tool_load_protein(name: str, organism: str = "human", prefer: str = "balanced",
-                      method: str = "") -> str:
+                      method: str = "") -> ToolResult:
     """
     Load the best PDB structure of a protein named in words.
 
@@ -1219,7 +1334,7 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
     """
     prof, err = resolve_protein(name, organism)
     if err:
-        return err
+        return _fail(err)
     rows = pacc.filter_structures(prof["structures"], method=method, loadable_only=True)
     if not rows:
         # A method filter narrowing existing structures to zero is a different
@@ -1229,12 +1344,14 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
         any_rows = (pacc.filter_structures(prof["structures"], loadable_only=True)
                     if method else rows)
         if any_rows:
-            return (f"{prof['protein_name']} ({prof['accession']}) has no structure "
-                    f"that can be loaded here by {method}.")
+            return _fail(f"{prof['protein_name']} ({prof['accession']}) has no structure "
+                         f"that can be loaded here by {method}.",
+                         {"accession": prof["accession"], "loadable": len(any_rows)})
         dest, af_err = download_alphafold(prof["accession"])
         if af_err:
-            return (f"{prof['protein_name']} ({prof['accession']}) has no experimental "
-                    f"structure in the PDB, and {af_err[0].lower()}{af_err[1:]}")
+            return _fail(f"{prof['protein_name']} ({prof['accession']}) has no experimental "
+                         f"structure in the PDB, and {af_err[0].lower()}{af_err[1:]}",
+                         {"accession": prof["accession"]})
         label = f"AF-{prof['accession']}"
         first = not structures()
         note = "" if first else _recolor_for_comparison()
@@ -1243,13 +1360,17 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
         if first and not st.session_state.representations:
             st.session_state.representations = [dict(r, id=uuid.uuid4().hex[:8])
                                                 for r in DEFAULT_REPS]
-        return (f"{prof['protein_name']} ({prof['accession']}) has no experimental "
-                f"structure in the PDB — loaded the AlphaFold predicted model "
-                f"({label}) instead. Confidence (pLDDT) varies by residue; treat "
-                f"low-confidence regions as illustrative, not a fitted structure."
-                f"{note}")
+        return _ok(f"{prof['protein_name']} ({prof['accession']}) has no experimental "
+                   f"structure in the PDB — loaded the AlphaFold predicted model "
+                   f"({label}) instead. Confidence (pLDDT) varies by residue; treat "
+                   f"low-confidence regions as illustrative, not a fitted structure."
+                   f"{note}",
+                   {"accession": prof["accession"], "loaded": label, "alphafold": True},
+                   files=[dest])
     best = pacc.rank_structures(rows, prefer)[0]
     msg = tool_add_structure(best["pdb_id"])
+    if not msg.ok:
+        return msg
     res = f"{best['resolution']:.2f} Å" if best["resolution"] is not None else "no resolution"
     # Say which chain is the protein asked for, and what else is in the file —
     # the top-ranked entry is often a complex, and its chain A is not
@@ -1276,12 +1397,18 @@ def tool_load_protein(name: str, organism: str = "human", prefer: str = "balance
     else:
         where = (f" Residues {best['start']}–{best['end']} of the sequence "
                  f"({best['coverage_pct']:.0f}%).")
-    return (f"{msg} {best['pdb_id']} is the {prefer} choice for "
-            f"{prof['protein_name']} ({prof['accession']}): {best['method']}, {res}"
-            + (f", {best['title']}" if best["title"] else "") + "."
-            + where
-            + f" {len(rows)} structures of this protein are loadable in total "
-              "(protein_structures lists them).")
+    return _ok(f"{msg} {best['pdb_id']} is the {prefer} choice for "
+               f"{prof['protein_name']} ({prof['accession']}): {best['method']}, {res}"
+               + (f", {best['title']}" if best["title"] else "") + "."
+               + where
+               + f" {len(rows)} structures of this protein are loadable in total "
+                 "(protein_structures lists them).",
+               {"accession": prof["accession"], "loaded": best["pdb_id"],
+                "method": best["method"], "resolution": best["resolution"],
+                "protein_chains": [c["chain"] for c in ours],
+                "chains": {c["chain"]: c["molecule"] for c in chains},
+                "loadable": len(rows)},
+               files=msg.files)
 
 
 # ── Structure preparation ────────────────────────────────────────────────────
@@ -1306,7 +1433,7 @@ def inspection_for(target: str = ""):
                                      prp.SCHEMA_VERSION)
 
 
-def tool_inspect_preparation(target: str = "") -> str:
+def tool_inspect_preparation(target: str = "") -> ToolResult:
     """
     Say what is wrong with a structure before anyone simulates it.
 
@@ -1321,10 +1448,10 @@ def tool_inspect_preparation(target: str = "") -> str:
         A plain-text checklist.
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     entry, finding = inspection_for(target)
     if not finding:
-        return f"Could not read '{target or 'the active structure'}'."
+        return _fail(f"Could not read '{target or 'the active structure'}'.")
     lines = [f"{entry['pdb_id']}: {finding['atoms']} atoms, {finding['residues']} "
              f"residues, {finding['models']} model(s), {finding['waters']} waters, "
              f"{finding['hydrogens']} hydrogens."]
@@ -1332,7 +1459,11 @@ def tool_inspect_preparation(target: str = "") -> str:
         lines.append("Nothing needs fixing before simulation.")
     for issue in finding["issues"]:
         lines.append(f"[{issue['level']}] {issue['title']} — {issue['detail']}")
-    return "\n".join(lines)
+    return _ok("\n".join(lines),
+               {"pdb_id": entry["pdb_id"],
+                **{k: finding[k] for k in ("atoms", "residues", "models", "waters", "hydrogens")},
+                "issues": [i["title"] for i in finding["issues"]]},
+               hints=["prepare_structure to fix them"] if finding["issues"] else None)
 
 
 def prepare_structure(target: str = "", profile: str = "amber", model=None,
@@ -1387,7 +1518,7 @@ def prepare_structure(target: str = "", profile: str = "amber", model=None,
 
 def tool_prepare_structure(target: str = "", profile: str = "amber",
                            model: int = 0, add_hydrogens: bool = False,
-                           keep_waters=None, keep_ligands=None) -> str:
+                           keep_waters=None, keep_ligands=None) -> ToolResult:
     """
     Clean a structure up and load the cleaned copy.
 
@@ -1407,7 +1538,7 @@ def tool_prepare_structure(target: str = "", profile: str = "amber",
         A description of what changed, or an error message.
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     overrides = {}
     if keep_waters is not None:
         overrides["keep_waters"] = bool(keep_waters)
@@ -1416,7 +1547,7 @@ def tool_prepare_structure(target: str = "", profile: str = "amber",
     record, err = prepare_structure(target, profile, model=int(model) or None,
                                     add_h=bool(add_hydrogens), **overrides)
     if err:
-        return err
+        return _fail(err)
 
     label = f"{record['source']}_prep"
     reg = register_structure(label, record["path"], source="local")
@@ -1432,7 +1563,14 @@ def tool_prepare_structure(target: str = "", profile: str = "amber",
            f"as {label}: {prp.report_text(record['report'], oneline=True)}"]
     if outstanding:
         out.append("Still outstanding: " + "; ".join(outstanding))
-    return " ".join(out)
+    rep_ = record["report"]
+    return _ok(" ".join(out),
+               {"source": record["source"], "loaded": label, "profile": profile,
+                "atoms_after": rep_.get("atoms_after"),
+                "hydrogens_added": rep_.get("hydrogens_added"),
+                "disulfide_cysteines": rep_.get("cys_renamed"),
+                "outstanding": outstanding},
+               files=[record["path"]])
 
 
 # ── Membrane embedding ───────────────────────────────────────────────────────
@@ -1533,7 +1671,7 @@ def orient_structure(target: str = "", source: str = "auto", n_ter: str = "in",
 
 
 def tool_orient_membrane(target: str = "", source: str = "auto",
-                         n_ter: str = "in", barrel: bool = False) -> str:
+                         n_ter: str = "in", barrel: bool = False) -> ToolResult:
     """
     Place a membrane protein in the bilayer and show it there.
 
@@ -1552,10 +1690,10 @@ def tool_orient_membrane(target: str = "", source: str = "auto",
         A description of the orientation, or an error message.
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     record, err = orient_structure(target, source, n_ter, bool(barrel))
     if err:
-        return err
+        return _fail(err)
     entry = find_structure(target) if target else active_structure()
     label = _load_oriented(entry, record)
     planes = record["info"].get("planes")
@@ -1568,12 +1706,15 @@ def tool_orient_membrane(target: str = "", source: str = "auto",
         bits.append(f"OPM calls it {record['info']['name']}")
     if record["source"] == "MEMEMBED":
         bits.append("this is a computed orientation — check it before building on it")
-    return ". ".join(bits) + "."
+    return _ok(". ".join(bits) + ".",
+               {"pdb_id": entry["pdb_id"], "loaded": label, "source": record["source"],
+                "thickness": thickness},
+               files=[record["path"]], hints=["build_membrane to pack lipids around it"])
 
 
 def tool_build_membrane(target: str = "", composition: str = "popc",
                         salt_concentration: float = 0.15,
-                        lipids: str = "", ratios: str = "") -> str:
+                        lipids: str = "", ratios: str = "") -> ToolResult:
     """
     Start packing a lipid bilayer around a membrane protein.
 
@@ -1594,29 +1735,30 @@ def tool_build_membrane(target: str = "", composition: str = "popc",
         Confirmation that the build started, or an error message.
     """
     if not mem.available():
-        return mem.backend_report()
+        return _fail(mem.backend_report(), {"unavailable": "packmol-memgen"})
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     job = st.session_state.membrane_job
     if job and job.get("status") == "running":
-        return (f"A membrane build for {job['label']} is already running "
-                f"({job.get('stage', 'running')}). Wait for it or cancel it first.")
+        return _fail(f"A membrane build for {job['label']} is already running "
+                     f"({job.get('stage', 'running')}). Wait for it or cancel it first.",
+                     hints=["membrane_status"])
 
     entry = find_structure(target) if target else active_structure()
     if not entry:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
 
     record, err = orient_structure(entry["pdb_id"])
     if err:
-        return f"Could not orient {entry['pdb_id']}: {err}"
+        return _fail(f"Could not orient {entry['pdb_id']}: {err}")
 
     if lipids and ratios:
         lip, rat, described = lipids, ratios, f"{lipids} in {ratios}"
     else:
         preset = mem.PRESET_BY_KEY.get((composition or "popc").lower())
         if not preset:
-            return ("Unknown composition. Available presets: "
-                    + ", ".join(p["key"] for p in mem.PRESETS))
+            return _fail("Unknown composition. Available presets: "
+                         + ", ".join(p["key"] for p in mem.PRESETS))
         lip, rat = mem.composition_args(preset["lower"], preset["upper"])
         described = preset["label"]
 
@@ -1627,14 +1769,17 @@ def tool_build_membrane(target: str = "", composition: str = "popc",
         salt=bool(salt_concentration), salt_concentration=salt_concentration or 0.15)
     st.session_state.membrane_job = job
     if job["status"] == "failed":
-        return job["error"]
-    return (f"Started packing {described} around {entry['pdb_id']} "
-            f"(oriented by {record['source']}). This runs in the background and "
-            f"takes minutes to hours depending on the protein — ask for the "
-            f"membrane status to check on it, or watch the Membrane tab.")
+        return _fail(job["error"])
+    return _ok(f"Started packing {described} around {entry['pdb_id']} "
+               f"(oriented by {record['source']}). This runs in the background and "
+               f"takes minutes to hours depending on the protein — ask for the "
+               f"membrane status to check on it, or watch the Membrane tab.",
+               {"pdb_id": entry["pdb_id"], "lipids": lip, "ratios": rat,
+                "status": "running"},
+               hints=["membrane_status"])
 
 
-def tool_membrane_status() -> str:
+def tool_membrane_status() -> ToolResult:
     """
     Report how the membrane build is getting on, and load it when it is done.
 
@@ -1643,21 +1788,23 @@ def tool_membrane_status() -> str:
     """
     job = st.session_state.membrane_job
     if not job:
-        return "No membrane build has been started in this session."
+        return _ok("No membrane build has been started in this session.", {"status": None})
     mem.poll(job)
     minutes = job.get("elapsed", 0) / 60
+    data = {"pdb_id": job["label"], "status": job["status"], "minutes": round(minutes, 1)}
     if job["status"] == "running":
-        return (f"Building a membrane for {job['label']}: {job['stage']}, "
-                f"{minutes:.1f} minutes in.")
+        return _ok(f"Building a membrane for {job['label']}: {job['stage']}, "
+                   f"{minutes:.1f} minutes in.", data)
     if job["status"] == "cancelled":
-        return f"The membrane build for {job['label']} was cancelled."
+        return _ok(f"The membrane build for {job['label']} was cancelled.", data)
     if job["status"] == "failed":
-        return f"The membrane build for {job['label']} failed: {job['error']}"
+        # The status report itself worked; the build it reports on did not.
+        return _ok(f"The membrane build for {job['label']} failed: {job['error']}", data)
     summary = job.get("summary") or mem.system_summary(job["output"])
-    return (f"The membrane system for {job['label']} finished in "
-            f"{minutes:.1f} minutes. {mem.summary_text(summary)} "
-            f"It is at {job['output']}; load it from the Membrane tab "
-            f"(the viewer copy leaves the water out).")
+    return _ok(f"The membrane system for {job['label']} finished in "
+               f"{minutes:.1f} minutes. {mem.summary_text(summary)} "
+               f"It is at {job['output']}; load it from the Membrane tab "
+               f"(the viewer copy leaves the water out).", data, files=[job["output"]])
 
 
 # ── Simulation setup ─────────────────────────────────────────────────────────
@@ -1926,8 +2073,9 @@ def _pick_option(value, options, default: str = ""):
     return next((k for k in options if norm(k) == want), None)
 
 
-def _bad_option(what: str, value, options) -> str:
-    return (f"Error: unknown {what} '{value}'. Options: " + ", ".join(options) + ".")
+def _bad_option(what: str, value, options) -> ToolResult:
+    return _fail(f"Error: unknown {what} '{value}'. Options: " + ", ".join(options) + ".",
+                 {"bad_option": what, "options": list(options)})
 
 
 # Common words for components whose dictionary name does not contain them
@@ -2006,8 +2154,13 @@ def _files_line(files: dict, dest: Path, archive: Path) -> str:
             f"the same set zipped as {archive}.")
 
 
+def _written(files: dict, dest: Path, archive: Path) -> list:
+    """Paths a simulation-setup tool wrote, for ToolResult.files."""
+    return [str(dest / k) for k, v in sorted(files.items()) if v is not None] + [str(archive)]
+
+
 def tool_parameterize_ligand(ligand: str = "", net_charge=None,
-                             charge_method: str = "bcc", target: str = "") -> str:
+                             charge_method: str = "bcc", target: str = "") -> ToolResult:
     """
     GAFF2 parameters and AM1-BCC charges for one ligand (antechamber + parmchk2).
 
@@ -2016,17 +2169,18 @@ def tool_parameterize_ligand(ligand: str = "", net_charge=None,
     the deposited form (ATP is recorded as 0, not -4 at pH 7).
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     tools = sim.tools_available()
     if not (tools["antechamber"] and tools["parmchk2"]):
-        return ("Cannot parameterise: AmberTools (antechamber, parmchk2) is not "
-                "installed here. Install it with setup_tools.sh, then ask again.")
+        return _fail("Cannot parameterise: AmberTools (antechamber, parmchk2) is not "
+                     "installed here. Install it with setup_tools.sh, then ask again.",
+                     {"unavailable": "ambertools"})
     name, entry = simulation_target(target)
     if not entry:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
     code, msg = _pick_ligand(entry, ligand, "parameterise")
     if not code:
-        return msg
+        return _fail(msg)
     method = _pick_option(charge_method, {"bcc": 0, "gas": 0}, "bcc")
     if not method:
         return _bad_option("charge method", charge_method, ["bcc", "gas"])
@@ -2039,7 +2193,8 @@ def tool_parameterize_ligand(ligand: str = "", net_charge=None,
 
     stored = parameterize_ligand(name, entry, code, charge, method)
     if stored.get("error"):
-        return f"antechamber failed on {code} in {name}: {stored['error']}"
+        return _fail(f"antechamber failed on {code} in {name}: {stored['error']}",
+                     {"ligand": code})
     out = [f"Parameterised {code} in {name} with GAFF2 and "
            f"{'AM1-BCC' if method == 'bcc' else 'Gasteiger'} charges, net charge "
            f"{charge:+d} (given): {Path(stored['mol2']).name} and "
@@ -2054,7 +2209,11 @@ def tool_parameterize_ligand(ligand: str = "", net_charge=None,
                    f"data for — check the geometry after minimisation.")
     if method == "gas":
         out.append("Gasteiger charges are crude: fine to test a setup, not for production.")
-    return " ".join(out)
+    return _ok(" ".join(out),
+               {"ligand": code, "structure": name, "net_charge": charge,
+                "charge_method": method, "guessed_parameters": len(stored["guessed"])},
+               files=[stored["mol2"], stored["frcmod"]],
+               hints=["setup_amber to build the system with it"])
 
 
 def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
@@ -2062,7 +2221,7 @@ def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
                      buffer: float = 12.0, salt_concentration: float = 0.15,
                      ions: str = "Na+/Cl-", temperature: float = 300.0,
                      pressure: float = 1.0, nanoseconds: float = 100.0,
-                     engine: str = "pmemd.cuda") -> str:
+                     engine: str = "pmemd.cuda") -> ToolResult:
     """
     Build an Amber system with tleap and write the run inputs.
 
@@ -2072,10 +2231,10 @@ def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
     says the topology was not built.
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
     ff = _pick_option(force_field, sim.PROTEIN_FFS, "ff19SB")
     if not ff:
         return _bad_option("force field", force_field, sim.PROTEIN_FFS)
@@ -2104,9 +2263,11 @@ def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
     params, missing = stored_ligand_params(name, entry)
     tleap = sim.tools_available()["tleap"]
     if tleap and missing:
-        return (f"Cannot build the Amber topology for {name} yet: {', '.join(missing)} "
-                f"has no parameters. Call parameterize_ligand for each (it needs the "
-                f"net charge), or prepare the structure without ligands.")
+        return _fail(f"Cannot build the Amber topology for {name} yet: {', '.join(missing)} "
+                     f"has no parameters. Call parameterize_ligand for each (it needs the "
+                     f"net charge), or prepare the structure without ligands.",
+                     {"missing_parameters": list(missing)},
+                     hints=[f"parameterize_ligand {c}" for c in missing])
 
     out = [_unprepared_note(name).strip()] if _unprepared_note(name) else []
     build = None
@@ -2137,17 +2298,25 @@ def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
                    "(setup_tools.sh) and ask again.")
         if missing:
             out.append(f"{', '.join(missing)} will also need parameters (parameterize_ligand).")
-    return " ".join(out)
+    data = {"structure": name, "force_field": ff, "water_model": water, "box": shape,
+            "nanoseconds": ns, "temperature": temp, "topology": bool(build and build["ok"])}
+    if build and build["ok"]:
+        data.update({k: build[k] for k in ("atoms", "residues", "waters", "charge", "disulfides")})
+    # Run inputs without tleap are a partial success; a tleap that ran and
+    # failed is a failure, whatever else was written.
+    return ToolResult(" ".join(out), not (build and not build["ok"]), data,
+                      _written(files, dest, archive),
+                      ["setup_oniom on this system"] if data["topology"] else None)
 
 
 def tool_setup_gromacs(target: str = "", temperature: float = 300.0,
-                       pressure: float = 1.0, nanoseconds: float = 100.0) -> str:
+                       pressure: float = 1.0, nanoseconds: float = 100.0) -> ToolResult:
     """GROMACS .mdp files (em, nvt, npt, md). No topology — the README says how."""
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
     temp = _num(temperature, 300.0)
     press = _num(pressure, 1.0)
     ns = _num(nanoseconds, 100.0)
@@ -2155,27 +2324,30 @@ def tool_setup_gromacs(target: str = "", temperature: float = 300.0,
     dest = SIMULATIONS_DIR / f"{name}_gromacs"
     archive = write_simulation_files(files, dest)
     membrane = mem.membrane_planes(entry["path"])
-    return (_unprepared_note(name)
-            + f"Wrote GROMACS run parameters for {name}: energy minimisation, NVT "
-            f"and NPT equilibration, and {ns:g} ns production at {temp:g} K, "
-            f"{press:g} bar ({'semi-isotropic, membrane' if membrane else 'isotropic'} "
-            f"pressure coupling). " + _files_line(files, dest, archive)
-            + " No GROMACS topology was made: PARORA does not build one. README.txt "
-            "has the commands — pdb2gmx on the prepared PDB, or convert an Amber "
-            "topology (setup_amber) with ParmEd/acpype.")
+    return _ok(_unprepared_note(name)
+               + f"Wrote GROMACS run parameters for {name}: energy minimisation, NVT "
+               f"and NPT equilibration, and {ns:g} ns production at {temp:g} K, "
+               f"{press:g} bar ({'semi-isotropic, membrane' if membrane else 'isotropic'} "
+               f"pressure coupling). " + _files_line(files, dest, archive)
+               + " No GROMACS topology was made: PARORA does not build one. README.txt "
+               "has the commands — pdb2gmx on the prepared PDB, or convert an Amber "
+               "topology (setup_amber) with ParmEd/acpype.",
+               {"structure": name, "nanoseconds": ns, "temperature": temp,
+                "pressure": press, "membrane": bool(membrane), "topology": False},
+               files=_written(files, dest, archive))
 
 
 def tool_setup_rosetta_docking(target: str = "", ligand: str = "",
-                               ligand_chain: str = "X", nstruct: int = 100) -> str:
+                               ligand_chain: str = "X", nstruct: int = 100) -> ToolResult:
     """RosettaLigand docking job files. Written, not run: Rosetta is not installed."""
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
     code, msg = _pick_ligand(entry, ligand, "dock")
     if not code:
-        return msg
+        return _fail(msg)
     chain = (str(ligand_chain or "X").strip() or "X")[:1].upper()
     n = min(max(int(_num(nstruct, 100)), 1), 100000)
     files = rosetta_job_files(name, entry, code, chain, n)
@@ -2192,7 +2364,10 @@ def tool_setup_rosetta_docking(target: str = "", ligand: str = "",
     if not prepared or prepared.get("profile") != "rosetta":
         out.append("Prepare it with the rosetta profile first: mixed deposited and "
                    "rebuilt hydrogens cause duplicate-atom errors.")
-    return " ".join(out)
+    return _ok(" ".join(out),
+               {"structure": name, "ligand": code, "ligand_chain": chain, "nstruct": n,
+                "has_mol2": f"{code}.mol2" in files, "run": False},
+               files=_written(files, dest, archive))
 
 
 def _region_keys(path, code: str, radius: float, center_keys=None) -> list:
@@ -2224,7 +2399,7 @@ def tool_setup_qm(target: str = "", center: str = "", chain: str = "",
                   side_chains_only: bool = True, charge=None, multiplicity: int = 1,
                   method: str = "B3LYP-D3", basis: str = "6-31G(d)",
                   job: str = "opt freq", solvent: str = "none", cores: int = 8,
-                  memory_gb: int = 16) -> str:
+                  memory_gb: int = 16) -> ToolResult:
     """
     Cut a QM cluster model around a ligand and write Gaussian/ORCA/Psi4 inputs.
 
@@ -2234,13 +2409,13 @@ def tool_setup_qm(target: str = "", center: str = "", chain: str = "",
     of the ligand (4HHB's four hemes) and no chain given → ask which one.
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
     code, msg = _pick_ligand(entry, center, "centre the QM region on")
     if not code:
-        return msg
+        return _fail(msg)
     meth = _pick_option(method, qm.METHODS, "B3LYP-D3")
     if not meth:
         return _bad_option("method", method, qm.METHODS)
@@ -2262,8 +2437,8 @@ def tool_setup_qm(target: str = "", center: str = "", chain: str = "",
     elif ch:
         keys = [k for k in copies if str(k[0]).upper() == ch]
         if not keys:
-            return (f"Error: {code} in {name} is in chain(s) "
-                    f"{', '.join(sorted({str(k[0]) for k in copies}))}, not {ch}.")
+            return _fail(f"Error: {code} in {name} is in chain(s) "
+                         f"{', '.join(sorted({str(k[0]) for k in copies}))}, not {ch}.")
     else:
         opts = [{"label": f"{code} {k[1]}{k[2]} in chain {k[0]}",
                  "meaning": f"use the {code} copy in chain {k[0]}"} for k in copies[:4]]
@@ -2303,14 +2478,21 @@ def tool_setup_qm(target: str = "", center: str = "", chain: str = "",
     out.append(f"Level: {meth}/{bas}, job '{jb}', solvent {solv}, link atoms frozen. "
                + _files_line(files, dest, archive))
     out += [f"Caution: {w}" for w in region["warnings"]]
-    return " ".join(out)
+    return _ok(" ".join(out),
+               {"structure": name, "center": code, "chain": ch or None, "radius": r,
+                "atoms": len(region["atoms"]), "link_atoms": len(region["links"]),
+                "formula": region["formula"], "charge": total, "multiplicity": mult,
+                "method": meth, "basis": bas, "job": jb,
+                "residues": [f"{res}{key[1]}{key[2]}({key[0]})"
+                             for key, res in region["residues"]]},
+               files=_written(files, dest, archive))
 
 
 def tool_setup_oniom(center: str = "", radius: float = 4.0,
                      side_chains_only: bool = True, mm_radius: float = 15.0,
                      method: str = "B3LYP/6-31G(d):Amber",
                      embedding: str = "electronic", job: str = "opt",
-                     charge=None, multiplicity: int = 1, cores: int = 8) -> str:
+                     charge=None, multiplicity: int = 1, cores: int = 8) -> ToolResult:
     """
     A Gaussian ONIOM (QM/MM) input on the Amber system built by setup_amber.
 
@@ -2318,9 +2500,10 @@ def tool_setup_oniom(center: str = "", radius: float = 4.0,
     """
     build = st.session_state.amber_build
     if not (build and build.get("ok")):
-        return ("Cannot set up ONIOM yet: it needs an Amber topology for the MM "
-                "layer's atom types and charges. Build one first with setup_amber "
-                "(needs AmberTools and, for a ligand, parameterize_ligand).")
+        return _fail("Cannot set up ONIOM yet: it needs an Amber topology for the MM "
+                     "layer's atom types and charges. Build one first with setup_amber "
+                     "(needs AmberTools and, for a ligand, parameterize_ligand).",
+                     hints=["setup_amber"])
     meth = _pick_option(method, oniom.ONIOM_METHODS, "B3LYP/6-31G(d):Amber")
     if not meth:
         return _bad_option("ONIOM method", method, oniom.ONIOM_METHODS)
@@ -2332,11 +2515,11 @@ def tool_setup_oniom(center: str = "", radius: float = 4.0,
         return _bad_option("job type", job, ["opt", "sp", "opt freq"])
     leap_pdb, paired, err = oniom_pairing(build)
     if err:
-        return f"Cannot set up ONIOM: {err}"
+        return _fail(f"Cannot set up ONIOM: {err}")
     code, msg = _pick_ligand({"path": str(leap_pdb), "pdb_id": build.get("name", "")},
                              center, "put in the QM layer")
     if not code:
-        return msg
+        return _fail(msg)
     r = min(max(_num(radius, 4.0), 0.0), 12.0)
     sphere = min(max(_num(mm_radius, 15.0), 0.0), 30.0)
     model = build_oniom_model(build, paired, [code], _region_keys(leap_pdb, code, r),
@@ -2349,7 +2532,7 @@ def tool_setup_oniom(center: str = "", radius: float = 4.0,
     dest = SIMULATIONS_DIR / f"{build.get('name', 'system')}_oniom"
     archive = write_simulation_files(files, dest)
     n_copies = len(_copy_keys(leap_pdb, code))
-    return (f"Built an ONIOM model on {build.get('name')}'s Amber system around {code}"
+    return _ok(f"Built an ONIOM model on {build.get('name')}'s Amber system around {code}"
             f"{f' (all {n_copies} copies are in the QM layer)' if n_copies > 1 else ''}: "
             f"{layered['high']} QM atoms, {layered['low']} MM atoms "
             f"({'MM layer within ' + format(sphere, 'g') + ' Å' if sphere else 'whole system'}), "
@@ -2357,7 +2540,13 @@ def tool_setup_oniom(center: str = "", radius: float = 4.0,
             f"{meth}, {emb} embedding, job '{jb}', QM charge {q:+d} "
             f"({'given' if _given(charge) else 'from the topology partial charges'}), "
             f"multiplicity {mult}, MM layer frozen. Residue numbers are leap's (from 1). "
-            + _files_line(files, dest, archive))
+            + _files_line(files, dest, archive),
+               {"structure": build.get("name"), "center": code, "copies": n_copies,
+                "qm_atoms": layered["high"], "mm_atoms": layered["low"],
+                "left_out": layered["dropped"], "link_atoms": len(model["boundary"]),
+                "method": meth, "embedding": emb, "job": jb, "charge": q,
+                "charge_given": _given(charge), "multiplicity": mult},
+               files=_written(files, dest, archive))
 
 
 DEFAULT_REPS = [
@@ -2462,7 +2651,7 @@ def clear_scene() -> None:
     st.session_state.annotations = []
 
 
-def tool_fetch_structure(pdb_id: str) -> str:
+def tool_fetch_structure(pdb_id: str) -> ToolResult:
     """
     Load a PDB structure from RCSB, keeping whatever is already in the scene.
 
@@ -2480,7 +2669,7 @@ def tool_fetch_structure(pdb_id: str) -> str:
     return tool_add_structure(pdb_id)
 
 
-def tool_replace_scene(pdb_id: str) -> str:
+def tool_replace_scene(pdb_id: str) -> ToolResult:
     """
     Unload everything and load one structure in its place.
 
@@ -2493,21 +2682,21 @@ def tool_replace_scene(pdb_id: str) -> str:
     pdb_id = pdb_id.upper().strip()
     dest, err = download_pdb(pdb_id)
     if err:
-        return err
+        return _fail(err, {"pdb_id": pdb_id})
     clear_scene()
     register_structure(pdb_id, dest, source="rcsb")
-    return f"Cleared the scene and loaded {pdb_id}."
+    return _ok(f"Cleared the scene and loaded {pdb_id}.", {"loaded": pdb_id}, files=[dest])
 
 
-def tool_clear_scene() -> str:
+def tool_clear_scene() -> ToolResult:
     """Unload every structure and reset the scene."""
     had = [s["pdb_id"] for s in structures()]
     clear_scene()
-    return ("Cleared the scene" + (f" (was: {', '.join(had)})" if had else "")
-            + ". Nothing is loaded now.")
+    return _ok("Cleared the scene" + (f" (was: {', '.join(had)})" if had else "")
+               + ". Nothing is loaded now.", {"removed": had})
 
 
-def tool_add_structure(pdb_id: str) -> str:
+def tool_add_structure(pdb_id: str) -> ToolResult:
     """
     Load a PDB structure *alongside* whatever is already in the scene.
 
@@ -2523,10 +2712,10 @@ def tool_add_structure(pdb_id: str) -> str:
     """
     pdb_id = pdb_id.upper().strip()
     if find_structure(pdb_id):
-        return f"{pdb_id} is already in the scene."
+        return _ok(f"{pdb_id} is already in the scene.", {"loaded": pdb_id, "already": True})
     dest, err = download_pdb(pdb_id)
     if err:
-        return err
+        return _fail(err, {"pdb_id": pdb_id})
 
     first = not structures()
     note = "" if first else _recolor_for_comparison()
@@ -2536,14 +2725,16 @@ def tool_add_structure(pdb_id: str) -> str:
         if not st.session_state.representations:
             st.session_state.representations = [dict(r, id=uuid.uuid4().hex[:8])
                                                 for r in DEFAULT_REPS]
-        return f"Loaded {pdb_id} → {dest}"
+        return _ok(f"Loaded {pdb_id} → {dest}", {"loaded": pdb_id}, files=[dest])
     others = [s["pdb_id"] for s in structures() if s["sid"] != entry["sid"]]
-    return (f"Added {pdb_id} alongside {', '.join(others)} — the earlier "
-            f"structures are still loaded. It is drawn at its deposited "
-            f"coordinates; superpose it to compare them.{note}")
+    return _ok(f"Added {pdb_id} alongside {', '.join(others)} — the earlier "
+               f"structures are still loaded. It is drawn at its deposited "
+               f"coordinates; superpose it to compare them.{note}",
+               {"loaded": pdb_id, "also_loaded": others}, files=[dest],
+               hints=[f"superpose_structures {pdb_id} onto {others[0]}"] if others else None)
 
 
-def tool_load_local(filepath: str, replace: bool = True) -> str:
+def tool_load_local(filepath: str, replace: bool = True) -> ToolResult:
     """
     Load a PDB structure from a local file path into the viewer.
 
@@ -2559,7 +2750,7 @@ def tool_load_local(filepath: str, replace: bool = True) -> str:
     """
     p = Path(filepath)
     if not p.exists():
-        return f"File not found: {filepath}"
+        return _fail(f"File not found: {filepath}")
     if replace or not structures():
         reset_structures()
         st.session_state.selections = {}
@@ -2568,13 +2759,13 @@ def tool_load_local(filepath: str, replace: bool = True) -> str:
         st.session_state.camera_target = None
         st.session_state.superpose_msg = None
         register_structure(p.stem, p, source="local")
-        return f"Loaded local file: {p.name}"
+        return _ok(f"Loaded local file: {p.name}", {"loaded": p.stem, "replaced": True})
     note = _recolor_for_comparison()
     register_structure(p.stem, p, source="local")
-    return f"Added local file {p.name} to the scene.{note}"
+    return _ok(f"Added local file {p.name} to the scene.{note}", {"loaded": p.stem})
 
 
-def tool_remove_structure(target: str) -> str:
+def tool_remove_structure(target: str) -> ToolResult:
     """
     Remove one structure from the scene, along with its representation layers.
 
@@ -2586,11 +2777,12 @@ def tool_remove_structure(target: str) -> str:
     """
     s = find_structure(target)
     if not s:
-        return f"No structure called '{target}' is loaded."
+        return _fail(f"No structure called '{target}' is loaded.")
     label = s["pdb_id"]
     drop_structure(s["sid"])
-    remaining = ", ".join(x["pdb_id"] for x in structures()) or "none"
-    return f"Removed {label}. Still loaded: {remaining}."
+    left = [x["pdb_id"] for x in structures()]
+    return _ok(f"Removed {label}. Still loaded: {', '.join(left) or 'none'}.",
+               {"removed": label, "loaded": left})
 
 
 @st.cache_data(show_spinner=False)
@@ -2621,7 +2813,7 @@ def structure_summary(target: str = ""):
                            srep.SCHEMA_VERSION)
 
 
-def tool_describe_structure(target: str = "", detail: str = "brief") -> str:
+def tool_describe_structure(target: str = "", detail: str = "brief") -> ToolResult:
     """
     Describe what a structure contains, in plain language.
 
@@ -2642,15 +2834,20 @@ def tool_describe_structure(target: str = "", detail: str = "brief") -> str:
         A plain-text report, or an error message.
     """
     if not structures():
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     summary = structure_summary(target)
     if summary is None:
-        return (f"No structure called '{target}' is loaded. Loaded: "
-                + ", ".join(s["pdb_id"] for s in structures()))
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + ", ".join(s["pdb_id"] for s in structures()))
     text = (srep.as_text(summary)
             if (detail or "brief").lower() in ("full", "detailed", "long", "all")
             else srep.as_brief(summary))
-    return text + _pocket_summary(find_structure(target) if target else active_structure())
+    entry = find_structure(target) if target else active_structure()
+    return _ok(text + _pocket_summary(entry),
+               {"pdb_id": entry["pdb_id"] if entry else target,
+                "totals": summary["totals"], "models": summary["models"],
+                "waters": summary["waters"],
+                "components": {c["code"]: c["count"] for c in summary["components"]}})
 
 
 def _pocket_summary(entry) -> str:
@@ -2708,7 +2905,7 @@ def _cached_foldseek(path: str, mtime: float, chains: tuple, max_hits: int,
                       db=db)
 
 
-def _foldseek_choice(entry: dict) -> str:
+def _foldseek_choice(entry: dict, info: dict = None) -> str:
     """
     The question to put to the user when there is no local Foldseek
     database and they have not agreed to an online search: which of the two
@@ -2730,6 +2927,8 @@ def _foldseek_choice(entry: dict) -> str:
     failed = (f" A previous download failed: {detail.strip()[-150:]}"
               if state == "failed" else "")
     st.session_state.foldseek_pending = entry["pdb_id"]
+    if info is not None:
+        info["needs_user_choice"] = True
     # The model tends to shorten this question to "online or download?" and
     # drop the upload warning and the size, so run_agent appends this exact
     # wording to its reply instead of trusting the paraphrase.
@@ -2749,7 +2948,7 @@ def _foldseek_choice(entry: dict) -> str:
             f"(2) {download}.{failed}")
 
 
-def tool_download_foldseek_database() -> str:
+def tool_download_foldseek_database() -> ToolResult:
     """
     Start downloading the local Foldseek PDB database, in the background.
 
@@ -2759,11 +2958,12 @@ def tool_download_foldseek_database() -> str:
     """
     state, _ = fsk.download_status()
     if state == "ready":
-        return "The local Foldseek database is already installed — searches run locally."
+        return _ok("The local Foldseek database is already installed — searches run locally.",
+                   {"status": "ready"})
     ok, msg = fsk.start_download()
     if ok:
         st.session_state.pop("foldseek_pending", None)
-    return msg
+    return ToolResult(msg, ok, {"status": "downloading" if ok else "failed"})
 
 
 def _fold_key(c: dict):
@@ -2993,7 +3193,8 @@ def _foldseek_exclude(entry: dict) -> str:
     return ""
 
 
-def _afdb_neighbor_lines(entry: dict, chains: list, max_hits: int) -> list:
+def _afdb_neighbor_lines(entry: dict, chains: list, max_hits: int,
+                         info: dict = None) -> list:
     """
     Foldseek hits against the local AlphaFold DB (Swiss-Prot) database.
 
@@ -3002,8 +3203,10 @@ def _afdb_neighbor_lines(entry: dict, chains: list, max_hits: int) -> list:
     mouse, plant and fly orthologs here). Hits are predicted models with no
     CATH/SCOP classification, so they name proteins, never a fold.
     Local only: nothing is uploaded, so no consent question is needed.
-    Returns [] when the database is not installed.
+    Returns [] when the database is not installed. `info`, when given, gets
+    "afdb_neighbours" (the hits' accessions) for run_agent's provenance note.
     """
+    info = {} if info is None else info
     db = fsk.find_afdb_database()
     if not db or not fsk.find_foldseek():
         return []
@@ -3012,6 +3215,8 @@ def _afdb_neighbor_lines(entry: dict, chains: list, max_hits: int) -> list:
         max_hits, _foldseek_exclude(entry), db, fsk.SCHEMA_VERSION)
     if not ok:
         return [f"  AlphaFold DB search failed: {msg}"]
+    info["afdb_neighbours"] = [h.get("accession") or h.get("target")
+                               for g in result.values() for h in g["hits"]]
     lines = [f"  AlphaFold DB neighbours (Foldseek vs the local "
              f"'{Path(db).name}' database — AlphaFold predicted models of reviewed "
              "UniProt entries, E-value ≤ 1e-3; no CATH/SCOP classification exists "
@@ -3034,7 +3239,8 @@ def _afdb_neighbor_lines(entry: dict, chains: list, max_hits: int) -> list:
 
 
 def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
-                               where: str = "auto", database: str = "pdb") -> list:
+                               where: str = "auto", database: str = "pdb",
+                               info: dict = None) -> list:
     """
     Foldseek hits for some chains of a structure, each annotated with the
     hit's own CATH/SCOP classification, plus a per-chain fold consensus.
@@ -3050,9 +3256,16 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
     database: "pdb" (default) — chains with no confident PDB match then also
     get the local AlphaFold DB search, when installed; "alphafold" — only
     the local AlphaFold DB search.
+
+    info: optional dict filled with what the lines say, for ToolResult.data —
+    "needs_user_choice", "error", "hits" (PDB id + chain), "no_pdb_match"
+    (chains), "afdb_neighbours".
     """
+    info = {} if info is None else info
     if database == "alphafold":
-        lines = _afdb_neighbor_lines(entry, chains, max_hits)
+        lines = _afdb_neighbor_lines(entry, chains, max_hits, info)
+        if not lines:
+            info["error"] = "AlphaFold DB Foldseek database not installed"
         return lines or [
             "The AlphaFold DB (Swiss-Prot) Foldseek database is not installed "
             "(~1.6 GB download, ~2.4 GB on disk). Install: foldseek databases "
@@ -3061,16 +3274,19 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
     local_ok, local_msg = fsk.availability()
     online_ok = entry["path"] in st.session_state.get("foldseek_online_ok", set())
     if where == "local" and not local_ok:
-        return [local_msg if fsk.find_database() else _foldseek_choice(entry)]
+        if fsk.find_database():
+            info["error"] = local_msg
+            return [local_msg]
+        return [_foldseek_choice(entry, info)]
     if where == "online" and not online_ok:
-        return [_foldseek_choice(entry)]
+        return [_foldseek_choice(entry, info)]
     if where == "auto":
         if local_ok:
             where = "local"
         elif online_ok:
             where = "online"
         else:
-            return [_foldseek_choice(entry)]
+            return [_foldseek_choice(entry, info)]
 
     exclude = _foldseek_exclude(entry)
     db = "online" if where == "online" else fsk.find_database()
@@ -3078,8 +3294,10 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
         entry["path"], Path(entry["path"]).stat().st_mtime, tuple(chains),
         max(max_hits, FOLD_POOL), exclude, db, fsk.SCHEMA_VERSION)
     if not ok:
+        info["error"] = msg
         return [msg]
     st.session_state.pop("foldseek_pending", None)
+    info["where"] = where
 
     against = (f"the {fsk.ONLINE_DB} database on search.foldseek.com (online)"
                if where == "online" else f"the local '{Path(db).name}' database")
@@ -3096,6 +3314,9 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
             no_pdb_match.append(rep)
             continue
         lines.append(f"  chain {label}:")
+        info.setdefault("hits", []).extend(
+            f"{h['pdb_id'].upper()}:{h['chain']}" if h["kind"] == "pdb"
+            else (h.get("accession") or h.get("name") or "") for h in pool_hits[:max_hits])
         # Classify what is shown plus the distant hits (the independent
         # evidence); near-identical ones only when no distant hit is classified.
         shown = pool_hits[:max_hits]
@@ -3136,11 +3357,12 @@ def _structural_neighbor_lines(entry: dict, chains: list, max_hits: int,
                 lines.append(f"    {i}. {h['name']} — {h['description']} — {stats}")
         lines.append(_fold_consensus(pool_hits, doms_of))
     if no_pdb_match:
-        lines.extend(_afdb_neighbor_lines(entry, no_pdb_match, max_hits))
+        info["no_pdb_match"] = list(no_pdb_match)
+        lines.extend(_afdb_neighbor_lines(entry, no_pdb_match, max_hits, info))
     return lines
 
 
-def tool_describe_fold(chain: str = "") -> str:
+def tool_describe_fold(chain: str = "") -> ToolResult:
     """
     Report a structure's fold/topology — real, sourced data, never a guess.
 
@@ -3165,7 +3387,7 @@ def tool_describe_fold(chain: str = "") -> str:
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
 
     atoms = _atoms_of(entry)
     chains = atoms["chains_present"]
@@ -3173,8 +3395,8 @@ def tool_describe_fold(chain: str = "") -> str:
     if (chain or "").strip():
         wanted_chain = chain.strip().upper().replace("CHAIN", "").strip()
         if wanted_chain not in chains:
-            return (f"Chain {wanted_chain} is not in {entry['pdb_id']}. "
-                    f"Chains present: {', '.join(chains)}")
+            return _fail(f"Chain {wanted_chain} is not in {entry['pdb_id']}. "
+                         f"Chains present: {', '.join(chains)}", {"chains": list(chains)})
         chains = [wanted_chain]
 
     lines = [f"Fold/topology for {entry['pdb_id']}"
@@ -3247,8 +3469,9 @@ def tool_describe_fold(chain: str = "") -> str:
     # 3. Chains with no classification of their own: which classified
     #    structures do they resemble? (Foldseek, optional.)
     unclassified = [ch for ch in chains if ch not in classification]
+    info = {}
     if unclassified:
-        lines.extend(_structural_neighbor_lines(entry, unclassified, max_hits=3))
+        lines.extend(_structural_neighbor_lines(entry, unclassified, max_hits=3, info=info))
 
     # One verdict line up front. With the classification, DSSP and the
     # "no classification" wording all in one report, qwen2.5:7b wrote "does
@@ -3274,11 +3497,16 @@ def tool_describe_fold(chain: str = "") -> str:
                    "entry for this structure.")
     lines.insert(1, "SUMMARY: " + verdict)
 
-    return "\n".join(lines)
+    return _ok("\n".join(lines),
+               {"pdb_id": entry["pdb_id"], "classified": classified,
+                "unclassified": unclassified, "folds": names,
+                "classification": {ch: [d.get("cath_id") or d.get("sunid")
+                                        for d in classification[ch]] for ch in classified},
+                **{k: v for k, v in info.items() if k != "error"}})
 
 
 def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
-                                   where: str = "auto", database: str = "pdb") -> str:
+                                   where: str = "auto", database: str = "pdb") -> ToolResult:
     """
     Find known structures that the loaded structure resembles in 3D.
 
@@ -3305,14 +3533,14 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     chains = []
     if (chain or "").strip():
         wanted = chain.strip().upper().replace("CHAIN", "").strip()
         present = _atoms_of(entry)["chains_present"]
         if wanted not in present:
-            return (f"Chain {wanted} is not in {entry['pdb_id']}. "
-                    f"Chains present: {', '.join(present)}")
+            return _fail(f"Chain {wanted} is not in {entry['pdb_id']}. "
+                         f"Chains present: {', '.join(present)}", {"chains": list(present)})
         chains = [wanted]
     try:
         max_hits = max(1, min(int(max_hits), 20))
@@ -3326,8 +3554,10 @@ def tool_find_structural_neighbors(chain: str = "", max_hits: int = 5,
     database = (database or "pdb").strip().lower()
     database = "alphafold" if database in ("alphafold", "afdb", "af", "swissprot",
                                           "swiss-prot") else "pdb"
-    lines.extend(_structural_neighbor_lines(entry, chains, max_hits, where, database))
-    return "\n".join(lines)
+    info = {}
+    lines.extend(_structural_neighbor_lines(entry, chains, max_hits, where, database, info))
+    return ToolResult("\n".join(lines), "error" not in info,
+                      {"pdb_id": entry["pdb_id"], "database": database, **info})
 
 
 @st.cache_data(show_spinner=False)
@@ -3372,7 +3602,7 @@ def _pocket_occupancy(p: dict) -> str:
         f"{o['n_in']} of {o['n_atoms']} atoms inside)" for o in p["occupants"])
 
 
-def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
+def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> ToolResult:
     """
     Find candidate ligand-binding pockets from the structure's own geometry.
 
@@ -3397,16 +3627,16 @@ def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     if not pkt.fpocket_available():
-        return pkt.UNAVAILABLE
+        return _fail(pkt.UNAVAILABLE, {"unavailable": "fpocket"})
     wanted = ""
     if (chain or "").strip():
         wanted = chain.strip().upper().replace("CHAIN", "").strip()
         present = _atoms_of(entry)["chains_present"]
         if wanted not in present:
-            return (f"Chain {wanted} is not in {entry['pdb_id']}. "
-                    f"Chains present: {', '.join(present)}")
+            return _fail(f"Chain {wanted} is not in {entry['pdb_id']}. "
+                         f"Chains present: {', '.join(present)}", {"chains": list(present)})
     try:
         max_pockets = max(1, min(int(max_pockets), 15))
     except (TypeError, ValueError):
@@ -3415,7 +3645,7 @@ def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
     ok, msg, result = _cached_pockets(entry["path"], Path(entry["path"]).stat().st_mtime,
                                       pkt.SCHEMA_VERSION)
     if not ok:
-        return msg
+        return _fail(msg)
     pockets = [p for p in result["pockets"]
                if not wanted or any(r[0] == wanted for r in p["residues"])]
     scope = f", chain {wanted}" if wanted else ""
@@ -3428,12 +3658,17 @@ def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
     lines = [f"Candidate binding pockets in {entry['pdb_id']}{scope} — fpocket, from this "
              f"structure's own geometry ({stripped}, so occupied and empty sites are found "
              "alike)."]
+    # run_agent hands a pocket-only request this report verbatim, and attaches
+    # data["summary"] to a mixed one (P12).
+    data = {"pdb_id": entry["pdb_id"], "chain": wanted or None, "count": len(pockets),
+            "relaxed": bool(result["relaxed"]), "summary": "", "pockets": []}
     if not pockets:
         lines.append("fpocket found no pocket"
                      + (f" lined by chain {wanted}" if wanted else "")
                      + ", even with a relaxed minimum size — there is no cavity here that "
                      "could hold a ligand.")
-        return "\n".join(lines)
+        data["summary"] = lines[-1]
+        return _ok("\n".join(lines), data)
 
     if result["relaxed"]:
         best = max(p.get("drug_score", 0) for p in pockets)
@@ -3472,6 +3707,15 @@ def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
     else:
         lines.append(f"SUMMARY: none of the {len(pockets)} pocket(s) reaches fpocket's "
                      f"druggability threshold ({pkt.DRUGGABLE}).")
+    data["summary"] = lines[-1][len("SUMMARY: "):]
+    data["druggable"] = [p["rank"] for p in druggable]
+    data["empty_druggable"] = [p["rank"] for p in empty_drug]
+    data["pockets"] = [{"rank": p["rank"], "score": round(p.get("score", 0), 2),
+                        "druggability": round(p.get("drug_score", 0), 2),
+                        "volume": round(p.get("volume", 0)),
+                        "chains": sorted({r[0] for r in p["residues"]}),
+                        "occupants": [o["label"] for o in p["occupants"]]}
+                       for p in shown + extra]
     for p in shown + extra:
         lines.append("")
         lines.append(_pocket_line(p))
@@ -3486,7 +3730,9 @@ def tool_find_pockets(chain: str = "", max_pockets: int = 5) -> str:
         "measurements — a cryptic pocket that only opens when the protein moves or a "
         "ligand binds is not visible here.")
     lines.append("To show one in the viewer, say \"highlight pocket N\".")
-    return "\n".join(lines)
+    top = (druggable or shown)[0]["rank"]
+    return _ok("\n".join(lines), data,
+               hints=[f"highlight pocket {top}", f"find_contacts pocket {top}"])
 
 
 _GENERIC_SITE = re.compile(r"\b(ligands?|pockets?|binding[ _-]?sites?|active[ _-]?sites?|"
@@ -3610,7 +3856,7 @@ def _mutation_from_prompt(prompt: str, residue: str) -> str:
 
 
 def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str = "",
-                                 chain: str = "") -> str:
+                                 chain: str = "") -> ToolResult:
     """
     Predict how tolerated a single amino-acid substitution is — a MODEL
     PREDICTION from ESM-2 sequence statistics, never a measurement.
@@ -3635,9 +3881,9 @@ def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str =
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     if not esm.esm_available():
-        return esm.unavailable_reason()
+        return _fail(esm.unavailable_reason(), {"unavailable": "esm"})
 
     m = _MUTATION_TOKEN.match(residue or "")
     if m:
@@ -3646,13 +3892,13 @@ def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str =
         residue = m.group(2)
     spec = mz.parse_spec(residue or "")
     if spec["resseq"] is None:
-        return (f"Could not read a residue number from '{residue}'. Give the position, "
-                "e.g. '45' or 'A/45'.")
+        return _fail(f"Could not read a residue number from '{residue}'. Give the position, "
+                     "e.g. '45' or 'A/45'.")
     resseq, icode = spec["resseq"], spec["icode"] or ""
 
     mut = esm.parse_amino_acid(mutant) if (mutant or "").strip() else ""
     if (mutant or "").strip() and not mut:
-        return f"'{mutant}' is not one of the 20 standard amino acids."
+        return _fail(f"'{mutant}' is not one of the 20 standard amino acids.")
     wt_claim = esm.parse_amino_acid(wildtype) if (wildtype or "").strip() else ""
     if not wt_claim and spec["resname"]:
         wt_claim = esm.parse_amino_acid(spec["resname"])
@@ -3665,14 +3911,15 @@ def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str =
                if r["kind"] == "protein" and r["resseq"] == resseq and r["icode"] == icode}
     if wanted:
         if wanted not in residues:
-            return (f"Chain {wanted} is not in {entry['pdb_id']}. "
-                    f"Chains present: {', '.join(residues)}")
+            return _fail(f"Chain {wanted} is not in {entry['pdb_id']}. "
+                         f"Chains present: {', '.join(residues)}", {"chains": list(residues)})
         if wanted not in holders:
-            return (f"Residue {resseq}{icode} is not an observed amino acid in "
-                    f"{entry['pdb_id']} chain {wanted}.")
+            return _fail(f"Residue {resseq}{icode} is not an observed amino acid in "
+                         f"{entry['pdb_id']} chain {wanted}.")
         use = wanted
     elif not holders:
-        return f"No chain of {entry['pdb_id']} has an observed amino acid numbered {resseq}{icode}."
+        return _fail(f"No chain of {entry['pdb_id']} has an observed amino acid numbered "
+                     f"{resseq}{icode}.")
     else:
         # "H92A" in hemoglobin: only chain B has a His at 92, so no question.
         if wt_claim and any(r["one"] == wt_claim for r in holders.values()):
@@ -3696,21 +3943,22 @@ def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str =
     target = holders[use]
     wt = target["one"]
     if wt not in esm.AMINO_ACIDS:
-        return (f"Residue {target['resname']} {resseq} in chain {use} is non-standard; "
-                "ESM-2 scores only the 20 standard amino acids.")
+        return _fail(f"Residue {target['resname']} {resseq} in chain {use} is non-standard; "
+                     "ESM-2 scores only the 20 standard amino acids.")
     if wt_claim and wt_claim != wt:
-        return (f"Residue {resseq} of {entry['pdb_id']} chain {use} is "
-                f"{target['resname']} ({wt}), not {wt_claim}. Check the position or "
-                "numbering — nothing was predicted.")
+        return _fail(f"Residue {resseq} of {entry['pdb_id']} chain {use} is "
+                     f"{target['resname']} ({wt}), not {wt_claim}. Check the position or "
+                     "numbering — nothing was predicted.",
+                     {"chain": use, "residue": resseq, "wildtype": wt})
     if mut == wt:
-        return f"{wt}{resseq}{mut} is not a substitution — the residue is already {wt}."
+        return _fail(f"{wt}{resseq}{mut} is not a substitution — the residue is already {wt}.")
 
     tokens, index_of, notes = esm.chain_sequence(path, use)
     idx = index_of[(resseq, icode)]
     with st.spinner("Scoring with ESM-2…"):
         res = _cached_esm_position(path, mtime, use, idx, esm.model_name())
     if not res.get("ok"):
-        return f"ESM-2 prediction failed: {res.get('error', 'unknown error')}"
+        return _fail(f"ESM-2 prediction failed: {res.get('error', 'unknown error')}")
     lp = res["log_probs"]
     ranked = sorted(lp, key=lp.get, reverse=True)
     p_wt, wt_rank = math.exp(lp[wt]), ranked.index(wt) + 1
@@ -3772,7 +4020,18 @@ def tool_predict_mutation_effect(residue: str, mutant: str = "", wildtype: str =
                    "UniProt sequence")
     caveats.extend(notes)
     lines.append("Caveats: " + "; ".join(caveats) + ".")
-    return "\n".join(lines)
+    # data["model_prediction"] is what run_agent's ESM caveat footer keys on.
+    data = {"model_prediction": True, "model": model, "pdb_id": entry["pdb_id"],
+            "chain": use, "residue": f"{resseq}{icode}", "wildtype": wt,
+            "native_probability": round(p_wt, 2), "native_rank": wt_rank,
+            "top": {a: round(math.exp(lp[a]), 2) for a in ranked[:5]},
+            "low_confidence": wt_rank > 3 or p_wt < 0.10}
+    if mut:
+        data.update({"mutant": mut, "llr": round(lp[mut] - lp[wt], 2),
+                     "band": esm.band(lp[mut] - lp[wt])})
+    else:
+        data["llr"] = {a: round(lp[a] - lp[wt], 1) for a in ranked if a != wt}
+    return _ok("\n".join(lines), data)
 
 
 # P11: a stability question that names a mutation is answerable (as a proxy);
@@ -3894,13 +4153,14 @@ def _stability_estimate(mutations: list) -> str:
              "together with how buried the position is in this structure."]
     for resseq, mut, wt, chain in mutations:
         report = tool_predict_mutation_effect(resseq, mut, wt, chain)
-        if not report.startswith("MODEL PREDICTION"):
+        if not (report.ok and report.data.get("model_prediction")):
             # A chain question or an error (wrong wild type, no such residue):
             # nothing was scored, so there is nothing to frame.
             return report
-        pos = re.search(r"^Position: .*? chain (\S)[ ,]", report, re.M)
-        use = pos.group(1) if pos else chain
-        llr_m = re.search(r"log-likelihood ratio ([+-]\d+\.\d+)", report)
+        use = report.data.get("chain") or chain
+        # A float only when one substitution was scored; a dict for all 19.
+        llr = report.data.get("llr")
+        llr = llr if isinstance(llr, float) else None
         rsa = _residue_rsa(entry["path"], use, int(resseq))
         buried, exposed = rsa is not None and rsa <= 0.10, rsa is not None and rsa >= 0.30
         where = ("of unknown burial" if rsa is None else
@@ -3921,7 +4181,7 @@ def _stability_estimate(mutations: list) -> str:
             if site:
                 where += f"; mostly covered by {site} — {own:.0%} accessible in its own chain alone"
                 buried = False
-        if not llr_m:
+        if llr is None:
             reading = ("No single substitution named — the ranking above shows which "
                        "replacements the model expects this position to accept least. "
                        + ("At a buried position those are the likelier destabilizing ones."
@@ -3931,7 +4191,6 @@ def _stability_estimate(mutations: list) -> str:
                           "The score alone cannot separate a stability cost from a "
                           "functional one."))
         else:
-            llr = float(llr_m.group(1))
             if llr >= -3:
                 reading = ("No sequence-level signal of destabilization. That is weak "
                            "evidence the mutation is near-neutral for stability, not proof.")
@@ -3968,7 +4227,7 @@ def _stability_estimate(mutations: list) -> str:
     return "\n\n".join(parts)
 
 
-def tool_ask_user(question: str, options) -> str:
+def tool_ask_user(question: str, options) -> ToolResult:
     """
     Put a clarifying question to the user instead of guessing.
 
@@ -3985,14 +4244,14 @@ def tool_ask_user(question: str, options) -> str:
         options = [o.strip(" -*0123456789.)") for o in re.split(r"[;\n]|,\s(?=[A-Z])", options)]
     options = [o for o in options if str(o).strip()]
     if not question.strip():
-        return "ask_user needs a question."
+        return _fail("ask_user needs a question.")
     return ask_clarification(question, options)
 
 
-def tool_list_structures() -> str:
+def tool_list_structures() -> ToolResult:
     """Describe every structure currently in the scene and how it is placed."""
     if not structures():
-        return "No structures are loaded."
+        return _ok("No structures are loaded.", {"loaded": []})
     lines = []
     for s in structures():
         bits = [s["pdb_id"]]
@@ -4007,7 +4266,11 @@ def tool_list_structures() -> str:
         if chains:
             bits.append(f"— {chains}")
         lines.append(" ".join(bits))
-    return "Loaded structures: " + "\n".join(lines)
+    return _ok("Loaded structures: " + "\n".join(lines),
+               {"loaded": [s["pdb_id"] for s in structures()],
+                "active": (active_structure() or {}).get("pdb_id"),
+                "chains": {s["pdb_id"]: {c["chain"]: c["molecule"] for c in chain_molecules(s)}
+                           for s in structures()}})
 
 
 def _ngl_resname(resname: str) -> str:
@@ -4254,7 +4517,7 @@ def _add_highlight(ngl: str, name: str) -> None:
     })
 
 
-def tool_select(name: str, expression: str) -> str:
+def tool_select(name: str, expression: str) -> ToolResult:
     """
     Create a named selection and immediately highlight it in the viewer.
 
@@ -4283,10 +4546,10 @@ def tool_select(name: str, expression: str) -> str:
             mda_expr = _ngl_to_mda_approx(ngl)
             count = len(u.select_atoms(mda_expr))
             if count == 0:
-                return (
+                return _fail(
                     f"Warning: '{expression}' matched 0 atoms in {st.session_state.pdb_id}. "
                     f"This structure may not contain that residue/selection. "
-                    f"Nothing was highlighted."
+                    f"Nothing was highlighted.", {"atoms": 0}
                 )
         except Exception:
             pass
@@ -4294,17 +4557,19 @@ def tool_select(name: str, expression: str) -> str:
     st.session_state.selections[name] = ngl
     _add_highlight(ngl, name)
     short = ngl[:60] + "..." if len(ngl) > 60 else ngl
-    return f"Selection '{name}' ({label}) highlighted as ball+stick. NGL: {short}"
+    return _ok(f"Selection '{name}' ({label}) highlighted as ball+stick. NGL: {short}",
+               {"name": name, "ngl": ngl})
 
 
-def tool_select_within(name: str, radius: float, target_selection: str) -> str:
+def tool_select_within(name: str, radius: float, target_selection: str) -> ToolResult:
     """Select all atoms within `radius` Å of `target_selection`, expanded to whole residues."""
     u = get_universe()
     if not u:
         # Approximate fallback when MDAnalysis is unavailable
         ngl = f"({resolve_selection(target_selection)}) or polymer"
         st.session_state.selections[name] = ngl
-        return f"MDAnalysis unavailable; approximate selection stored"
+        return _ok("MDAnalysis unavailable; approximate selection stored",
+                   {"name": name, "approximate": True})
 
     try:
         target_ngl = resolve_selection(target_selection)
@@ -4313,12 +4578,16 @@ def tool_select_within(name: str, radius: float, target_selection: str) -> str:
         nearby = u.select_atoms(f"byres (around {radius} group target)", target=target_ag)
         ngl = mda_to_ngl_serial(nearby)
         st.session_state.selections[name] = ngl
-        return f"Selection '{name}': {len(nearby.residues)} residues within {radius}Å of '{target_selection}'"
+        return _ok(f"Selection '{name}': {len(nearby.residues)} residues within {radius}Å "
+                   f"of '{target_selection}'",
+                   {"name": name, "residues": len(nearby.residues), "radius": radius,
+                    "residue_ids": [f"{r.resname}{r.resid}:{r.segid}"
+                                    for r in nearby.residues[:200]]})
     except Exception as e:
-        return f"Error: {e}"
+        return _fail(f"Error: {e}")
 
 
-def tool_select_by_bfactor(name: str, operator: str, threshold: float) -> str:
+def tool_select_by_bfactor(name: str, operator: str, threshold: float) -> ToolResult:
     """
     Select atoms where B-factor satisfies the given comparison.
 
@@ -4332,14 +4601,17 @@ def tool_select_by_bfactor(name: str, operator: str, threshold: float) -> str:
     """
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable"
+        return _fail("MDAnalysis unavailable", {"unavailable": "mdanalysis"})
     try:
-        ag = u.select_atoms(f"tempfactor {operator} {threshold}")
+        # MDAnalysis compares attributes only through `prop`; a bare
+        # "tempfactor > 50" failed to parse on every call.
+        ag = u.select_atoms(f"prop tempfactor {operator} {float(threshold)}")
         ngl = mda_to_ngl_serial(ag)
         st.session_state.selections[name] = ngl
-        return f"Selection '{name}': {len(ag)} atoms with B-factor {operator} {threshold}"
+        return _ok(f"Selection '{name}': {len(ag)} atoms with B-factor {operator} {threshold}",
+                   {"name": name, "atoms": len(ag), "residues": len(ag.residues)})
     except Exception as e:
-        return f"Error: {e}"
+        return _fail(f"Error: {e}")
 
 
 def _normalise_color(color: str) -> str:
@@ -4366,7 +4638,7 @@ def _normalise_color(color: str) -> str:
 
 
 def tool_show(rep_type: str, selection: str, color: str = "element",
-              exclusive: bool = False) -> str:
+              exclusive: bool = False) -> ToolResult:
     """
     Add or replace a visual representation layer for a given selection.
 
@@ -4407,8 +4679,8 @@ def tool_show(rep_type: str, selection: str, color: str = "element",
     # NGL silently ignores an unknown representation type, which looks to the
     # user like the command was simply dropped. Fail loudly instead.
     if rep_type not in NGL_REP_TYPES:
-        return (f"Unknown representation '{rep_type}'. Valid styles: "
-                + ", ".join(NGL_REP_TYPES))
+        return _fail(f"Unknown representation '{rep_type}'. Valid styles: "
+                     + ", ".join(NGL_REP_TYPES), {"options": list(NGL_REP_TYPES)})
 
     color = _normalise_color(color)
 
@@ -4434,10 +4706,12 @@ def tool_show(rep_type: str, selection: str, color: str = "element",
         "sid": _scope_for(ngl_sel),
     })
     suffix = " — everything else hidden" if exclusive else ""
-    return f"Showing {rep_type} for '{selection}' ({color}){suffix}"
+    return _ok(f"Showing {rep_type} for '{selection}' ({color}){suffix}",
+               {"rep_type": rep_type, "ngl": ngl_sel, "color": color,
+                "exclusive": bool(exclusive)})
 
 
-def tool_hide(selection: str) -> str:
+def tool_hide(selection: str) -> ToolResult:
     """
     Hide a selection: drop any layer that is exactly it, and narrow every
     broader surviving layer so it no longer draws those atoms either.
@@ -4477,16 +4751,18 @@ def tool_hide(selection: str) -> str:
             f"narrowed {narrowed} layer(s) to exclude it" if narrowed else "",
         ) if p
     ) or "no matching layers found"
-    return f"Hid '{selection}' ({detail})"
+    return _ok(f"Hid '{selection}' ({detail})",
+               {"ngl": ngl_sel, "removed": removed, "narrowed": narrowed})
 
 
-def tool_hide_all() -> str:
+def tool_hide_all() -> ToolResult:
     """Remove every representation layer from the viewer, leaving a blank canvas."""
+    n = len(st.session_state.representations)
     st.session_state.representations = []
-    return "All representations hidden"
+    return _ok("All representations hidden", {"removed": n})
 
 
-def tool_show_all(rep_type: str = "cartoon") -> str:
+def tool_show_all(rep_type: str = "cartoon") -> ToolResult:
     """
     Replace all current representations with a single full-structure view.
 
@@ -4499,10 +4775,10 @@ def tool_show_all(rep_type: str = "cartoon") -> str:
     st.session_state.representations = [
         {"type": rep_type, "selection": "all", "color": "residueindex", "transparency": 0.0}
     ]
-    return f"Showing {rep_type} for all atoms"
+    return _ok(f"Showing {rep_type} for all atoms", {"rep_type": rep_type})
 
 
-def tool_color(color: str, selection: str) -> str:  # noqa: D401
+def tool_color(color: str, selection: str) -> ToolResult:  # noqa: D401
     """
     Apply a color to all existing representation layers for a given selection.
 
@@ -4530,15 +4806,16 @@ def tool_color(color: str, selection: str) -> str:  # noqa: D401
         else:
             for r in rest:
                 r["color"] = color
-            return f"Colored the rest (everything not coloured explicitly) as {color}"
+            return _ok(f"Colored the rest (everything not coloured explicitly) as {color}",
+                       {"color": color, "layers": len(rest)})
 
     ngl_sel = resolve_selection(selection)
     unknown = _ngl_unknown_words(ngl_sel)
     if unknown:
-        return (f"Error: could not read the selection '{selection}' (unknown word(s): "
-                f"{', '.join(unknown)}). Nothing was coloured. Use 'chain A', "
-                f"'chains C-K', 'chains C, D and E', or 'rest' for everything "
-                f"not yet coloured.")
+        return _fail(f"Error: could not read the selection '{selection}' (unknown word(s): "
+                     f"{', '.join(unknown)}). Nothing was coloured. Use 'chain A', "
+                     f"'chains C-K', 'chains C, D and E', or 'rest' for everything "
+                     f"not yet coloured.", {"unknown_words": list(unknown)})
 
     updated = 0
     for r in reps:
@@ -4546,7 +4823,8 @@ def tool_color(color: str, selection: str) -> str:  # noqa: D401
             r["color"] = color
             updated += 1
     if updated:
-        return f"Colored '{selection}' as {color}"
+        return _ok(f"Colored '{selection}' as {color}",
+                   {"color": color, "ngl": ngl_sel, "layers": updated})
 
     # No layer is exactly this selection, so the atoms are drawn by a broader
     # one (the load-time "protein" cartoon). Just stacking a coloured layer on
@@ -4570,7 +4848,8 @@ def tool_color(color: str, selection: str) -> str:  # noqa: D401
                                     "color": color, "transparency": 0.0,
                                     "sid": _scope_for(ngl_sel), "_colored": True}
     reps.extend(added.values())
-    return f"Colored '{selection}' as {color}"
+    return _ok(f"Colored '{selection}' as {color}",
+               {"color": color, "ngl": ngl_sel, "layers": len(added)})
 
 
 _REST_RE = re.compile(
@@ -4580,7 +4859,7 @@ _REST_RE = re.compile(
     re.IGNORECASE)
 
 
-def tool_set_transparency(value: float, selection: str) -> str:
+def tool_set_transparency(value: float, selection: str) -> ToolResult:
     """
     Set the transparency of all representation layers for a given selection.
 
@@ -4597,7 +4876,8 @@ def tool_set_transparency(value: float, selection: str) -> str:
         if r["selection"] == ngl_sel:
             r["transparency"] = max(0.0, min(1.0, value))  # Clamp to [0, 1]
             updated += 1
-    return f"Set transparency {value} on {updated} representation(s) for '{selection}'"
+    return _ok(f"Set transparency {value} on {updated} representation(s) for '{selection}'",
+               {"value": value, "ngl": ngl_sel, "layers": updated})
 
 
 # ── Geometric measurement ────────────────────────────────────────────────────
@@ -4701,26 +4981,33 @@ def _selection_missing(selection) -> bool:
     }
 
 
-def tool_measure_mda_distance(sel1: str, sel2: str) -> str:
+def tool_measure_mda_distance(sel1: str, sel2: str) -> ToolResult:
     """Measure a deterministic distance using raw MDAnalysis selection syntax."""
     u = get_universe()
     if not u:
-        return "Load a protein structure before measuring a distance."
+        return _fail("Load a protein structure before measuring a distance.")
 
     sel1 = _clean_mda_selection(sel1)
     sel2 = _clean_mda_selection(sel2)
 
     if _selection_missing(sel1) or _selection_missing(sel2):
-        return (
+        return _fail(
             "To calculate a distance, specify two atoms or atom selections. "
             "For example: measure the distance between the CA atoms of "
             "residues 50 and 100 in chain A."
         )
 
     try:
-        return measure_distance_from_universe(u, sel1, sel2)
+        n1, n2 = len(u.select_atoms(sel1)), len(u.select_atoms(sel2))
+        text = measure_distance_from_universe(u, sel1, sel2)
+        if not (n1 and n2):
+            return _fail(text, {"atoms": [n1, n2]})
+        d = math.dist(u.select_atoms(sel1).center_of_geometry(),
+                      u.select_atoms(sel2).center_of_geometry())
+        return _ok(text, {"sel1": sel1, "sel2": sel2, "atoms": [n1, n2],
+                          "distance": round(d, 2)})
     except Exception as e:
-        return f"Error measuring MDAnalysis distance: {e}"
+        return _fail(f"Error measuring MDAnalysis distance: {e}")
 
 
 MAX_MEASUREMENTS = 12
@@ -4774,7 +5061,7 @@ def _remember_measurement(first, second, d) -> None:
     st.session_state.measurements = (existing + [entry])[-MAX_MEASUREMENTS:]
 
 
-def tool_measure_distance(a: str = "", b: str = "", **legacy) -> str:
+def tool_measure_distance(a: str = "", b: str = "", **legacy) -> ToolResult:
     """
     Measure the distance between two residues, atoms or ligands.
 
@@ -4799,7 +5086,7 @@ def tool_measure_distance(a: str = "", b: str = "", **legacy) -> str:
     b = b or legacy.get("atom2_sel", "")
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
 
     names = [s["pdb_id"] for s in structures()]
     resn = _atoms_of(entry)["resnames_present"]
@@ -4808,10 +5095,10 @@ def tool_measure_distance(a: str = "", b: str = "", **legacy) -> str:
 
     first, err = _pick(a, entry, cross)
     if err:
-        return err
+        return _fail(err)
     second, err = _pick(b, entry, cross)
     if err:
-        return err
+        return _fail(err)
 
     d = mz.distance(first["atoms"], first["indices"],
                     second["atoms"], second["indices"])
@@ -4839,7 +5126,11 @@ def tool_measure_distance(a: str = "", b: str = "", **legacy) -> str:
                              "if you meant the fitted positions"))
 
     _remember_measurement(first, second, d)
-    return "\n".join(lines)
+    return _ok("\n".join(lines),
+               {"a": first["label"], "b": second["label"],
+                "ca": None if d["ca"] is None else round(d["ca"], 2),
+                "closest": round(d["closest"], 2), "centre": round(d["centre"], 2),
+                "closest_atoms": list(d["closest_atoms"]), "contact": d["closest"] < 4.0})
 
 
 def _key_to_ngl(key) -> str:
@@ -4875,7 +5166,7 @@ def _store_interactions(entry, found) -> None:
 
 def tool_find_interactions(target: str = "", types: str = "",
                            radius: float = 0.0, include_water: bool = False,
-                           limit: int = 25) -> str:
+                           limit: int = 25) -> ToolResult:
     """
     Find non-covalent interactions: salt bridges, hydrogen bonds and the rest.
 
@@ -4898,7 +5189,7 @@ def tool_find_interactions(target: str = "", types: str = "",
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     atoms = _atoms_of(entry)
 
     wanted = [t.strip().lower().replace(" ", "_").replace("-", "_")
@@ -4943,16 +5234,17 @@ def tool_find_interactions(target: str = "", types: str = "",
         target = ""
     keys, plabel = _pocket_target(target) if target else (None, None)
     if plabel and not keys:
-        return plabel
+        return _fail(plabel)
     if keys:
         restrict, scope_label, target = set(keys), plabel, ""
     if target:
         target, msg = _generic_ligand(target, "find the interactions of")
         if msg:
-            return msg
+            return _fail(msg)
         side, err = _pick(target, entry, cross=False)
         if err:
-            return err + _pocket_hint(target)
+            hint = _pocket_hint(target)
+            return _fail(err + hint, hints=["find_pockets"] if hint else None)
         else:
             restrict = {(atoms["chain"][i], atoms["resseq"][i], atoms["icode"][i])
                         for i in side["indices"]}
@@ -5013,12 +5305,24 @@ def tool_find_interactions(target: str = "", types: str = "",
         lines.append(f"Drawn in the viewer as coloured dashed lines "
                      f"({min(len(found), MAX_INTERACTION_LINES)} of {len(found)}).")
 
-    st.session_state.interaction_msg = "\n".join(lines)
+    # Pairs by type: what the disulfide nudge and the fact check read.
+    pairs = {}
+    for f in found:
+        pairs.setdefault(f["type"], set()).add(
+            " — ".join(sorted((f["a_label"], f["b_label"]))))
+    st.session_state.interaction_msg = _ok(
+        "\n".join(lines),
+        {"pdb_id": entry["pdb_id"], "scope": scope_label,
+         "types": kinds or "default", "counts": dict(result["counts"]),
+         "residue_pairs": {k: len(v) for k, v in pairs.items()},
+         "pairs": {k: sorted(v)[:100] for k, v in pairs.items()},
+         "disulfides": len(pairs.get("disulfide", ()))},
+        hints=["highlight interactions"] if found else None)
     return st.session_state.interaction_msg
 
 
 def tool_highlight(target: str, style: str = "ball+stick",
-                   color: str = "yellow", zoom: bool = True) -> str:
+                   color: str = "yellow", zoom: bool = True) -> ToolResult:
     """
     Highlight one or more residues, ligands or regions in the viewer.
 
@@ -5036,7 +5340,7 @@ def tool_highlight(target: str, style: str = "ball+stick",
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     atoms = _atoms_of(entry)
 
     keys, labels = [], []
@@ -5044,7 +5348,8 @@ def tool_highlight(target: str, style: str = "ball+stick",
 
     if spec.lower() in ("interactions", "interaction", "contacts", "last"):
         if not st.session_state.interactions:
-            return "No interactions have been found yet — run find_interactions first."
+            return _fail("No interactions have been found yet — run find_interactions first.",
+                         hints=["find_interactions"])
         sels = []
         for m in st.session_state.interactions:
             for end in (m["a"], m["b"]):
@@ -5056,7 +5361,7 @@ def tool_highlight(target: str, style: str = "ball+stick",
     elif _pocket_target(spec) != (None, None):
         pocket_keys, label = _pocket_target(spec)
         if pocket_keys is None:
-            return label
+            return _fail(label)
         ngl, labels = keys_to_ngl(pocket_keys), [label]
     else:
         for piece in [p for p in spec.split(",") if p.strip()]:
@@ -5083,14 +5388,14 @@ def tool_highlight(target: str, style: str = "ball+stick",
                 continue
             side, err = _pick(piece, entry, cross=False)
             if err:
-                return err
+                return _fail(err)
             for i in side["indices"]:
                 key = (atoms["chain"][i], atoms["resseq"][i], atoms["icode"][i])
                 if key not in keys:
                     keys.append(key)
             labels.append(side["label"])
         if not keys:
-            return "Nothing to highlight — name a residue, ligand or range."
+            return _fail("Nothing to highlight — name a residue, ligand or range.")
         ngl = keys_to_ngl(keys)
 
     if style not in NGL_REP_TYPES:
@@ -5109,11 +5414,13 @@ def tool_highlight(target: str, style: str = "ball+stick",
     })
     if zoom:
         st.session_state.camera_target = ngl
-    return (f"Highlighted {'; '.join(labels)} in {entry['pdb_id']} as {style} "
-            f"({color}). Saved as the selection 'highlight'.")
+    return _ok(f"Highlighted {'; '.join(labels)} in {entry['pdb_id']} as {style} "
+               f"({color}). Saved as the selection 'highlight'.",
+               {"pdb_id": entry["pdb_id"], "targets": labels, "ngl": ngl,
+                "style": style, "color": color, "zoomed": bool(zoom)})
 
 
-def tool_measure_angle(a: str, b: str, c: str) -> str:
+def tool_measure_angle(a: str, b: str, c: str) -> ToolResult:
     """
     Measure the angle at residue `b` between residues `a` and `c`.
 
@@ -5128,25 +5435,25 @@ def tool_measure_angle(a: str, b: str, c: str) -> str:
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
 
     points, labels = [], []
     for spec_text in (a, b, c):
         side, err = _pick(spec_text, entry, cross=True)
         if err:
-            return err
+            return _fail(err)
         idx = mz._representative(side["atoms"], side["indices"]) or side["indices"][0]
         points.append(side["atoms"]["xyz"][idx])
         labels.append(side["label"])
 
     value = mz.angle(*points)
     if value is None:
-        return "Two of those points coincide, so there is no angle to measure."
-    return (f"Angle at {labels[1]} between {labels[0]} and {labels[2]}: "
-            f"{value:.1f}°")
+        return _fail("Two of those points coincide, so there is no angle to measure.")
+    return _ok(f"Angle at {labels[1]} between {labels[0]} and {labels[2]}: "
+               f"{value:.1f}°", {"points": labels, "angle": round(value, 1)})
 
 
-def tool_measure_dihedral(a: str, b: str, c: str, d: str) -> str:
+def tool_measure_dihedral(a: str, b: str, c: str, d: str) -> ToolResult:
     """
     Measure the torsion angle about the b–c axis, in degrees.
 
@@ -5163,26 +5470,26 @@ def tool_measure_dihedral(a: str, b: str, c: str, d: str) -> str:
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
 
     points, labels = [], []
     for spec_text in (a, b, c, d):
         side, err = _pick(spec_text, entry, cross=True)
         if err:
-            return err
+            return _fail(err)
         idx = mz._representative(side["atoms"], side["indices"]) or side["indices"][0]
         points.append(side["atoms"]["xyz"][idx])
         labels.append(f"{side['label']}·{side['atoms']['name'][idx]}")
 
     value = mz.dihedral(*points)
     if value is None:
-        return "Those four points are collinear, so there is no torsion to measure."
-    return (f"Dihedral {labels[0]} → {labels[1]} → {labels[2]} → {labels[3]}: "
-            f"{value:.1f}°")
+        return _fail("Those four points are collinear, so there is no torsion to measure.")
+    return _ok(f"Dihedral {labels[0]} → {labels[1]} → {labels[2]} → {labels[3]}: "
+               f"{value:.1f}°", {"points": labels, "dihedral": round(value, 1)})
 
 
 def tool_find_contacts(target: str, radius: float = 4.0,
-                       include_water: bool = False) -> str:
+                       include_water: bool = False) -> ToolResult:
     """
     List every residue within a cutoff of a residue or ligand.
 
@@ -5201,7 +5508,7 @@ def tool_find_contacts(target: str, radius: float = 4.0,
     """
     entry = active_structure()
     if not entry:
-        return "No structure is loaded — fetch one first."
+        return _fail(NO_STRUCTURE)
     # An empty target here is "the ligand" with the noun dropped: qwen2.5:7b
     # sent target='' for "what does the ligand bind to" after a find_pockets
     # turn, got "no residue was named", and told the user 4HHB has no ligand.
@@ -5211,21 +5518,25 @@ def tool_find_contacts(target: str, radius: float = 4.0,
     # model back to find_pockets, whose report it then garbled.
     keys, plabel = _pocket_target(target) if target else (None, None)
     if plabel and not keys:
-        return plabel
+        return _fail(plabel)
     if keys:
         m = re.search(r"(\d+)", target)
         p = st.session_state.pockets["by_rank"][int(m.group(1))]
         if not p.get("occupants"):
-            return (f"Nothing is bound in {plabel.split(' (')[0]} of {entry['pdb_id']} — it is "
-                    f"empty in this file. Its lining residues: {_pocket_residues(p)}.")
+            # An answer, not a failure: the lining is what surrounds an empty pocket.
+            return _ok(f"Nothing is bound in {plabel.split(' (')[0]} of {entry['pdb_id']} — "
+                       f"it is empty in this file. Its lining residues: {_pocket_residues(p)}.",
+                       {"pocket": p["rank"], "occupants": [],
+                        "lining": [f"{r[3]}{r[1]}{r[2]}:{r[0]}" for r in p["residues"]]})
         occ = p["occupants"][0]
         target = occ["label"].split(" ", 1)[1]           # "HEM B/148" -> "B/148"
     target, msg = _generic_ligand(target or "ligand", "list the residues in contact with")
     if msg:
-        return msg
+        return _fail(msg)
     side, err = _pick(target, entry, cross=False)
     if err:
-        return err + _pocket_hint(target)
+        hint = _pocket_hint(target)
+        return _fail(err + hint, hints=["find_pockets"] if hint else None)
 
     try:
         radius = float(radius)
@@ -5238,14 +5549,17 @@ def tool_find_contacts(target: str, radius: float = 4.0,
     # results for the others.
     groups = side["groups"]
     code = groups[0][0].split()[0].upper()
+    data = {"pdb_id": entry["pdb_id"], "target": side["label"], "radius": radius}
     if (len(groups) > 1 and target.strip().upper() == code
             and code not in srep.STANDARD_AA):
         per = 15
+        data["copies"] = {}
         lines = [f"'{target}' has {len(groups)} copies in {entry['pdb_id']}; "
                  f"residues within {radius:g} Å of each:"]
         for label, indices in groups[:6]:
             found = mz.contacts(side["atoms"], indices, radius,
                                 include_water=bool(include_water))
+            data["copies"][label] = {c["label"]: round(c["distance"], 2) for c in found}
             lines.append(f"{label} ({len(found)} found)" + (":" if found else
                          f" — nothing within {radius:g} Å."))
             for c in found[:per]:
@@ -5255,13 +5569,15 @@ def tool_find_contacts(target: str, radius: float = 4.0,
                 lines.append(f"  …and {len(found) - per} more")
         if len(groups) > 6:
             lines.append(f"({len(groups) - 6} more copies not listed — add a chain to pick one.)")
-        return "\n".join(lines)
+        return _ok("\n".join(lines), data)
 
     found = mz.contacts(side["atoms"], side["indices"], radius,
                         include_water=bool(include_water))
+    data["contacts"] = {c["label"]: round(c["distance"], 2) for c in found}
     if not found:
-        return (f"Nothing is within {radius:g} Å of {side['label']} in "
-                f"{entry['pdb_id']}.")
+        # A real empty shell, not a failed search.
+        return _ok(f"Nothing is within {radius:g} Å of {side['label']} in "
+                   f"{entry['pdb_id']}.", data)
 
     lines = [f"Residues within {radius:g} Å of {side['label']} in {entry['pdb_id']} "
              f"({len(found)} found):"]
@@ -5272,7 +5588,7 @@ def tool_find_contacts(target: str, radius: float = 4.0,
         lines.append(f"  …and {len(found) - 40} more")
     if side["note"]:
         lines.append(f"  note: {side['note']}")
-    return "\n".join(lines)
+    return _ok("\n".join(lines), data)
 
 
 def _ensure_loaded(target: str):
@@ -5302,7 +5618,7 @@ def _ensure_loaded(target: str):
 
 def tool_superpose(mobile: str, reference: str, method: str = "auto",
                    mobile_selection: str = "protein",
-                   reference_selection: str = "protein") -> str:
+                   reference_selection: str = "protein") -> ToolResult:
     """
     Superimpose one loaded structure onto another so they share a coordinate frame.
 
@@ -5326,16 +5642,17 @@ def tool_superpose(mobile: str, reference: str, method: str = "auto",
         were paired, or an error message.
     """
     if not sup.available():
-        return "MDAnalysis is unavailable, so structures cannot be superposed."
+        return _fail("MDAnalysis is unavailable, so structures cannot be superposed.",
+                     {"unavailable": "mdanalysis"})
 
     mob, err = _ensure_loaded(mobile)
     if err:
-        return err
+        return _fail(err)
     ref, err = _ensure_loaded(reference)
     if err:
-        return err
+        return _fail(err)
     if mob["sid"] == ref["sid"]:
-        return "The mobile and reference structures must be different."
+        return _fail("The mobile and reference structures must be different.")
 
     result = sup.superpose(
         mob["path"], ref["path"],
@@ -5345,19 +5662,23 @@ def tool_superpose(mobile: str, reference: str, method: str = "auto",
     )
     if not result["ok"]:
         st.session_state.superpose_msg = result["message"]
-        return result["message"]
+        return _fail(result["message"])
 
     mob["matrix"] = result["matrix"]
     mob["fit"] = result["message"]
     mob["fit_reference"] = ref["pdb_id"]
     mob["rmsd"] = result["rmsd"]
     st.session_state.camera_target = None      # refit the camera on both
-    msg = f"Superposed {mob['pdb_id']} onto {ref['pdb_id']} — {result['message']}."
+    msg = _ok(f"Superposed {mob['pdb_id']} onto {ref['pdb_id']} — {result['message']}.",
+              {"mobile": mob["pdb_id"], "reference": ref["pdb_id"],
+               "rmsd": None if result["rmsd"] is None else round(result["rmsd"], 2),
+               "matched": result.get("n_atoms"), "identity": result.get("identity"),
+               "method": result.get("method")})
     st.session_state.superpose_msg = msg
     return msg
 
 
-def tool_clear_superposition(target: str = "all") -> str:
+def tool_clear_superposition(target: str = "all") -> ToolResult:
     """
     Put superposed structures back at their deposited coordinates.
 
@@ -5372,22 +5693,22 @@ def tool_clear_superposition(target: str = "all") -> str:
     else:
         s = find_structure(target)
         if not s:
-            return f"No structure called '{target}' is loaded."
+            return _fail(f"No structure called '{target}' is loaded.")
         hits = [s] if s["matrix"] else []
 
     if not hits:
-        return "No structure is currently superposed."
+        return _ok("No structure is currently superposed.", {"reset": []})
     for s in hits:
         s["matrix"] = None
         s["fit"] = None
         s.pop("fit_reference", None)
         s.pop("rmsd", None)
     st.session_state.superpose_msg = None
-    return ("Reset " + ", ".join(s["pdb_id"] for s in hits) +
-            " to the deposited coordinates.")
+    return _ok("Reset " + ", ".join(s["pdb_id"] for s in hits) +
+               " to the deposited coordinates.", {"reset": [s["pdb_id"] for s in hits]})
 
 
-def tool_zoom(selection: str) -> str:
+def tool_zoom(selection: str) -> ToolResult:
     """
     Focus the NGL camera on a selection after the next page render.
 
@@ -5402,10 +5723,10 @@ def tool_zoom(selection: str) -> str:
     """
     ngl_sel = resolve_selection(selection)
     st.session_state.camera_target = ngl_sel
-    return f"Camera focused on '{selection}'"
+    return _ok(f"Camera focused on '{selection}'", {"ngl": ngl_sel})
 
 
-def tool_set_background(color: str) -> str:
+def tool_set_background(color: str) -> ToolResult:
     """
     Set the NGL viewer background color.
 
@@ -5423,10 +5744,10 @@ def tool_set_background(color: str) -> str:
     if c not in valid:
         c = "black"
     st.session_state.background = c
-    return f"Background set to {c}"
+    return _ok(f"Background set to {c}", {"background": c})
 
 
-def tool_save_structure(filename: str) -> str:
+def tool_save_structure(filename: str) -> ToolResult:
     """
     Copy the currently loaded PDB file to a new filename in STRUCTURES_DIR.
 
@@ -5438,14 +5759,13 @@ def tool_save_structure(filename: str) -> str:
     """
     path = st.session_state.pdb_path
     if not path or not Path(path).exists():
-        return "No structure loaded"
+        return _fail("No structure loaded")
     out = STRUCTURES_DIR / filename
-    import shutil
     shutil.copy2(path, out)
-    return f"Saved to {out}"
+    return _ok(f"Saved to {out}", files=[out])
 
 
-def tool_remove_solvent() -> str:
+def tool_remove_solvent() -> ToolResult:
     """
     Strip all water molecules from the current structure and save the result.
 
@@ -5462,11 +5782,12 @@ def tool_remove_solvent() -> str:
     """
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable"
+        return _fail("MDAnalysis unavailable", {"unavailable": "mdanalysis"})
     entry = active_structure()
     if not entry:
-        return "No structure loaded"
+        return _fail("No structure loaded")
     try:
+        waters = len(u.select_atoms("water").residues)
         no_water = u.select_atoms("not water")
         out_path = STRUCTURES_DIR / f"{st.session_state.pdb_id}_no_solvent.pdb"
         no_water.write(str(out_path))
@@ -5474,18 +5795,21 @@ def tool_remove_solvent() -> str:
         entry["source"] = "local"
         st.session_state.pdb_path = str(out_path)
         st.session_state.universe = None   # Force reload from the new de-solvated file
-        return f"Removed solvent. Saved to {out_path.name}"
+        return _ok(f"Removed solvent. Saved to {out_path.name}",
+                   {"pdb_id": entry["pdb_id"], "waters_removed": waters}, files=[out_path])
     except Exception as e:
-        return f"Error: {e}"
+        return _fail(f"Error: {e}")
 
 
-def tool_add_hydrogens() -> str:
+def tool_add_hydrogens() -> ToolResult:
     """
     Placeholder for hydrogen addition (requires OpenBabel or RDKit).
 
     Returns an informative message instead of silently failing.
     """
-    return "Hydrogen addition requires OpenBabel or RDKit (not installed). Install openbabel-python to enable."
+    return _fail("Hydrogen addition requires OpenBabel or RDKit (not installed). "
+                 "Install openbabel-python to enable.", {"unavailable": "openbabel"},
+                 hints=["prepare_structure with add_hydrogens"])
 
 def _format_chain_summary(df) -> str:
     """Convert chain-summary output into readable scientific prose."""
@@ -5544,6 +5868,31 @@ def _format_chain_summary(df) -> str:
     return response
 
 
+def _salt_bridge_pairs(df):
+    """(within one chain, between chains) residue pairs of a salt-bridge table."""
+    def _chain(label):
+        return str(label).rsplit(":", 1)[-1] if ":" in str(label) else ""
+
+    unique_pairs = (df[["acidic_residue", "basic_residue"]]
+                    .drop_duplicates().reset_index(drop=True))
+    pairs = [(r.acidic_residue, r.basic_residue)
+             for r in unique_pairs.itertuples(index=False)]
+    return ([p for p in pairs if _chain(p[0]) == _chain(p[1])],
+            [p for p in pairs if _chain(p[0]) != _chain(p[1])])
+
+
+def _df_failed(df) -> bool:
+    """An analysis_tools table that reports an error instead of rows."""
+    return df is not None and "error" in df.columns
+
+
+def _df_rows(df) -> int:
+    """Data rows in an analysis_tools table (its 'result' row means none)."""
+    if df is None or df.empty or "error" in df.columns or "result" in df.columns:
+        return 0
+    return len(df)
+
+
 def _format_salt_bridge_summary(df, cutoff: float, max_rows: int = 100) -> str:
     """Summarize geometric acidic-basic contacts."""
     if df is None or df.empty:
@@ -5562,22 +5911,11 @@ def _format_salt_bridge_summary(df, cutoff: float, max_rows: int = 100) -> str:
     if not required.issubset(df.columns):
         return df.to_string(index=False)
 
-    unique_pairs = (
-        df[["acidic_residue", "basic_residue"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-
     # Every pair is listed, split by whether it joins two chains: with only
     # three "representative" pairs, qwen2.5:7b said "four" while listing
     # three, and called same-chain pairs inter-chain.
-    def _chain(label):
-        return str(label).rsplit(":", 1)[-1] if ":" in str(label) else ""
-
-    pairs = [(r.acidic_residue, r.basic_residue)
-             for r in unique_pairs.itertuples(index=False)]
-    inter = [p for p in pairs if _chain(p[0]) != _chain(p[1])]
-    intra = [p for p in pairs if _chain(p[0]) == _chain(p[1])]
+    intra, inter = _salt_bridge_pairs(df)
+    pairs = intra + inter
 
     def _list(ps):
         shown = ", ".join(f"{a}–{b}" for a, b in ps[:40])
@@ -5637,31 +5975,38 @@ def _format_nearby_residue_summary(df, selection: str, cutoff: float) -> str:
     return response + "\n\n" + df.to_string(index=False)
 
 
-def tool_summarize_chains() -> str:
+def tool_summarize_chains() -> ToolResult:
     """Summarize chains/segments in the currently loaded structure."""
     # Chain identities come from the file's own COMPND/DBREF records, so this
     # names each chain's molecule even when MDAnalysis is unavailable.
     names = chain_map_line(active_structure(),
                            (st.session_state.focus or {}).get("accession", ""))
+    entry = active_structure()
+    data = {"pdb_id": entry["pdb_id"] if entry else None,
+            "chains": {c["chain"]: c["molecule"] for c in chain_molecules(entry)} if entry else {}}
     u = get_universe()
     if not u:
-        return names or "Load a protein structure before requesting a chain summary."
+        return (_ok(names, data) if names else
+                _fail("Load a protein structure before requesting a chain summary."))
 
     try:
         df = summarize_chains_from_universe(u)
-        return (names + "\n\n" if names else "") + _format_chain_summary(df)
+        if _df_rows(df):
+            data["segments"] = {str(r["chain_or_segment"]): int(r["n_residues"])
+                                for r in df.to_dict(orient="records")}
+        return _ok((names + "\n\n" if names else "") + _format_chain_summary(df), data)
     except Exception as e:
-        return names or f"Error summarizing chains: {e}"
+        return _ok(names, data) if names else _fail(f"Error summarizing chains: {e}")
 
 
 def tool_list_residues(
     chain: str = "",
     max_rows: int = 200
-) -> str:
+) -> ToolResult:
     """List residues, optionally restricted to one chain or segment."""
     u = get_universe()
     if not u:
-        return "Load a protein structure before listing residues."
+        return _fail("Load a protein structure before listing residues.")
 
     chain = str(chain or "").strip()
     max_rows = _safe_int(max_rows, 200)
@@ -5674,26 +6019,35 @@ def tool_list_residues(
         )
 
         if "error" in df.columns:
-            return str(df.iloc[0]["error"])
+            return _fail(str(df.iloc[0]["error"]))
 
         prefix = f"Chain {chain} residues:\n" if chain else ""
-        return prefix + df.to_string(index=False)
+        return _ok(prefix + df.to_string(index=False),
+                   {"chain": chain or None, "listed": len(df),
+                    "residues": [f"{r['resname']}{r['resid']}:{r['chain_or_segment']}"
+                                 for r in df.to_dict(orient="records")]})
 
     except Exception as e:
-        return f"Error listing residues: {e}"
+        return _fail(f"Error listing residues: {e}")
 
 
-def tool_bfactor_summary() -> str:
+def tool_bfactor_summary() -> ToolResult:
     """Summarize B-factor/tempfactor values for the loaded structure."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot summarize B-factors"
+        return _fail("MDAnalysis unavailable — cannot summarize B-factors",
+                     {"unavailable": "mdanalysis"})
 
     try:
         df = bfactor_summary_from_universe(u)
-        return df.to_string(index=False)
+        if _df_failed(df):
+            return _fail(str(df.iloc[0]["error"]))
+        row = df.iloc[0]
+        return _ok(df.to_string(index=False),
+                   {k: round(float(row[k]), 2) for k in ("mean_bfactor", "min_bfactor",
+                                                         "max_bfactor") if k in df.columns})
     except Exception as e:
-        return f"Error summarizing B-factors: {e}"
+        return _fail(f"Error summarizing B-factors: {e}")
 
 
 def tool_detect_contacts(
@@ -5701,11 +6055,12 @@ def tool_detect_contacts(
     sel2: str = "protein",
     cutoff: float = 4.0,
     max_rows: int = 100
-) -> str:
+) -> ToolResult:
     """Detect residue-level contacts between two selections."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot detect contacts"
+        return _fail("MDAnalysis unavailable — cannot detect contacts",
+                     {"unavailable": "mdanalysis"})
 
     try:
         df = contact_detection_from_universe(
@@ -5715,16 +6070,21 @@ def tool_detect_contacts(
             cutoff=cutoff,
             max_rows=max_rows
         )
-        return df.to_string(index=False)
+        if _df_failed(df):
+            return _fail(str(df.iloc[0]["error"]))
+        return _ok(df.to_string(index=False),
+                   {"sel1": sel1, "sel2": sel2, "cutoff": cutoff, "contacts": _df_rows(df),
+                    "pairs": ([f"{r['residue_1']} — {r['residue_2']} {r['min_distance_A']}"
+                               for r in df.to_dict(orient="records")] if _df_rows(df) else [])})
     except Exception as e:
-        return f"Error detecting contacts: {e}"
+        return _fail(f"Error detecting contacts: {e}")
 
 
 def tool_detect_salt_bridges(
     chain: str = "",
     cutoff: float = 4.0,
     max_rows: int = 100
-) -> str:
+) -> ToolResult:
     """
     Detect and summarize candidate salt bridges.
 
@@ -5733,7 +6093,7 @@ def tool_detect_salt_bridges(
     """
     u = get_universe()
     if not u:
-        return "Load a protein structure before identifying salt bridges."
+        return _fail("Load a protein structure before identifying salt bridges.")
 
     chain = str(chain).strip()
     cutoff = _safe_float(cutoff, 4.0)
@@ -5750,22 +6110,36 @@ def tool_detect_salt_bridges(
         )
 
         summary = _format_salt_bridge_summary(df, cutoff, max_rows)
-
-        if chain and "error" not in summary.lower():
+        if _df_failed(df):
+            return _fail(summary)
+        if chain:
             summary = f"Chain {chain} analysis: {summary}"
-
-        return summary
+        # run_agent attaches this count and the short pair lists to the reply
+        # (the model miscounted pairs and mislabelled same-chain ones).
+        data = {"chain": chain or None, "cutoff": cutoff, "atom_contacts": _df_rows(df),
+                "pairs": 0, "within": [], "between": []}
+        if _df_rows(df) and {"acidic_residue", "basic_residue"} <= set(df.columns):
+            intra, inter = _salt_bridge_pairs(df)
+            data.update(pairs=len(intra) + len(inter),
+                        within=[f"{a}–{b}" for a, b in intra],
+                        between=[f"{a}–{b}" for a, b in inter],
+                        summary=f"{len(intra) + len(inter)} candidate salt-bridge residue "
+                                f"pairs ({_df_rows(df)} acidic–basic atom contacts within "
+                                f"{cutoff:.1f} Å): {len(intra)} within one chain, "
+                                f"{len(inter)} between two chains.")
+        return _ok(summary, data)
     except Exception as e:
-        return f"Error detecting salt bridges: {e}"
+        return _fail(f"Error detecting salt bridges: {e}")
 
 def tool_detect_hydrogen_bonds(
     cutoff: float = 3.5,
     max_rows: int = 100
-) -> str:
+) -> ToolResult:
     """Detect candidate hydrogen bonds using a distance-only donor/acceptor screen."""
     u = get_universe()
     if not u:
-        return "MDAnalysis unavailable — cannot detect hydrogen bonds"
+        return _fail("MDAnalysis unavailable — cannot detect hydrogen bonds",
+                     {"unavailable": "mdanalysis"})
 
     try:
         df = hydrogen_bond_detection_from_universe(
@@ -5773,25 +6147,29 @@ def tool_detect_hydrogen_bonds(
             cutoff=cutoff,
             max_rows=max_rows
         )
-        return df.to_string(index=False)
+        if _df_failed(df):
+            return _fail(str(df.iloc[0]["error"]))
+        return _ok(df.to_string(index=False),
+                   {"cutoff": cutoff, "hbonds": _df_rows(df),
+                    "truncated": _df_rows(df) >= max_rows})
     except Exception as e:
-        return f"Error detecting hydrogen bonds: {e}"
+        return _fail(f"Error detecting hydrogen bonds: {e}")
 
 def tool_nearby_residues(
     selection: str,
     cutoff: float = 5.0,
     max_rows: int = 100
-) -> str:
+) -> ToolResult:
     """Find and summarize residues near an MDAnalysis selection."""
     u = get_universe()
     if not u:
-        return "Load a protein structure before finding nearby residues."
+        return _fail("Load a protein structure before finding nearby residues.")
 
     selection = _clean_mda_selection(selection)
     cutoff = _safe_float(cutoff, 5.0)
 
     if _selection_missing(selection):
-        return (
+        return _fail(
             "To find nearby residues, specify a ligand, residue, atom, or "
             "MDAnalysis selection. For example: find residues within 5 Å "
             "of resname DCK."
@@ -5807,7 +6185,13 @@ def tool_nearby_residues(
         if max_rows and len(df) > _safe_int(max_rows, 100):
             df = df.head(_safe_int(max_rows, 100))
 
-        return _format_nearby_residue_summary(df, selection, cutoff)
+        text = _format_nearby_residue_summary(df, selection, cutoff)
+        if _df_failed(df):
+            return _fail(text)
+        residues = sorted({f"{r.get('resname', '')}{r.get('resid', '')}:"
+                           f"{r.get('chain_or_segment', '')}"
+                           for r in df.to_dict(orient="records")}) if _df_rows(df) else []
+        return _ok(text, {"selection": selection, "cutoff": cutoff, "residues": residues})
     except Exception as e:
         # The model passes residue specs here ("A/HIS87", "A/87") that are not
         # MDAnalysis syntax; find_contacts' parser reads those, so answer with it
@@ -5815,16 +6199,28 @@ def tool_nearby_residues(
         if active_structure() and re.search(r"\d", selection) and not re.search(
                 r"\b(resid|resname|segid|name|and|or|around)\b", selection):
             alt = tool_find_contacts(selection, radius=cutoff)
-            if not _TOOL_FAILED.search(alt[:240]):
+            if alt.ok:
                 return alt
-        return f"Error finding nearby residues: {e}"
+        return _fail(f"Error finding nearby residues: {e}")
 
 
-def tool_measure_mda_angle(sel1: str, sel2: str, sel3: str) -> str:
+def _mda_measurement(text: str, kind: str, selections: list) -> ToolResult:
+    """
+    Wrap analysis_tools' angle/dihedral line ("... = 109.47° using atom
+    counts ..." or "<Kind> failed: ...") as a result with the value in data.
+    """
+    text = str(text)
+    m = re.search(r"=\s*(-?\d+(?:\.\d+)?)°", text)
+    if text.lower().startswith(f"{kind} failed") or not m:
+        return _fail(text)
+    return _ok(text, {"selections": selections, kind: float(m.group(1))})
+
+
+def tool_measure_mda_angle(sel1: str, sel2: str, sel3: str) -> ToolResult:
     """Measure an angle between three MDAnalysis atom selections."""
     u = get_universe()
     if not u:
-        return "Load a protein structure before measuring an angle."
+        return _fail("Load a protein structure before measuring an angle.")
 
     selections = [
         _clean_mda_selection(sel1),
@@ -5833,7 +6229,7 @@ def tool_measure_mda_angle(sel1: str, sel2: str, sel3: str) -> str:
     ]
 
     if any(_selection_missing(sel) for sel in selections):
-        return (
+        return _fail(
             "To calculate an angle, specify three atoms or atom selections. "
             "For example: calculate the angle between the CA atoms of "
             "residues 50, 51, and 52 in chain A."
@@ -5841,7 +6237,7 @@ def tool_measure_mda_angle(sel1: str, sel2: str, sel3: str) -> str:
 
     generic = {"protein", "ligand", "nonstandard", "non-standard", "chain", "chains"}
     if any(sel.lower() in generic for sel in selections):
-        return (
+        return _fail(
             "An angle requires three specific atom selections rather than a "
             "whole protein, chain, or ligand."
         )
@@ -5853,16 +6249,16 @@ def tool_measure_mda_angle(sel1: str, sel2: str, sel3: str) -> str:
             sel2=selections[1],
             sel3=selections[2],
         )
-        return str(result)
+        return _mda_measurement(result, "angle", selections)
     except Exception as e:
-        return f"Error measuring angle: {e}"
+        return _fail(f"Error measuring angle: {e}")
 
 
-def tool_measure_mda_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> str:
+def tool_measure_mda_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> ToolResult:
     """Measure a dihedral angle between four MDAnalysis atom selections."""
     u = get_universe()
     if not u:
-        return "Load a protein structure before measuring a dihedral."
+        return _fail("Load a protein structure before measuring a dihedral.")
 
     selections = [
         _clean_mda_selection(sel1),
@@ -5872,7 +6268,7 @@ def tool_measure_mda_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> str
     ]
 
     if any(_selection_missing(sel) for sel in selections):
-        return (
+        return _fail(
             "To calculate a dihedral, specify four atoms or atom selections. "
             "For example: use the N, CA, C, and N atoms across two adjacent "
             "residues in chain A."
@@ -5880,7 +6276,7 @@ def tool_measure_mda_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> str
 
     generic = {"protein", "ligand", "nonstandard", "non-standard", "chain", "chains"}
     if any(sel.lower() in generic for sel in selections):
-        return (
+        return _fail(
             "A dihedral requires four specific atom selections rather than a "
             "whole protein, chain, or ligand."
         )
@@ -5893,9 +6289,9 @@ def tool_measure_mda_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> str
             sel3=selections[2],
             sel4=selections[3],
         )
-        return str(result)
+        return _mda_measurement(result, "dihedral", selections)
     except Exception as e:
-        return f"Error measuring dihedral: {e}"
+        return _fail(f"Error measuring dihedral: {e}")
 
 
 # ── Annotations: text labels pinned to a region ──────────────────────────────
@@ -6054,7 +6450,7 @@ def _label_anchor(atoms, indices, offset: float):
 
 
 def tool_add_label(text: str, target: str, structure: str = "",
-                   color: str = "yellow", offset: float = 0.0) -> str:
+                   color: str = "yellow", offset: float = 0.0) -> ToolResult:
     """
     Pin a text label to a region of a structure so a figure can be read.
 
@@ -6073,14 +6469,14 @@ def tool_add_label(text: str, target: str, structure: str = "",
     """
     entry = find_structure(structure) if structure else active_structure()
     if not entry:
-        return ("No structure is loaded" + (f" called '{structure}'." if structure
-                else ", so there is nothing to label."))
+        return _fail("No structure is loaded" + (f" called '{structure}'." if structure
+                     else ", so there is nothing to label."))
     if not (text or "").strip():
-        return "A label needs some text — say what it should read."
+        return _fail("A label needs some text — say what it should read.")
 
     indices, desc, err = _resolve_label_target(entry, target)
     if err:
-        return err
+        return _fail(err)
 
     hexcolor = LABEL_COLORS.get((color or "").strip().lower(), "")
     if not hexcolor:
@@ -6097,11 +6493,13 @@ def tool_add_label(text: str, target: str, structure: str = "",
         "size":   4.0,
         "offset": float(offset or 0.0),
     })
-    return (f"Labelled {desc} of {entry['pdb_id']} as '{text.strip()}' "
-            f"({len(indices)} atoms).")
+    return _ok(f"Labelled {desc} of {entry['pdb_id']} as '{text.strip()}' "
+               f"({len(indices)} atoms).",
+               {"pdb_id": entry["pdb_id"], "text": text.strip(), "region": desc,
+                "atoms": len(indices)})
 
 
-def tool_clear_labels(text: str = "") -> str:
+def tool_clear_labels(text: str = "") -> ToolResult:
     """
     Remove pinned labels.
 
@@ -6116,28 +6514,32 @@ def tool_clear_labels(text: str = "") -> str:
     else:
         st.session_state.annotations = []
     gone = before - len(st.session_state.annotations)
+    left = len(st.session_state.annotations)
     if not gone:
-        return f"No label reading '{text}' is on the scene." if text else "There are no labels to remove."
-    return f"Removed {gone} label(s)."
+        if text:
+            return _fail(f"No label reading '{text}' is on the scene.", {"labels": left},
+                         hints=["list_labels"])
+        return _ok("There are no labels to remove.", {"removed": 0, "labels": 0})
+    return _ok(f"Removed {gone} label(s).", {"removed": gone, "labels": left})
 
 
-def tool_list_labels() -> str:
+def tool_list_labels() -> ToolResult:
     """Every label currently pinned to the scene."""
     rows = st.session_state.annotations
     if not rows:
-        return "No labels are pinned to the scene."
+        return _ok("No labels are pinned to the scene.", {"labels": []})
     out = [f"{len(rows)} label(s):"]
     for a in rows:
         entry = find_structure(a["sid"])
         out.append(f"  '{a['text']}' on {entry['pdb_id'] if entry else '?'} — "
                    f"{a['desc'] or a['target']}")
-    return "\n".join(out)
+    return _ok("\n".join(out), {"labels": [a["text"] for a in rows]})
 
 
 # ── NGL → MDAnalysis expression approximation ────────────────────────────────
 
 def tool_render_image(quality: str = "draft", width: int = 1200,
-                      height: int = 900) -> str:
+                      height: int = 900) -> ToolResult:
     """
     Ray trace the current scene with PyMOL and store the resulting PNG path.
 
@@ -6154,10 +6556,10 @@ def tool_render_image(quality: str = "draft", width: int = 1200,
         Status string describing the render, or an error message.
     """
     if not PYMOL_AVAILABLE or pymol_render is None:
-        return ("PyMOL is not available. Set PYMOL_PYTHON to an interpreter "
-                "that can `import pymol2`.")
+        return _fail("PyMOL is not available. Set PYMOL_PYTHON to an interpreter "
+                     "that can `import pymol2`.", {"unavailable": "pymol"})
     if not st.session_state.pdb_id:
-        return "No structure loaded — fetch a structure before rendering."
+        return _fail("No structure loaded — fetch a structure before rendering.")
 
     # Publication renders are far slower, so they get a correspondingly
     # larger subprocess budget than the interactive default.
@@ -6193,7 +6595,10 @@ def tool_render_image(quality: str = "draft", width: int = 1200,
     )
     st.session_state.render_path = png if ok else None
     st.session_state.render_msg = msg
-    return msg if ok else "Render failed: " + msg
+    if not ok:
+        return _fail("Render failed: " + msg)
+    return _ok(msg, {"quality": quality, "width": int(width), "height": int(height)},
+               files=[png])
 
 
 def _ngl_to_mda_approx(ngl_sel: str) -> str:
@@ -7352,7 +7757,9 @@ TOOL_DISPATCH = {
     ),
 
     # ---------- Structure (legacy single-structure MDAnalysis path) ----------
-    "align_structures": lambda a: tool_align_structures(
+    # Old schema name; tool_align_structures never existed, so every call
+    # raised NameError. Same fit as superpose_structures (S4).
+    "align_structures": lambda a: tool_superpose(
         a.get("mobile_id", ""),
         a.get("reference_id", ""),
     ),
@@ -7985,12 +8392,6 @@ NUMBER_GATE_EXEMPT = {
     "setup_qm", "setup_oniom",
 }
 
-# A tool result that means nothing happened.
-_TOOL_FAILED = re.compile(
-    r"^(error|tool error|blocked|warning|unknown tool|no structure|nothing)|"
-    r"could not|couldn't|cannot|not found|no such|failed|must be different|"
-    r"matched 0 atoms|nothing was", re.IGNORECASE)
-
 # Arguments that are free text or styling, never residue numbers.
 NUMBER_GATE_FREE_ARGS = {"color", "text", "name", "style", "rep_type", "filename",
                          "quality", "operator", "profile", "types", "where",
@@ -8556,15 +8957,25 @@ def run_agent(user_prompt: str, status=None) -> str:
                                      f"{clarify_note}Newest request: {user_prompt}")}
     ]
 
+    # Every tool call that ran this request, in order: (name, ToolResult).
+    # The guards below read these results' ok/data, not the message text (S4).
+    ran: list[tuple[str, ToolResult]] = []
+
+    def _ran(name: str) -> list:
+        return [r for n, r in ran if n == name]
+
     def _request_evidence() -> str:
         # What this request actually saw: the user's words, scene, history and
         # tool results — minus the retrieved few-shot examples. Their numbers
         # belong to other prompts: "what happens if I mutate it to alanine"
         # ran predict_mutation_effect(residue='45') off the "mutating residue
         # 45" example, and the number gate counted 45 as user-supplied (S2a).
+        # Plus each result's data: values a summary trimmed ("…and 12 more")
+        # are still evidence the tool produced.
         text = "\n".join(str(m.get("content", "")) for m in messages
                          if m.get("role") == "user")
-        return text.replace(grounding, "") if grounding else text
+        text = text.replace(grounding, "") if grounding else text
+        return "\n".join([text] + [json.dumps(r.data, default=str) for _, r in ran if r.data])
 
     active_tools, tools_are_subset = TOOLS, False
     _log(
@@ -8684,16 +9095,12 @@ def run_agent(user_prompt: str, status=None) -> str:
             # prepare_structure) is not a disulfide answer: nudging it replaced
             # "built ... 6 disulfide(s)" with a wrong "no disulfides" (S3 eval).
             disulfide_re = r"disulf|disulph|\bs-s\b|\bss[ -]bond|cystine"
-            tool_said_disulfide = any(
-                str(m.get("content", "")).startswith("Tool results:")
-                and re.search(disulfide_re, str(m.get("content", "")).lower())
-                for m in messages if m.get("role") == "user")
+            tool_said_disulfide = any(k.startswith("disulfide") for _, r in ran for k in r.data)
             if (not disulfide_nudged and st.session_state.pdb_id
                     and (re.search(disulfide_re, prompt_lower)
                          or (re.search(disulfide_re, final_text.lower())
                              and not tool_said_disulfide))
-                    and not any("[find_interactions]:" in str(m.get("content", ""))
-                                for m in messages if m.get("role") == "user")):
+                    and not _ran("find_interactions")):
                 disulfide_nudged = True
                 _log("↻ Disulfide answer with no find_interactions run — nudging")
                 messages.append({"role": "assistant", "content": final_text})
@@ -8707,11 +9114,12 @@ def run_agent(user_prompt: str, status=None) -> str:
             # lysine 48 as sticks and zoom to it" qwen2.5:14b ran fetch and
             # select, then replied "highlighted ... and zoomed to" (S3 eval).
             zoom_re = r"\bzoom(?:ed|ing|s)?\b"
+            zoomed = (any(r.ok for r in _ran("zoom"))
+                      or any(r.ok and r.data.get("zoomed") for r in _ran("highlight")))
             if (not zoom_nudged and st.session_state.pdb_id
                     and (re.search(zoom_re, prompt_lower)
                          or re.search(zoom_re, final_text.lower()))
-                    and not any("[zoom]:" in str(m.get("content", ""))
-                                for m in messages if m.get("role") == "user")):
+                    and not zoomed):
                 zoom_nudged = True
                 _log("↻ Zoom requested or claimed with no zoom call — nudging")
                 messages.append({"role": "assistant", "content": final_text})
@@ -8748,70 +9156,62 @@ def run_agent(user_prompt: str, status=None) -> str:
             # P10: the 7B model paraphrases the ESM result without its caveats
             # and has called it "a significant decrease in stability" — so the
             # standard caveat rides on every reply that used the prediction.
-            if any(r"[predict_mutation_effect]: MODEL PREDICTION" in str(m.get("content", ""))
-                   for m in messages):
+            if any(r.ok and r.data.get("model_prediction")
+                   for r in _ran("predict_mutation_effect")):
                 reply += ("\n\n_ESM-2 model prediction from sequence statistics "
                           "(zero-shot masked-marginal score) — not an experimental "
                           "measurement and not a stability (ΔΔG) estimate._")
             # P13: same paraphrase risk for a function inferred from family
             # and domain matches — it must never read as the known function.
-            pf = [str(m.get("content", "")) for m in messages
-                  if "[protein_function]:" in str(m.get("content", ""))]
-            if any(re.search(r"INFERRED FUNCTION[^\n]*\(LOW CONFIDENCE", c) for c in pf):
+            pf = [r.data for r in _ran("protein_function") if r.ok]
+            if any(d.get("inferred") for d in pf):
                 basis = "sequence-family, domain and electronic GO matches"
-                if any("INFERRED FUNCTION FROM STRUCTURAL NEIGHBOURS" in c for c in pf):
+                if any(d.get("structural_neighbours") for d in pf):
                     basis += ", or from structurally similar proteins (Foldseek)"
                 reply += ("\n\n_UniProt has no curated function for this protein. Any role "
                           f"above marked as inferred comes from {basis} — a low-confidence "
                           "computational guess, not an established function._")
-            elif any("AUTOMATIC annotation" in c for c in pf):
+            elif any(d.get("automatic") for d in pf):
                 reply += ("\n\n_This function text is UniProt's automatic (rule-based) "
                           "annotation for an unreviewed entry, not curator-reviewed._")
             # P9 follow-up: qwen2.5:7b called AlphaFold DB hits "known
             # structures" and dropped that no PDB entry matched — so the
             # provenance rides on every reply that used them.
-            afdb = [str(m.get("content", "")) for m in messages
-                    if "AlphaFold DB neighbours (Foldseek" in str(m.get("content", ""))]
+            afdb = [r.data for n in ("find_structural_neighbors", "describe_fold")
+                    for r in _ran(n) if "afdb_neighbours" in r.data]
             if afdb:
-                no_pdb = any("no confident structural match to any entry" in c for c in afdb)
+                no_pdb = any(d.get("no_pdb_match") for d in afdb)
                 reply += ("\n\n_" + ("No experimental (PDB) structure matched confidently. "
                                      if no_pdb else "")
                           + "The AlphaFold DB neighbours are predicted models of reviewed "
                           "UniProt entries, not experimental structures, and have no "
                           "CATH/SCOP fold classification._")
             question = st.session_state.pop("foldseek_question", None)
-            if question and any("NEEDS USER CHOICE" in p for p in summary_parts):
+            if question and any(r.data.get("needs_user_choice") for _, r in ran):
                 reply = f"{reply}\n\n{question}"
             # P12: qwen2.5:7b paraphrased find_pockets' report into wrong
             # counts ("four druggable", listing three), wrong chains and
             # "occupied by hemoglobin subunits" for heme. A pocket-only
             # request gets the report itself; anything more keeps the
             # model's reply with the report's SUMMARY line attached verbatim.
-            pocket_reports = [p[len("find_pockets: "):] for p in summary_parts
-                              if p.startswith("find_pockets: Candidate binding pockets")]
+            pocket_reports = [r for r in _ran("find_pockets") if r.ok]
             if pocket_reports:
                 # A failed call that led to find_pockets (find_contacts on
                 # 'pocket 30') still leaves a pocket-only answer.
-                if all(p.startswith("find_pockets: ") for p in summary_parts
-                       if not _TOOL_FAILED.search(p.split(": ", 1)[-1][:240])):
-                    return pocket_reports[-1]
-                summary = next((l for l in pocket_reports[-1].splitlines()
-                                if l.startswith("SUMMARY:")), "")
-                if summary:
-                    reply += f"\n\n_fpocket: {summary[len('SUMMARY:'):].strip()}_"
+                if all(n == "find_pockets" for n, r in ran if r.ok):
+                    return pocket_reports[-1].summary
+                if pocket_reports[-1].data.get("summary"):
+                    reply += f"\n\n_fpocket: {pocket_reports[-1].data['summary']}_"
             # Same for salt bridges: the model miscounted pairs and called
             # same-chain pairs inter-chain, so the tool's own count rides along.
-            sb = [p for p in summary_parts if p.startswith("detect_salt_bridges: ")
-                  and "SUMMARY:" in p]
+            sb = [r.data for r in _ran("detect_salt_bridges") if r.ok and r.data.get("summary")]
             if sb:
-                body = sb[-1].split("SUMMARY:", 1)[1].splitlines()
-                reply += f"\n\n_Salt-bridge detector: {body[0].strip()}_"
+                reply += f"\n\n_Salt-bridge detector: {sb[-1]['summary']}_"
                 # Short pair lists ride along too — asked to "list the salt
                 # bridges between chains", the model repeated the count only.
-                for ln in body[1:3]:
-                    m = re.match(r"(Within one chain|Between chains) \((\d+)\): (.*)", ln)
-                    if m and int(m.group(2)) <= 12:
-                        reply += f"\n_{m.group(1)}: {m.group(3)}_"
+                for label, key in (("Within one chain", "within"), ("Between chains", "between")):
+                    if 0 < len(sb[-1][key]) <= 12:
+                        reply += f"\n_{label}: {', '.join(sb[-1][key])}._"
             return reply
 
         tool_results = []
@@ -8930,7 +9330,7 @@ def run_agent(user_prompt: str, status=None) -> str:
                                    for n in re.findall(r"\d+", v)} - seen, key=int)
                 if invented:
                     _log(f"🚫 Blocked '{name}' — numbers {invented} not from user or any tool")
-                    tool_results.append({"tool": name, "result": (
+                    tool_results.append({"tool": name, "result": _blocked(
                         f"Blocked — {', '.join(invented)} did not come from the user or any "
                         "tool result. Do not guess residue numbers: call `ask_user` to ask "
                         "which residues/region they mean (offer concrete options if a tool "
@@ -8949,13 +9349,15 @@ def run_agent(user_prompt: str, status=None) -> str:
                 _log(
                     f"🚫 Blocked 'select' — representation command; no highlight needed"
                 )
-                tool_results.append({"tool": name, "result": "Blocked — use 'show' for representations, 'select' for highlights."})
+                tool_results.append({"tool": name, "result": _blocked(
+                    "Blocked — use 'show' for representations, 'select' for highlights.")})
                 continue
 
             # ── Gate: destructive ───────────────────────────────────────────
             if name in DESTRUCTIVE_TOOLS and not hide_requested:
                 _log(f"🚫 Blocked '{name}' — not requested")
-                tool_results.append({"tool": name, "result": "Blocked — user did not request hiding."})
+                tool_results.append({"tool": name, "result": _blocked(
+                    "Blocked — user did not request hiding.")})
                 continue
 
             # The load/search gate (LOAD_TOOLS + a regex classifier for
@@ -8971,7 +9373,8 @@ def run_agent(user_prompt: str, status=None) -> str:
             # ── Gate: write/side-effect ─────────────────────────────────────
             if name in WRITE_TOOLS and not write_requested:
                 _log(f"🚫 Blocked '{name}' — not requested by user")
-                tool_results.append({"tool": name, "result": "Blocked — user did not request this operation."})
+                tool_results.append({"tool": name, "result": _blocked(
+                    "Blocked — user did not request this operation.")})
                 continue
 
             # ── Gate: Foldseek online upload / database download ───────────
@@ -8983,13 +9386,13 @@ def run_agent(user_prompt: str, status=None) -> str:
                 elif (args.get("where") == "online" and entry_now and entry_now["path"]
                       not in st.session_state.get("foldseek_online_ok", set())):
                     _log("🚫 Blocked online Foldseek — user did not agree to upload")
-                    tool_results.append({"tool": name, "result": (
+                    tool_results.append({"tool": name, "result": _blocked(
                         "Blocked — the user has not agreed to upload this structure. "
                         "Ask them: search online, or download the local database?")})
                     continue
             if name == "download_foldseek_database" and not foldseek_download_requested:
                 _log("🚫 Blocked Foldseek database download — not requested")
-                tool_results.append({"tool": name, "result": (
+                tool_results.append({"tool": name, "result": _blocked(
                     "Blocked — the user did not ask to download the database. Ask them first.")})
                 continue
 
@@ -9002,8 +9405,9 @@ def run_agent(user_prompt: str, status=None) -> str:
                 # never ran as "completed successfully" (S3 eval).
                 prior = failed_sigs.get(sig)
                 tool_results.append({"tool": name, "result": (
-                    f"Skipped — this exact call already failed and nothing has changed "
-                    f"since: {prior[:150]}" if prior else "Already called — skipped.")})
+                    _skipped(f"Skipped — this exact call already failed and nothing has "
+                             f"changed since: {prior[:150]}", ok=False)
+                    if prior else _skipped("Already called — skipped."))})
                 continue
 
             # ── Dedup: ball+stick show for an already-selected NGL string ───
@@ -9011,7 +9415,8 @@ def run_agent(user_prompt: str, status=None) -> str:
                 ngl_candidate = resolve_selection(args.get("selection", ""))
                 if ngl_candidate in selected_ngl_strs:
                     _log(f"⏭ Skipped 'show ball+stick' — already highlighted")
-                    tool_results.append({"tool": name, "result": "Already highlighted by select — skipped."})
+                    tool_results.append({"tool": name, "result": _skipped(
+                        "Already highlighted by select — skipped.")})
                     continue
 
             # ── Dedup: select for an already-selected NGL string ────────────
@@ -9019,7 +9424,8 @@ def run_agent(user_prompt: str, status=None) -> str:
                 ngl_candidate = resolve_selection(args.get("expression", ""))
                 if ngl_candidate in selected_ngl_strs:
                     _log(f"⏭ Skipped duplicate select — '{ngl_candidate}' already selected")
-                    tool_results.append({"tool": name, "result": "Already selected — skipped."})
+                    tool_results.append({"tool": name, "result": _skipped(
+                        "Already selected — skipped.")})
                     continue
 
             called_sigs.add(sig)
@@ -9031,9 +9437,13 @@ def run_agent(user_prompt: str, status=None) -> str:
             _progress(status, f"Running {name.replace('_', ' ')}…")
             t0 = time.monotonic()
             try:
-                result = dispatch(args) if dispatch else f"Unknown tool: {name}"
+                raw = dispatch(args) if dispatch else _fail(f"Unknown tool: {name}")
+                if not isinstance(raw, ToolResult):
+                    _log(f"⚠️ '{name}' returned a bare {type(raw).__name__}, not a "
+                         "ToolResult — classified by the legacy text check", logging.WARNING)
+                result = as_tool_result(raw)
             except Exception as e:
-                result = f"Tool error: {e}"
+                result = _fail(f"Tool error: {e}")
                 # The user only ever sees the one-line "Tool error: ..." string
                 # above; the full traceback -- what actually broke inside the
                 # tool -- only ever lands here, in the log.
@@ -9043,7 +9453,7 @@ def run_agent(user_prompt: str, status=None) -> str:
                 log.warning("Tool '%s' took %.0f ms", name, elapsed_ms)
 
             # Track NGL strings that now have a ball+stick highlight
-            if name == "select" and "error" not in result.lower():
+            if name == "select" and result.ok:
                 ngl_str = st.session_state.selections.get(args.get("name", ""), "")
                 if ngl_str:
                     selected_ngl_strs.add(ngl_str)
@@ -9052,32 +9462,34 @@ def run_agent(user_prompt: str, status=None) -> str:
             if name == "show" and args.get("rep_type", "cartoon") != "ball+stick":
                 show_rep_fired = True
 
-            level = logging.ERROR if str(result).lower().startswith(("error", "tool error")) else logging.INFO
+            level = logging.INFO if result.ok else logging.ERROR
             if status is not None:
-                ok = level != logging.ERROR
-                status.write(f"{'✓' if ok else '✗'} {name.replace('_', ' ')}")
+                status.write(f"{'✓' if result.ok else '✗'} {name.replace('_', ' ')}")
             _log(f"🔧 {name}({args}) → {result}", level)
             summary_parts.append(f"{name}: {result}")
+            ran.append((name, result))
             tool_results.append({"tool": name, "result": result,
                                  "args": dict(args), "ms": round(elapsed_ms)})
             # A call that succeeds may have fixed what an earlier one lacked
             # (parameterize_ligand, then setup_amber again), so failed calls
             # become retryable; one that fails stays blocked until then.
-            if _TOOL_FAILED.search(str(result)[:240]):
-                failed_sigs[sig] = str(result)
+            if not result.ok:
+                failed_sigs[sig] = result.summary
             else:
                 called_sigs.difference_update(failed_sigs)
                 failed_sigs.clear()
 
         # Every call above appended exactly one result, in call order.
         for tc, r in zip(tool_calls, tool_results):
-            res = str(r["result"])
+            res = r["result"]
             _trace({"turn": turn, "tool": r["tool"],
                     "args": r.get("args", _tc_args(tc)),
-                    "status": ("ran" if "ms" in r else
-                               "blocked" if res.startswith("Blocked") else "skipped"),
-                    "failed": "ms" in r and bool(_TOOL_FAILED.search(res[:240])),
-                    "result": res[:800], "ms": r.get("ms")})
+                    "status": "ran" if "ms" in r else res.data.get("status", "skipped"),
+                    "ok": res.ok,
+                    "failed": "ms" in r and not res.ok,
+                    "result": res.summary[:800], "ms": r.get("ms"),
+                    "data": json.loads(json.dumps(res.data, default=str)) if "ms" in r else {},
+                    "files": res.files, "next_hints": res.next_hints})
 
         # A question for the user (ask_user, or a tool that found the request
         # ambiguous) ends the request here: the answer decides what runs next,
@@ -9087,7 +9499,8 @@ def run_agent(user_prompt: str, status=None) -> str:
             _progress(status, "Need a choice from you before going on.")
             return clarification_text()
 
-        results_text = "\n".join(f"[{r['tool']}]: {r['result']}" for r in tool_results)
+        results_text = "\n".join(f"[{r['tool']}]: {_for_model(r['result'])}"
+                                  for r in tool_results)
 
         # Append tool results to the conversation. The system message is left
         # alone; the refreshed scene rides along with the results instead.
@@ -9107,11 +9520,11 @@ def run_agent(user_prompt: str, status=None) -> str:
         # Say which calls failed, in so many words. Left implicit, the model
         # read "could not make sense of '30'" and told the user the residues
         # were highlighted.
-        failed = [r for r in tool_results if _TOOL_FAILED.search(str(r["result"])[:240])]
+        failed = [r for r in tool_results if not r["result"].ok]
         if failed:
             follow_up = (
                 "These calls FAILED and changed nothing: "
-                + "; ".join(f"{r['tool']} ({str(r['result'])[:120]})" for r in failed)
+                + "; ".join(f"{r['tool']} ({r['result'].summary[:120]})" for r in failed)
                 + ". Never say they worked — and a failed call found nothing either way, "
                 "so never report its absence of results as a finding ('no salt bridges "
                 "were found'). Retry once with corrected arguments if the "
@@ -11240,7 +11653,7 @@ def label_ui() -> None:
 
     if st.session_state.label_msg:
         msg = st.session_state.label_msg
-        (st.success if msg.startswith("Labelled") else st.warning)(msg)
+        (st.success if as_tool_result(msg).ok else st.warning)(msg)
 
     rows = st.session_state.annotations
     if not rows:

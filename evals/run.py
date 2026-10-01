@@ -235,9 +235,9 @@ class Harness:
             if isinstance(item, str):
                 item = {"tool": "fetch_structure", "args": {"pdb_id": item}}
             fn = self.app.TOOL_DISPATCH[item["tool"]]
-            res = str(fn(item.get("args", {})))
-            if self.app._TOOL_FAILED.search(res[:240]):
-                errors.append(f"{item['tool']}: {res[:200]}")
+            res = self.app.as_tool_result(fn(item.get("args", {})))
+            if not res.ok:
+                errors.append(f"{item['tool']}: {res.summary[:200]}")
         # A preload that asked something must not leak into the first turn.
         self.st.session_state.pop("clarify", None)
         return errors

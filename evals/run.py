@@ -22,7 +22,7 @@ Needs the parora conda env and a running Ollama with the model pulled:
 Case format (one JSON object per line; '#'-lines and blank lines ignored):
 
     id        unique slug
-    category  lookup | multistep | ambiguity | destructive | recovery |
+    category  lookup | multistep | plan | ambiguity | destructive | recovery |
               guardrail | multiturn
     groups    TOOL_GROUPS names the case exercises (coverage report)
     source    "log" (seeded from logs/parora.log) or "synthetic"
@@ -46,6 +46,9 @@ Case format (one JSON object per line; '#'-lines and blank lines ignored):
       not_say    [regex] — none may match the reply
       max_calls  upper bound on calls that ran
       no_failed  true → no call that ran reported failure
+      plan_complete  true → run_agent made a plan (S6) and the reply's checklist
+                 accounts for every step: none left open ("☐"), none
+                 marked "not run"
 
 Side effects are real: tools that write (save_structure, remove_solvent, ...)
 write under protein-viz-agent/, and uncached structures are downloaded.
@@ -144,7 +147,7 @@ def _describe(spec: dict) -> str:
     return f"{spec['name']}({args}){' ok' if spec.get('ok') else ''}"
 
 
-def score(expect: dict, trace: list, reply: str, asked: bool) -> list:
+def score(expect: dict, trace: list, reply: str, asked: bool, plan: dict = None) -> list:
     """Each check → (label, passed, detail)."""
     ran = [c for c in trace if c["status"] == "ran"]
     checks = []
@@ -189,6 +192,14 @@ def score(expect: dict, trace: list, reply: str, asked: bool) -> list:
     if expect.get("no_failed"):
         bad = [c["tool"] for c in ran if c.get("failed")]
         checks.append(("no_failed", not bad, "failed " + ", ".join(bad) if bad else ""))
+
+    if expect.get("plan_complete"):
+        steps = (plan or {}).get("steps", [])
+        open_ = [s["n"] for s in steps if s["status"] == "pending"
+                 or (s["status"] == "skipped" and s["note"] == "not run")]
+        checks.append(("plan_complete", bool(steps) and not open_,
+                       "no plan" if not steps else
+                       ("steps not run: " + ", ".join(map(str, open_)) if open_ else "")))
 
     return checks
 
@@ -259,12 +270,16 @@ class Harness:
         # Asked = a pending clarify card, an ask_user call, or a short reply
         # that puts a question to the user in plain text — not counting a
         # closing courtesy offer ("Anything else?").
-        questions = [q for q in re.findall(r"[^.?!\n]*\?", reply)
+        # The S6 plan checklist is code-built and quotes the user's goals;
+        # it is neither a question nor part of the reply's length.
+        body = reply.split("\n\n**Plan**\n")[0]
+        questions = [q for q in re.findall(r"[^.?!\n]*\?", body)
                      if not COURTESY.search(q)]
         asked = (bool(ss.get("clarify"))
                  or any(c["tool"] == "ask_user" and c["status"] == "ran" for c in trace)
-                 or (bool(questions) and len(reply) < 600))
-        return {"prompt": prompt, "reply": reply, "asked": asked, "trace": trace,
+                 or (bool(questions) and len(body) < 600))
+        plan = copy.deepcopy(ss.get("agent_plan"))
+        return {"prompt": prompt, "reply": reply, "asked": asked, "trace": trace, "plan": plan,
                 "seconds": round(time.monotonic() - t0, 2),
                 "llm_calls": self.llm_calls - n0}
 
@@ -430,7 +445,7 @@ def main():
                     expect = {**(expect or {}), **c["expect"]}
                 tr = h.turn(prompt)
                 r["turns"].append(tr)
-                for label, ok, detail in score(expect or {}, tr["trace"], tr["reply"], tr["asked"]):
+                for label, ok, detail in score(expect or {}, tr["trace"], tr["reply"], tr["asked"], tr.get("plan")):
                     r["checks"].append({"turn": i + 1, "check": label,
                                         "passed": ok, "detail": detail})
             r["passed"] = all(ch["passed"] for ch in r["checks"])

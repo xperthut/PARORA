@@ -1748,7 +1748,8 @@ def tool_build_membrane(target: str = "", composition: str = "popc",
 
     entry = find_structure(target) if target else active_structure()
     if not entry:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
 
     record, err = orient_structure(entry["pdb_id"])
     if err:
@@ -2179,7 +2180,8 @@ def tool_parameterize_ligand(ligand: str = "", net_charge=None,
                      {"unavailable": "ambertools"})
     name, entry = simulation_target(target)
     if not entry:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
     code, msg = _pick_ligand(entry, ligand, "parameterise")
     if not code:
         return _fail(msg)
@@ -2236,7 +2238,8 @@ def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
         return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
     ff = _pick_option(force_field, sim.PROTEIN_FFS, "ff19SB")
     if not ff:
         return _bad_option("force field", force_field, sim.PROTEIN_FFS)
@@ -2322,7 +2325,8 @@ def tool_setup_gromacs(target: str = "", temperature: float = 300.0,
         return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
     temp = _num(temperature, 300.0)
     press = _num(pressure, 1.0)
     ns = _num(nanoseconds, 100.0)
@@ -2350,7 +2354,8 @@ def tool_setup_rosetta_docking(target: str = "", ligand: str = "",
         return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
     code, msg = _pick_ligand(entry, ligand, "dock")
     if not code:
         return _fail(msg)
@@ -2418,7 +2423,8 @@ def tool_setup_qm(target: str = "", center: str = "", chain: str = "",
         return _fail(NO_STRUCTURE)
     name, entry = simulation_target(target)
     if not entry:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
     code, msg = _pick_ligand(entry, center, "centre the QM region on")
     if not code:
         return _fail(msg)
@@ -2783,7 +2789,8 @@ def tool_remove_structure(target: str) -> ToolResult:
     """
     s = find_structure(target)
     if not s:
-        return _fail(f"No structure called '{target}' is loaded.")
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
     label = s["pdb_id"]
     drop_structure(s["sid"])
     left = [x["pdb_id"] for x in structures()]
@@ -4438,6 +4445,14 @@ def _expression_to_ngl(expression: str, u) -> tuple[str, str]:
     if _CHAIN_LIST_RE.fullmatch(expression.strip()):
         return _chain_list_to_ngl(expression.strip(), u), expression.strip()
 
+    # "resn HEM and chain A" → NGL "HEM and :A". The single-name branch below
+    # took the last word as the residue name, so this selected residue "A".
+    if (re.match(r"(?:resn|resname)\s", expr_lower)
+            and not re.fullmatch(r"(?:resn|resname)\s+\S+", expr_lower)):
+        ngl = re.sub(r"\b(?:resn|resname)\s+([A-Za-z0-9]+)",
+                     lambda mm: _ngl_resname(mm.group(1)), expression.strip(), flags=re.I)
+        return _chain_list_to_ngl(ngl, u), expression.strip()
+
     # "resn ATP" / "resname ATP" → NGL "[ATP]"
     if expr_lower.startswith("resn ") or expr_lower.startswith("resname "):
         resname = expression.split()[-1].upper()
@@ -5699,7 +5714,8 @@ def tool_clear_superposition(target: str = "all") -> ToolResult:
     else:
         s = find_structure(target)
         if not s:
-            return _fail(f"No structure called '{target}' is loaded.")
+            return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + (", ".join(x["pdb_id"] for x in structures()) or "none") + ".")
         hits = [s] if s["matrix"] else []
 
     if not hits:
@@ -6646,6 +6662,23 @@ def _ngl_to_mda_approx(ngl_sel: str) -> str:
     if m:                                # residue number/range, optional chain
         res = f"resid {m.group(1)}" + (f":{m.group(2)}" if m.group(2) else "")
         return res + (f" and (segid {m.group(3)} or chainID {m.group(3)})" if m.group(3) else "")
+    if ngl_sel.startswith("[") and ngl_sel.endswith("]") and "]" not in ngl_sel[1:-1]:
+        return f"resname {ngl_sel[1:-1]}"
+    if re.fullmatch(r"[A-Z0-9]{2,4}", ngl_sel) and not ngl_sel.isdigit():
+        return f"resname {ngl_sel}"      # bare NGL residue name ("HEM")
+    # Compound: "HEM and :A", "[ATP] or (10-20:B)" — convert each term and keep
+    # the logic. Passed through whole, select_within('HEM and chain A') failed
+    # with "Unknown selection token: 'HEM'" (S6 eval).
+    tokens = re.findall(r"\(|\)|[^\s()]+", ngl_sel)
+    if len(tokens) > 1:
+        out = []
+        for t in tokens:
+            if t in ("(", ")") or t.lower() in ("and", "or", "not"):
+                out.append(t.lower())
+            else:
+                conv = _ngl_to_mda_approx(t)
+                out.append(f"({conv})" if " " in conv else conv)
+        return " ".join(out)
     return ngl_sel                       # pass-through for unknown expressions
 
 
@@ -8985,6 +9018,235 @@ def _progress(status, msg: str) -> None:
         status.write(msg)
 
 
+# ── Plan-then-act (S6) ───────────────────────────────────────────────────────
+# A long request ("load X, strip water, find the pocket, list H-bonds, render a
+# figure, set up Amber") used to lose steps: the loop picks one tool per turn
+# and every follow-up says "if the request is satisfied, stop", so the model
+# stopped after two or three. Now a request with several actions gets a plan
+# first — one JSON call — and the loop works through it: code ticks steps off
+# from the calls that ran, the follow-up names the next open step instead of
+# inviting a stop, and the reply ends with every step's outcome. Requests with
+# one or two actions skip all of this and cost nothing extra.
+
+PLAN_MIN_ACTIONS = 3
+PLAN_MAX_STEPS = 10
+PLAN_TURN_CAP = 40
+_PLAN_SPLIT = re.compile(r"[,;]|\band then\b|\bthen\b|\band also\b|\balso\b|\band\b|\bafter that\b")
+_PLAN_VERB = re.compile(
+    r"\b(load|fetch|open|download|strip|remove|delete|find|list|detect|identify|show|"
+    r"display|colou?r|paint|highlight|select|label|annotate|mark|zoom|focus|render|"
+    r"ray ?trace|measure|compute|calculate|save|export|write|superpose|superimpose|"
+    r"align|overlay|compare|prepare|clean|protonate|set up|setup|build|parameteri[sz]e|"
+    r"predict|tell me|describe|summari[sz]e|hide|embed|orient|dock|search|look up|"
+    r"make (a|an) (figure|image|picture))\b")
+# Tools that do the same job for a plan step: the planner may say `select`
+# where the model then uses `highlight`, or `find_interactions` where it runs
+# `detect_salt_bridges`. A step is ticked by its own tool first, else by one
+# of these. parameterize_ligand is deliberately not with setup_amber — it is
+# a prerequisite, not the build.
+_PLAN_EQUIV = [
+    {"fetch_structure", "add_structure", "replace_scene", "load_protein", "load_local"},
+    {"show", "show_all", "highlight", "select", "color"},
+    {"find_interactions", "detect_salt_bridges", "detect_hydrogen_bonds"},
+    {"find_contacts", "nearby_residues", "select_within", "detect_contacts"},
+    {"measure_distance", "measure_mda_distance"},
+    {"measure_angle", "measure_mda_angle"},
+    {"measure_dihedral", "measure_mda_dihedral"},
+    {"describe_structure", "summarize_chains", "list_structures", "list_residues"},
+    {"superpose_structures", "align_structures"},
+]
+_PLAN_MARK = {"pending": "☐", "done": "✓", "failed": "✗", "skipped": "–"}
+
+
+def _plan_wanted(prompt: str) -> bool:
+    """True when the request reads as PLAN_MIN_ACTIONS or more separate actions."""
+    clauses = _PLAN_SPLIT.split(prompt.lower())
+    return sum(1 for c in clauses if _PLAN_VERB.search(c)) >= PLAN_MIN_ACTIONS
+
+
+def _tool_catalog() -> str:
+    """One line per tool — name and the first sentence of its description."""
+    lines = []
+    for t in TOOLS:
+        f = t["function"]
+        first = re.split(r"(?<=\.)\s", f.get("description", "").strip(), maxsplit=1)[0]
+        lines.append(f"- {f['name']}: {first[:140]}")
+    return "\n".join(lines)
+
+
+_PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {"steps": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"goal": {"type": "string"}, "tool": {"type": "string"},
+                       "depends_on": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["goal", "tool"]}}},
+    "required": ["steps"],
+}
+
+
+def _plan_request(user_prompt: str) -> dict | None:
+    """
+    Ask the model for an ordered plan of the request's steps (one JSON call).
+
+    Returns {"request", "steps": [{n, goal, tool, deps, status, note}]} or None
+    when planning failed or found fewer than two steps — the loop then runs
+    exactly as it does without a plan.
+    """
+    system = (
+        "You plan the steps of a protein-structure request before any tool runs. "
+        "Return JSON: {\"steps\": [{\"goal\", \"tool\", \"depends_on\"}]}. Rules: "
+        "one step per action the user asked for, in the user's order unless one "
+        "step needs another's result first; never add a step the user did not ask "
+        "for (no extra describe, hide, save or render); `goal` restates that action "
+        "in the user's words with their numbers, names and chains, nothing invented; "
+        "`tool` is the one tool from the list that does it, or \"\" if it is answered "
+        "in words; `depends_on` lists only the step numbers (from 1) whose OUTPUT this "
+        "step uses — a structure it loads or prepares, a selection, file or list it "
+        "creates. Steps that merely come later do not depend on each other; showing, "
+        "colouring, highlighting, labelling, zooming and rendering never depend on "
+        "one another. A step that needs a value "
+        "the user did not give (a ligand charge, a residue) is still listed; its tool "
+        "will ask. Structures already in the Scene need no load step.")
+    user = (f"{_state_block()}\n\nTools:\n{_tool_catalog()}\n\n"
+            f"Request: {user_prompt}")
+    try:
+        response = ollama_client.chat(
+            model=MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            format=_PLAN_SCHEMA,
+            options={**OLLAMA_OPTIONS, "temperature": 0},
+            keep_alive=KEEP_ALIVE,
+            think=THINK,
+        )
+        raw = json.loads(response.get("message", {}).get("content", "") or "{}")
+    except Exception as e:
+        _log(f"⚠️ Planning failed ({e}) — running without a plan", logging.WARNING)
+        return None
+    # Plan text rides in the user messages, which the number gate counts as
+    # evidence — so a residue number the planner made up would pass as the
+    # user's. Numbers in a goal must come from the request or the scene.
+    known = set(re.findall(r"\d+", f"{user_prompt}\n{_state_block()}"))
+    steps = []
+    for s in (raw.get("steps") or [])[:PLAN_MAX_STEPS]:
+        if not isinstance(s, dict) or not str(s.get("goal", "")).strip():
+            continue
+        tool = str(s.get("tool") or "").strip()
+        n = len(steps) + 1
+        goal = re.sub(r"\d+", lambda m: m.group() if m.group() in known else "?",
+                      str(s["goal"]).strip())
+        steps.append({
+            "n": n,
+            "goal": goal[:160],
+            "tool": tool if tool in TOOL_DISPATCH else "",
+            "deps": sorted({int(d) for d in (s.get("depends_on") or [])
+                            if isinstance(d, (int, float)) and 0 < int(d) < n}),
+            "status": "pending",
+            "note": "",
+        })
+    if len(steps) < 2:
+        return None
+    return {"request": user_prompt, "steps": steps}
+
+
+def _render_plan(plan: dict) -> str:
+    """The plan as a markdown checklist: ✓ done, ✗ failed, – skipped, ☐ open."""
+    lines = []
+    for s in plan["steps"]:
+        line = f"{_PLAN_MARK[s['status']]} {s['n']}. {s['goal']}"
+        if s["note"]:
+            line += f" — {s['note']}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _plan_step_for(plan: dict, name: str) -> dict | None:
+    """
+    The plan step a call of `name` serves: the earliest open (or failed, so a
+    retry counts) step for that exact tool, else for an equivalent one. None
+    means a helper call that serves no step.
+    """
+    open_steps = [s for s in plan["steps"] if s["status"] in ("pending", "failed")]
+    step = next((s for s in open_steps if s["tool"] == name), None)
+    if step is None:
+        family = set().union(*(g for g in _PLAN_EQUIV if name in g)) or {name}
+        step = next((s for s in open_steps if s["tool"] in family), None)
+    return step
+
+
+def _advance_plan(plan: dict, name: str, result: ToolResult) -> None:
+    """
+    Tick the step the call that ran serves (see _plan_step_for). A failed
+    step skips the steps that depend on it; when a retry succeeds they open
+    again.
+    """
+    step = _plan_step_for(plan, name)
+    if step is None:
+        # A helper that worked may have fixed what a failed step lacked
+        # (parameterize_ligand before setup_amber): one more retry each.
+        if result.ok:
+            for s in plan["steps"]:
+                if s["status"] == "failed":
+                    s["tries"] = min(s.get("tries", 0), 1)
+        return
+    step["tries"] = step.get("tries", 0) + 1
+    blocked_note = f"needs step {step['n']}, which failed"
+    if result.ok:
+        step["status"], step["note"] = "done", result.summary.strip().splitlines()[0][:120] \
+            if result.summary.strip() else ""
+        for s in plan["steps"]:
+            if s["status"] == "skipped" and s["note"] == blocked_note:
+                s["status"], s["note"] = "pending", ""
+    else:
+        step["status"], step["note"] = "failed", result.summary.splitlines()[0][:140]
+        # A tool the error itself names as the fix ("Call parameterize_ligand
+        # for each") — offered once even when the retries are spent.
+        step["fix"] = next((t for t in re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", result.summary)
+                            if t in TOOL_DISPATCH and t != step["tool"]), "")
+        for s in plan["steps"]:
+            if s["status"] == "pending" and step["n"] in s["deps"]:
+                s["status"], s["note"] = "skipped", blocked_note
+
+
+def _plan_follow_up(plan: dict) -> str:
+    """What the model is told after a tool batch while a plan is running."""
+    open_steps = [s for s in plan["steps"] if s["status"] == "pending"]
+    head = f"Plan progress:\n{_render_plan(plan)}\n\n"
+    fixable = [s for s in plan["steps"] if s["status"] == "failed" and s.get("fix")
+               and not s.get("fix_offered")]
+    if fixable:
+        f = fixable[0]
+        f["fix_offered"], f["tries"] = True, min(f.get("tries", 0), 1)
+        return head + (
+            f"Step {f['n']} failed: {f['note']}. The error names `{f['fix']}` as the fix. "
+            f"If the user's request (including any clarification) gives what `{f['fix']}` "
+            f"needs, call it now, then retry step {f['n']}; if it needs a value the user "
+            "has not given, do not invent one — say what is needed in the final reply.")
+    retry = [s for s in plan["steps"] if s["status"] == "failed" and s.get("tries", 0) < 2]
+    if retry:
+        r = retry[0]
+        return head + (
+            f"Step {r['n']} failed: {r['note']}. Retry it once now with arguments corrected "
+            "from that error and from the results above (use names and selections a tool "
+            "actually returned — never a guessed name). If the error shows it cannot work, "
+            "do not retry; go on with the other steps and say why in the final reply.")
+    if not open_steps:
+        return head + (
+            "Every plan step has run, failed or been skipped. Do not call more tools. "
+            "Reply with a plain-text summary that covers EVERY step in order: what it "
+            "found or produced (with the tool's numbers), or why it failed or was skipped.")
+    nxt = open_steps[0]
+    return head + (
+        f"Next: step {nxt['n']} — {nxt['goal']}"
+        + (f" (expected tool: `{nxt['tool']}`)" if nxt["tool"] else "")
+        + ". Call the tool for it now; later steps that do not need its result may "
+        "run in the same turn. If a result changes what a later step needs, adapt "
+        "that step. If a step cannot be done, say so and why in the final reply — "
+        "never claim it was done. Reply in plain text only when every step is done, "
+        "failed or skipped, covering each one.")
+
+
 def run_agent(user_prompt: str, status=None) -> str:
     """
     Execute a gated, deduplicated multi-turn tool-calling loop for one user command.
@@ -9015,17 +9277,25 @@ def run_agent(user_prompt: str, status=None) -> str:
     _log(f"📨 User: {user_prompt}")
     _progress(status, "Reading your request…")
     st.session_state.agent_trace = []
+    st.session_state.agent_plan = None
     st.session_state.request_no = st.session_state.get("request_no", 0) + 1
 
     # A reply to the question asked last turn: turn "2" back into the original
     # request with the chosen meaning spelled out, so every gate and the model
     # see what the user actually wants.
     pending = st.session_state.pop("clarify", None)
+    paused_plan = st.session_state.pop("plan_paused", None)
     clarify_note, clarified = "", False
     if pending:
         choice = resolve_clarification(pending, user_prompt)
         if not choice and not pending["options"] and len(user_prompt.split()) <= 8:
             # A short answer to an open question ("2W72") is that answer.
+            choice = {"meaning": user_prompt.strip()}
+        # Same mid-plan (S6), even with options: "net charge 0" answers "What
+        # is the net charge of AQ4? 1. Provide the net charge 2. Skip".
+        if (not choice and paused_plan and paused_plan["request"] == pending["request"]
+                and len(user_prompt.split()) <= 8
+                and not _PLAN_VERB.search(user_prompt.lower())):
             choice = {"meaning": user_prompt.strip()}
         if choice:
             clarified = True
@@ -9038,6 +9308,14 @@ def run_agent(user_prompt: str, status=None) -> str:
                 + f", about their request \"{pending['request']}\". If the newest message "
                 "answers that, carry out the original request with the meaning they chose; "
                 "if it is a new request, handle that instead.\n\n")
+    # S6: the model asked in plain words ("what net charge for AQ4?") with a
+    # plan unfinished — a short reply answers it, same as an open question.
+    if (not pending and paused_plan and paused_plan.get("asked_in_text")
+            and len(user_prompt.split()) <= 8 and not _PLAN_VERB.search(user_prompt.lower())):
+        pending = {"request": paused_plan["request"]}
+        user_prompt = f"{paused_plan['request']} — clarification: {user_prompt.strip()}"
+        clarified = True
+        _log(f"🧭 Answer to the plan's question: {user_prompt}")
     st.session_state.current_request = user_prompt
 
     prompt_lower = user_prompt.lower()
@@ -9150,6 +9428,44 @@ def run_agent(user_prompt: str, status=None) -> str:
     # _state_block() for why that matters to the prefill cost. Retrieved
     # few-shot grounding (rag_grounding.py) rides in the volatile user
     # message alongside the scene state, same reasoning as _state_block().
+    # S6: a request with several actions gets a plan before any tool runs. A
+    # plan paused by a question last turn resumes where it stopped: its done
+    # steps stay done, so the load or analysis before the question is not redone.
+    plan = None
+    if clarified and paused_plan and pending and paused_plan["request"] == pending["request"]:
+        plan = {k: v for k, v in paused_plan.items() if k != "asked_in_text"}
+        plan["request"] = user_prompt
+        for s in plan["steps"]:
+            if s["status"] != "done":
+                s["status"], s["note"], s["tries"] = "pending", "", 0
+        _log(f"🗺️ Resuming plan after the answer:\n{_render_plan(plan)}")
+    elif _plan_wanted(user_prompt):
+        _progress(status, "Planning the steps…")
+        plan = _plan_request(user_prompt)
+        if plan:
+            _log(f"🗺️ Plan:\n{_render_plan(plan)}")
+    st.session_state.agent_plan = plan
+    plan_slot = status.empty() if (plan and status is not None) else None
+
+    def _show_plan() -> None:
+        if plan_slot is not None:
+            plan_slot.markdown("**Plan**\n\n" + _render_plan(plan).replace("\n", "  \n"))
+
+    _show_plan()
+    plan_block = ""
+    if plan:
+        done = [s for s in plan["steps"] if s["status"] == "done"]
+        plan_block = (
+            "Plan for this request — work through every step in order; steps that do "
+            "not need an earlier result may run in the same turn:\n"
+            + "\n".join(f"{s['n']}. {s['goal']}"
+                        + (f" [`{s['tool']}`]" if s["tool"] else "")
+                        + (" — ALREADY DONE, do not repeat" if s["status"] == "done" else "")
+                        for s in plan["steps"])
+            + ("\n\n" if not done else
+               "\nSteps marked done ran before the user's answer; their results are in "
+               "the Scene and Remembered results.\n\n"))
+
     grounding = format_grounding(user_prompt)
     grounding_block = f"{grounding}\n\n" if grounding else ""
     history = _history_block()
@@ -9157,7 +9473,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     messages = [
         {"role": "system", "content": _system_prompt()},
         {"role": "user", "content": (f"{_state_block()}\n\n{grounding_block}{history_block}"
-                                     f"{clarify_note}Newest request: {user_prompt}")}
+                                     f"{clarify_note}{plan_block}Newest request: {user_prompt}")}
     ]
 
     # Every tool call that ran this request, in order: (name, ToolResult).
@@ -9179,6 +9495,18 @@ def run_agent(user_prompt: str, status=None) -> str:
                          if m.get("role") == "user")
         text = text.replace(grounding, "") if grounding else text
         return "\n".join([text] + [json.dumps(r.data, default=str) for _, r in ran if r.data])
+
+    def _plan_footer() -> str:
+        # Every plan step's outcome, from code, not the model: a step the reply
+        # skipped over still shows as done, failed or not run (S6).
+        if not plan:
+            return ""
+        for s in plan["steps"]:
+            if s["status"] == "pending":
+                s["status"] = "done" if not s["tool"] else "skipped"
+                s["note"] = "answered above" if not s["tool"] else "not run"
+        _show_plan()
+        return f"\n\n**Plan**\n{_render_plan(plan)}"
 
     active_tools, tools_are_subset = TOOLS, False
     _log(
@@ -9221,7 +9549,9 @@ def run_agent(user_prompt: str, status=None) -> str:
     # Each turn is a full round trip to the model: one to pick tools, one more
     # to read their results and either summarize or call more. A single-tool
     # request now costs two turns and a load-then-style request four.
-    MAX_TURNS = 16
+    # A plan gets a budget per step instead (S6): 3 turns each, with a hard cap.
+    MAX_TURNS = min(PLAN_TURN_CAP, max(16, 3 * len(plan["steps"]) + 4)) if plan else 16
+    plan_nudges = 0                        # Retries for plan steps left unrun at the reply
     summary_parts = []
     called_sigs: set[str] = set()          # Tracks (name, args) pairs to avoid exact repeats
     failed_sigs: dict[str, str] = {}       # sig -> result, for calls that failed
@@ -9336,6 +9666,23 @@ def run_agent(user_prompt: str, status=None) -> str:
             # scene, the working context, the user's words or a tool result.
             # One chance to correct it; after that, flag what is unverified
             # rather than pass it off as fact.
+            # S6: a plan step that never ran is not silently dropped. Twice at
+            # most, the model is sent back to it; whatever is still open after
+            # that is reported as not done in the checklist below.
+            unrun = ([s for s in plan["steps"] if s["status"] == "pending" and s["tool"]]
+                     if plan else [])
+            if unrun and plan_nudges < 2 and turn < MAX_TURNS - 2:
+                plan_nudges += 1
+                _log(f"↻ Plan steps {[s['n'] for s in unrun]} never ran — nudging")
+                messages.append({"role": "assistant", "content": final_text})
+                messages.append({"role": "user", "content": (
+                    "These plan steps have not run: "
+                    + "; ".join(f"{s['n']}. {s['goal']}"
+                                + (f" (`{s['tool']}`)" if s["tool"] else "") for s in unrun)
+                    + ". Call the tools for them now. If one cannot be done, or is "
+                    "answered in words, reply covering every step and say plainly which "
+                    "ones were not done and why. Do not mention this note.")})
+                continue
             unsupported = _unsupported_facts(final_text, _request_evidence())
             if unsupported and not fact_checked:
                 fact_checked = True
@@ -9402,7 +9749,7 @@ def run_agent(user_prompt: str, status=None) -> str:
                 # A failed call that led to find_pockets (find_contacts on
                 # 'pocket 30') still leaves a pocket-only answer.
                 if all(n == "find_pockets" for n, r in ran if r.ok):
-                    return pocket_reports[-1].summary
+                    return pocket_reports[-1].summary + _plan_footer()
                 if pocket_reports[-1].data.get("summary"):
                     reply += f"\n\n_fpocket: {pocket_reports[-1].data['summary']}_"
             # Same for salt bridges: the model miscounted pairs and called
@@ -9419,7 +9766,10 @@ def run_agent(user_prompt: str, status=None) -> str:
             amber = [r.data for r in _ran("setup_amber") if r.ok and r.data.get("summary")]
             if amber and amber[-1]["summary"] not in reply:
                 reply += f"\n\n_tleap: {amber[-1]['summary']}_"
-            return reply
+            if (plan and "?" in final_text
+                    and any(s["status"] != "done" and s["tool"] for s in plan["steps"])):
+                st.session_state.plan_paused = {**plan, "asked_in_text": True}
+            return reply + _plan_footer()
 
         tool_results = []
 
@@ -9499,6 +9849,18 @@ def run_agent(user_prompt: str, status=None) -> str:
                     if mut:
                         args["mutant"] = mut
                         _log(f"🧭 Injected mutant '{mut}' from the prompt")
+                # The wild type the user wrote wins: for "is K48R tolerated"
+                # qwen2.5:14b sent wildtype='L' (lysine → L), and the tool
+                # rightly refused a claim the structure contradicts (S6 eval).
+                num = re.search(r"\d+", str(args.get("residue", "")))
+                said = [esm.parse_amino_acid(wt) for wt, n, mt in re.findall(
+                            r"\b([A-Za-z]{1,3})(\d+)([A-Za-z]{1,3})\b", user_prompt)
+                        if num and n == num.group()
+                        and esm.parse_amino_acid(wt) and esm.parse_amino_acid(mt)]
+                claimed = esm.parse_amino_acid(str(args.get("wildtype") or "")) or ""
+                if said and claimed and claimed != said[0]:
+                    args["wildtype"] = said[0]
+                    _log(f"🧭 Wild type '{claimed}' replaced by the user's '{said[0]}'")
                 ch = str(args.get("chain") or "").strip().upper()
                 if ch and ch not in user_chains and not re.search(
                         rf"\b{re.escape(ch)}\s*[/:]\s*\d|\d\s*[/:]\s*{re.escape(ch)}\b",
@@ -9570,7 +9932,13 @@ def run_agent(user_prompt: str, status=None) -> str:
             # same rule directly and qwen2.5:7b follows it without a
             # hard block, verified across pure-"show" prompts, mixed
             # show+highlight prompts, and a "show the ligand" case.
-            if name == "select" and (show_rep_fired or batch_has_rep_show):
+            # With a plan, a select that serves its own open highlight step is
+            # the user's request, not a stray add-on to a show (S6).
+            plan_wants_select = bool(plan) and any(
+                s["status"] == "pending" and s["tool"] in ("select", "highlight")
+                for s in plan["steps"])
+            if (name == "select" and (show_rep_fired or batch_has_rep_show)
+                    and not plan_wants_select):
                 _log(
                     f"🚫 Blocked 'select' — representation command; no highlight needed"
                 )
@@ -9620,6 +9988,28 @@ def run_agent(user_prompt: str, status=None) -> str:
                 tool_results.append({"tool": name, "result": _blocked(
                     "Blocked — the user did not ask to download the database. Ask them first.")})
                 continue
+
+            # ── Plan: dependencies (S6) ─────────────────────────────────────
+            # A step that needs an earlier step's result waits until that step
+            # is done: in one batch the model highlighted 'heme_neighbors'
+            # right after the select_within that failed to make it. Deferring
+            # also when the dependency finished in the same batch serialised
+            # every step (the planner chains them) and doubled latency, so a
+            # blind guess there (setup_amber on '_PREP1CRN') is left to fail
+            # and get its retry instead.
+            step = _plan_step_for(plan, name) if plan else None
+            if step:
+                late = [d for d in plan["steps"] if d["n"] in step["deps"] and d["tool"]
+                        and d["status"] != "done"]
+                if late:
+                    d = late[0]
+                    _log(f"⏸ Deferred '{name}' — plan step {step['n']} needs step {d['n']}, "
+                         f"which is {d['status']}")
+                    tool_results.append({"tool": name, "result": _skipped(
+                        f"Deferred — step {step['n']} needs step {d['n']}'s result, and step "
+                        f"{d['n']} is {d['status']}. Do step {d['n']} first, then call this "
+                        "again with arguments taken from its result.", ok=False)})
+                    continue
 
             # ── Dedup: exact same call ──────────────────────────────────────
             sig = f"{name}:{json.dumps(args, sort_keys=True)}"
@@ -9694,6 +10084,9 @@ def run_agent(user_prompt: str, status=None) -> str:
             summary_parts.append(f"{name}: {result}")
             ran.append((name, result))
             _remember(name, args, result)
+            if plan and not result.data.get("needs_user_choice"):
+                _advance_plan(plan, name, result)
+                _show_plan()
             tool_results.append({"tool": name, "result": result,
                                  "args": dict(args), "ms": round(elapsed_ms)})
             # A call that succeeds may have fixed what an earlier one lacked
@@ -9723,6 +10116,11 @@ def run_agent(user_prompt: str, status=None) -> str:
         if st.session_state.get("clarify"):
             _log(f"❔ Asking the user: {clarification_text()}")
             _progress(status, "Need a choice from you before going on.")
+            # S6: the answer resumes this plan, and what already ran is reported
+            # now — a question at step 6 used to drop steps 1-5's results.
+            if plan and any(s["status"] == "done" for s in plan["steps"]):
+                st.session_state.plan_paused = plan
+                return (f"{clarification_text()}\n\nSo far:\n{_render_plan(plan)}")
             return clarification_text()
 
         results_text = "\n".join(f"[{r['tool']}]: {_for_model(r['result'])}"
@@ -9746,6 +10144,8 @@ def run_agent(user_prompt: str, status=None) -> str:
         # Say which calls failed, in so many words. Left implicit, the model
         # read "could not make sense of '30'" and told the user the residues
         # were highlighted.
+        if plan:
+            follow_up = _plan_follow_up(plan)
         failed = [r for r in tool_results if not r["result"].ok]
         if failed:
             follow_up = (
@@ -9755,7 +10155,7 @@ def run_agent(user_prompt: str, status=None) -> str:
                 "so never report its absence of results as a finding ('no salt bridges "
                 "were found'). Retry once with corrected arguments if the "
                 "error shows how, otherwise tell the user plainly what failed and why. "
-                + ("" if show_rep_fired else follow_up))
+                + ("" if show_rep_fired and not plan else follow_up))
         messages.append({
             "role": "user",
             "content": f"Tool results:\n{results_text}\n\n{_state_block()}\n\n{follow_up}"
@@ -9763,7 +10163,7 @@ def run_agent(user_prompt: str, status=None) -> str:
 
     _log("⚠️ Max turns reached", logging.WARNING)
     _progress(status, "Stopping — reached the step limit for this request.")
-    return "Done: " + "; ".join(summary_parts)
+    return "Done: " + "; ".join(summary_parts) + _plan_footer()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

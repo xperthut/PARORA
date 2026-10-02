@@ -68,7 +68,9 @@ APP_DIR = HERE.parent / "protein-viz-agent"
 CASES = HERE / "prompts.jsonl"
 REPORTS = HERE / "reports"
 COURTESY = re.compile(r"anything else|let me know|can i (help|assist) you|"
-                      r"further (help|assist)", re.I)
+                      r"further (help|assist|action|request)|"
+                      r"would you like (me )?to (do|perform|try) (anything|something|any) "
+                      r"(else|further|more)", re.I)
 DISCOVERED = ("PACKMOL_MEMGEN", "DSSP_BIN", "FOLDSEEK_BIN", "FOLDSEEK_DB", "FOLDSEEK_AFDB",
               "FPOCKET_BIN", "PYMOL_PYTHON", "ESM_PYTHON")
 

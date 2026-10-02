@@ -295,6 +295,8 @@ defaults = {
     "active_only":     False,   # draw only the active structure — see _viewer_payload
     "viewer_seq":      0,       # last viewer event applied — see handle_viewer_event
     "toolbar_open":    None,    # (top, sub) of the open toolbar dialog — see _toolbar_dialog
+    "facts":           [],      # every successful agent tool result — see _remember (S5)
+    "request_no":      0,       # chat requests run_agent has handled
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -2302,6 +2304,10 @@ def tool_setup_amber(target: str = "", force_field: str = "ff19SB",
             "nanoseconds": ns, "temperature": temp, "topology": bool(build and build["ok"])}
     if build and build["ok"]:
         data.update({k: build[k] for k in ("atoms", "residues", "waters", "charge", "disulfides")})
+        # run_agent attaches this line verbatim: qwen2.5:14b's paraphrase kept
+        # the atom count and dropped the force field, net charge and the
+        # disulfide count — the one number that shows S–S bonds were built.
+        data["summary"] = next(o for o in out if o.startswith("Built the Amber system"))
     # Run inputs without tleap are a partial success; a tleap that ran and
     # failed is a failure, whatever else was written.
     return ToolResult(" ".join(out), not (build and not build["ok"]), data,
@@ -6676,6 +6682,24 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "recall",
+            "description": (
+                "Return, in full, results that tools produced for EARLIER requests in "
+                "this session — pockets, distances, contacts, interactions, mutation "
+                "scores, files written, etc. — with the call that produced each. Use it "
+                "when the user refers back ('the pocket you found earlier', 'that "
+                "distance', 'the file you saved', 'compare with before') and the "
+                "'Remembered results' lines in the Scene block do not give enough "
+                "detail. Changes nothing."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "topic": {"type": "string", "description": "What to look up: a fact id such as 'F3', a topic ('pocket', 'distance', 'salt bridge', 'file'), a tool name, a PDB id or a residue. Empty = everything remembered."},
+                "limit": {"type": "integer", "description": "How many results to return, newest and best matches first (default 5)"}
+            }, "required": ["topic"]}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "find_protein",
             "description": (
                 "Identify a protein by name, gene symbol or UniProt accession and "
@@ -6744,7 +6768,9 @@ TOOLS = [
                 "insulin receptor', 'show me EGFR', 'open p53'. Picks the file the way "
                 "the Proteins panel would and adds it to the scene. Falls back to the "
                 "AlphaFold predicted model when no experimental structure exists. For "
-                "an actual PDB accession use fetch_structure instead."
+                "an actual PDB accession use fetch_structure instead. Like "
+                "fetch_structure it draws the structure itself — no show/color/hide after "
+                "a plain load."
             ),
             "parameters": {"type": "object", "properties": {
                 "name": {"type": "string"},
@@ -6981,7 +7007,10 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "fetch_structure",
-            "description": "Download a PDB structure from RCSB by ID and save it locally. Always call this to load a structure before any other operation.",
+            "description": ("Download a PDB structure from RCSB by ID and save it locally. Always call this "
+                            "to load a structure before any other operation. The first structure loaded "
+                            "is drawn right away as a rainbow cartoon: a plain 'load X' needs no "
+                            "show, color or hide call after it."),
             "parameters": {"type": "object", "properties": {
                 "pdb_id": {"type": "string"}}, "required": ["pdb_id"]}
         }
@@ -7704,6 +7733,7 @@ def _known_args(fn, args: dict) -> dict:
 
 TOOL_DISPATCH = {
     "ask_user": lambda a: tool_ask_user(a.get("question", ""), a.get("options") or []),
+    "recall":   lambda a: tool_recall(str(a.get("topic", "")), a.get("limit", 5)),
     # ---------- Analysis tools from analysis_tools.py ----------
     "measure_mda_distance": lambda a: tool_measure_mda_distance(
         a.get("sel1", ""),
@@ -7993,6 +8023,14 @@ def _system_prompt() -> str:
         "   The earlier turns are TRIMMED and are not a source of facts: never copy "
         "   accessions, residue ranges or chain letters out of them — call the tool that "
         "   answers the question (e.g. `protein_structures`) and report its result. "
+        "0a8. EARLIER RESULTS. The 'Remembered results' lines in the Scene block are "
+        "   tool output from earlier requests, each with the call that produced it. "
+        "   'the pocket you found earlier', 'that distance', 'the file you saved', "
+        "   'compare with the salt bridges from before' → use those lines; if they lack "
+        "   the detail needed, call `recall` with the topic first. They ARE a source of "
+        "   facts (unlike the trimmed chat turns) — quote them, never re-estimate. Say "
+        "   which structure a remembered result was for. Run the tool again only when "
+        "   the user asks to redo it or nothing remembered matches. "
         "0d2. Preparing a structure — 'keep only one state', 'remove the other "
         "   models', 'this NMR structure has 20 states', 'clean it up', 'add "
         "   hydrogens', 'get it ready for Amber / Rosetta / simulation' → ONE "
@@ -8197,10 +8235,14 @@ TOOL_GROUPS = {
     "superpose": (r"superpose|superimpose|align|overlay|compare|rmsd|fit\b",
                   {"superpose_structures", "clear_superposition", "list_structures",
                    "add_structure", "fetch_structure"}),
+    "memory":   (r"earlier|\bbefore\b|previous|\bago\b|at the start|first time|you (found|"
+                 r"measured|saved|computed|got|said)|remember|recall|\bthat (pocket|"
+                 r"distance|score|file|result)",
+                 {"recall"}),
 }
 
 # Always offered: orientation, and the escape hatches for a misrouted message.
-CORE_TOOLS = {"describe_structure", "list_structures", "select", "show", "color"}
+CORE_TOOLS = {"describe_structure", "list_structures", "select", "show", "color", "recall"}
 
 def _route_tools(prompt_lower: str):
     """
@@ -8271,6 +8313,7 @@ def _state_block() -> str:
     acc = (st.session_state.focus or {}).get("accession", "")
     chain_desc = " ".join(x for x in (chain_map_line(s, acc, show_drawn=True)
                                       for s in structures()) if x)
+    memory = _memory_block()
     return (
         f"Scene — current structure: {pdb}. Structures in the scene: [{loaded}]. "
         + (f"Every chain of each loaded file is in the scene: {chain_desc}. " if chain_desc else "")
@@ -8278,7 +8321,8 @@ def _state_block() -> str:
         f"Representations currently drawn (this is everything the viewer shows, nothing "
         f"else is visible): [{rep_desc}]. "
         f"Text labels currently pinned: [{label_desc}]. "
-        f"Superpositions: [{fits}]." + (f" {focus}" if focus else "") + pending_line)
+        f"Superpositions: [{fits}]." + (f" {focus}" if focus else "") + pending_line
+        + (f"\n{memory}" if memory else ""))
 
 
 HISTORY_TURNS = 6          # chat messages (user + assistant) carried into a request
@@ -8311,6 +8355,164 @@ def _history_block() -> str:
         who = "User" if m.get("role") == "user" else "You"
         lines.append(f"{who}: {text}")
     return "Earlier conversation (context only — act on the newest request):\n" + "\n".join(lines)
+
+
+# ── Working memory (suggestion.txt S5) ───────────────────────────────────────
+# _history_block keeps 6 trimmed messages, so "compare that to the pocket you
+# found earlier" had nothing to work from once that answer scrolled out. Every
+# tool call that succeeds is kept in st.session_state.facts with the call that
+# produced it (provenance): the newest few ride in _state_block as one line
+# each, and `recall` returns any of them in full. The history stays context
+# only; facts come from here, and everything here is tool-produced.
+
+# Topic words `recall` matches on, besides the tool name and the result text.
+MEMORY_TOPICS = {
+    "structure load loaded entry": {"fetch_structure", "add_structure", "load_protein",
+                                    "load_local", "remove_structure", "clear_scene"},
+    "chain chains residue residues composition ligand": {
+        "describe_structure", "summarize_chains", "list_residues", "list_structures"},
+    "selection residues near within": {"select_within", "select_by_bfactor", "nearby_residues"},
+    "measurement distance angle dihedral": {
+        "measure_distance", "measure_angle", "measure_dihedral", "measure_mda_distance",
+        "measure_mda_angle", "measure_mda_dihedral"},
+    "contact contacts near": {"find_contacts", "detect_contacts", "nearby_residues"},
+    "interaction interactions bond bonds salt bridge hydrogen disulfide": {
+        "find_interactions", "detect_salt_bridges", "detect_hydrogen_bonds"},
+    "pocket pockets cavity binding site druggable": {"find_pockets"},
+    "mutation mutant variant score esm": {"predict_mutation_effect"},
+    "protein function uniprot structures": {"find_protein", "protein_structures",
+                                            "protein_function"},
+    "fold topology neighbour neighbor foldseek similar": {"describe_fold",
+                                                          "find_structural_neighbors"},
+    "superposition rmsd alignment compare": {"superpose_structures", "align_structures"},
+    "bfactor b-factor flexibility": {"bfactor_summary", "select_by_bfactor"},
+    "preparation prepared simulation amber gromacs rosetta qm oniom ligand parameters": {
+        "inspect_preparation", "prepare_structure", "parameterize_ligand", "setup_amber",
+        "setup_gromacs", "setup_rosetta_docking", "setup_qm", "setup_oniom"},
+    "membrane": {"orient_membrane", "build_membrane", "membrane_status"},
+    "image render figure": {"render_image"},
+    "file files saved written": {"save_structure", "remove_solvent"},
+}
+
+# Calls whose outcome is the live scene, which _state_block already spells out,
+# or that only ask/list: remembering them would bury the results among clicks.
+MEMORY_SKIP = {"ask_user", "recall", "select", "highlight", "show", "show_all", "hide",
+               "hide_all", "color", "set_transparency", "zoom", "set_background",
+               "add_label", "clear_labels", "list_labels", "clear_superposition",
+               "download_foldseek_database"}
+
+MEMORY_LINES = 12          # remembered results shown in the Scene block
+MEMORY_LINE_CHARS = 220    # per line; `recall` has the rest
+_RECALL_STOP = {"the", "a", "an", "of", "you", "i", "we", "that", "this", "it", "earlier",
+                "before", "found", "find", "result", "results", "what", "was", "were",
+                "my", "your", "last", "previous", "first", "about", "from", "for", "on",
+                "in", "and", "to", "did", "do"}
+
+
+def _topics_of(tool: str) -> list:
+    return [w for words, tools in MEMORY_TOPICS.items() if tool in tools
+            for w in words.split()]
+
+
+def _remember(name: str, args: dict, result: ToolResult) -> None:
+    """Keep one successful tool call and its result as a fact (S5)."""
+    if not result.ok or name in MEMORY_SKIP or result.data.get("needs_user_choice"):
+        return
+    facts = st.session_state.setdefault("facts", [])
+    facts.append({
+        "id": f"F{len(facts) + 1}",
+        "request": st.session_state.get("request_no", 0),
+        "prompt": st.session_state.get("current_request", ""),
+        "tool": name,
+        "args": json.loads(json.dumps(args, default=str)),
+        "structure": st.session_state.pdb_id or "",
+        "summary": result.summary[:4000],
+        "data": json.loads(json.dumps(result.data, default=str)),
+        "files": list(result.files),
+    })
+
+
+def _fact_call(f: dict) -> str:
+    args = ", ".join(f"{k}={v!r}" for k, v in f["args"].items())
+    return f"{f['tool']}({args})" + (f" on {f['structure']}" if f["structure"] else "")
+
+
+def _fact_gist(f: dict) -> str:
+    """One line of what a remembered call found."""
+    text = f["data"].get("summary") if isinstance(f["data"].get("summary"), str) else ""
+    if not text:
+        text = " ".join(ln.strip() for ln in f["summary"].splitlines()[:3] if ln.strip())
+    text = " ".join(text.split())
+    if f["files"]:
+        text += " Files: " + ", ".join(Path(p).name for p in f["files"][:3])
+    return text if len(text) <= MEMORY_LINE_CHARS else text[:MEMORY_LINE_CHARS] + " …"
+
+
+def _memory_block() -> str:
+    """
+    Results of earlier requests, one line each, for the Scene block. This
+    request's own calls are left out — their full results are in the turn.
+    """
+    now = st.session_state.get("request_no", 0)
+    old = [f for f in st.session_state.get("facts", []) if f["request"] < now]
+    if not old:
+        return ""
+    loaded = {s["pdb_id"] for s in structures()}
+    shown = old[-MEMORY_LINES:]
+    lines = [f"{f['id']} (request {f['request']}) {_fact_call(f)}"
+             + (" [structure no longer loaded]" if f["structure"] and f["structure"] not in loaded
+                else "")
+             + f" → {_fact_gist(f)}" for f in shown]
+    more = (f" {len(old) - len(shown)} older result(s) not listed — `recall` finds them."
+            if len(old) > len(shown) else "")
+    return ("Remembered results of earlier requests (tool output, with the call that "
+            "produced it; `recall` gives the full result):" + more + "\n" + "\n".join(lines))
+
+
+def tool_recall(topic: str = "", limit: int = 5) -> ToolResult:
+    """
+    Earlier tool results matching `topic` — a fact id ('F3'), a tool name, a
+    topic word ('pocket', 'distance', 'salt bridge', 'file'), a PDB id or a
+    residue — newest first, in full.
+    """
+    facts = st.session_state.get("facts", [])
+    if not facts:
+        return _ok("Nothing is remembered yet — no tool has produced a result in this "
+                   "session.", {"facts": []})
+    words = [w for w in re.findall(r"[a-z0-9]+", (topic or "").lower()) if w not in _RECALL_STOP]
+    ranked = []
+    for i, f in enumerate(facts):
+        tags = set(_topics_of(f["tool"])) | set(f["tool"].split("_"))
+        hay = " ".join([f["id"], f["tool"], f["structure"], json.dumps(f["args"]),
+                        f["summary"][:3000], " ".join(f["files"])]).lower()
+        if words and f["id"].lower() in words:
+            score = 100
+        else:
+            score = sum(3 if (w in tags or w.rstrip("s") in tags) else
+                        1 if (w in hay or w.rstrip("s") in hay) else 0 for w in words)
+        if score or not words:
+            ranked.append((score, i, f))
+    if not ranked:
+        known = sorted({f["tool"] for f in facts})
+        return _ok(f"No remembered result matches '{topic}'. Remembered tool results: "
+                   + ", ".join(known) + ". Run the tool again if it is needed.",
+                   {"facts": [], "topic": topic})
+    try:
+        limit = max(1, min(int(limit), 10))
+    except (TypeError, ValueError):
+        limit = 5
+    picked = [f for _, _, f in sorted(ranked, key=lambda x: (-x[0], -x[1]))[:limit]]
+    out = []
+    for f in picked:
+        body = f["summary"] if len(f["summary"]) <= 1500 else f["summary"][:1500] + " …"
+        asked = f" (\"{f['prompt'][:120]}\")" if f["prompt"] else ""
+        out.append(f"{f['id']} — request {f['request']}{asked}: {_fact_call(f)}\n{body}"
+                   + (f"\nFiles: {', '.join(f['files'])}" if f["files"] else ""))
+    return _ok(f"{len(picked)} remembered result(s) for '{topic or 'everything'}':\n\n"
+               + "\n\n".join(out),
+               {"facts": [{k: f[k] for k in ("id", "request", "tool", "args", "structure",
+                                             "data", "files")} for f in picked],
+                "topic": topic})
 
 
 # Lines a local model sometimes appends that describe its own tool use rather
@@ -8379,7 +8581,7 @@ _RESIDUE_TOKEN = re.compile(
 # Tools whose string arguments are identifiers or free text, not residue
 # selections — PDB ids, accessions, file names, the question itself.
 NUMBER_GATE_EXEMPT = {
-    "ask_user", "fetch_structure", "add_structure", "replace_scene", "load_protein",
+    "ask_user", "recall", "fetch_structure", "add_structure", "replace_scene", "load_protein",
     "find_protein", "protein_structures", "protein_function", "load_local",
     "remove_structure", "render_image", "save_structure", "set_background",
     "download_foldseek_database", "find_structural_neighbors", "superpose_structures",
@@ -8813,6 +9015,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     _log(f"📨 User: {user_prompt}")
     _progress(status, "Reading your request…")
     st.session_state.agent_trace = []
+    st.session_state.request_no = st.session_state.get("request_no", 0) + 1
 
     # A reply to the question asked last turn: turn "2" back into the original
     # request with the chosen meaning spelled out, so every gate and the model
@@ -9212,6 +9415,10 @@ def run_agent(user_prompt: str, status=None) -> str:
                 for label, key in (("Within one chain", "within"), ("Between chains", "between")):
                     if 0 < len(sb[-1][key]) <= 12:
                         reply += f"\n_{label}: {', '.join(sb[-1][key])}._"
+            # Same for an Amber build: force field, charge and disulfide count.
+            amber = [r.data for r in _ran("setup_amber") if r.ok and r.data.get("summary")]
+            if amber and amber[-1]["summary"] not in reply:
+                reply += f"\n\n_tleap: {amber[-1]['summary']}_"
             return reply
 
         tool_results = []
@@ -9298,6 +9505,24 @@ def run_agent(user_prompt: str, status=None) -> str:
                         user_prompt, re.I):
                     args.pop("chain")
                     _log(f"🧭 Dropped chain '{ch}' the user never named")
+
+            # `show` replaces a layer of the same type and selection, colour
+            # included. For a plain "load 1CRN" qwen2.5:14b added show(cartoon,
+            # protein) with the default colour 'element', which swapped the
+            # loaded rainbow cartoon for an element-coloured one nobody asked
+            # for. Keep the drawn layer's colour unless the user named one.
+            if name == "show" and not args.get("exclusive"):
+                drawn = next((r for r in st.session_state.representations
+                              if r["type"] == str(args.get("rep_type", "")).lower()
+                              and r["selection"] == resolve_selection(args.get("selection", ""))),
+                             None)
+                want = str(args.get("color") or "element").lower()
+                if (drawn and drawn.get("color") and drawn["color"] != want
+                        and want not in prompt_lower
+                        and not re.search(r"colou?r|paint|rainbow|spectrum", prompt_lower)):
+                    args["color"] = drawn["color"]
+                    _log(f"🧭 Kept the drawn {drawn['type']} colour '{drawn['color']}' "
+                         f"(user named no colour)")
 
             # The user named one chain; a residue selection that dropped it
             # would act on that residue in every chain ("select residue 58 of
@@ -9468,6 +9693,7 @@ def run_agent(user_prompt: str, status=None) -> str:
             _log(f"🔧 {name}({args}) → {result}", level)
             summary_parts.append(f"{name}: {result}")
             ran.append((name, result))
+            _remember(name, args, result)
             tool_results.append({"tool": name, "result": result,
                                  "args": dict(args), "ms": round(elapsed_ms)})
             # A call that succeeds may have fixed what an earlier one lacked

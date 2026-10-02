@@ -194,5 +194,17 @@
   {
     "prompt": "fetch lysozyme 2LZM, show tyrosine 88 as sticks and zoom to it",
     "grounding": "Three steps, one per instruction, nothing else (no remove_solvent): fetch_structure(pdb_id='2LZM'), then show(rep_type='licorice', selection='88'), then zoom(selection='88'). 'zoom to it' needs its own zoom call — never say the view zoomed without calling zoom."
+  },
+  {
+    "prompt": "list the residues lining the pocket you found earlier",
+    "grounding": "The pocket result is from an earlier request: read its 'Remembered results' line in the Scene block. If that line does not list the residues, call recall(topic='pocket') and answer from it — do not run find_pockets again unless the user asks to redo it, and never invent residues."
+  },
+  {
+    "prompt": "what was the distance you measured before",
+    "grounding": "Answer from the 'Remembered results' line of the earlier measurement in the Scene block (quote its value, residues and structure). If no remembered line has it, call recall(topic='distance'); if recall finds nothing, say no distance was measured in this session."
+  },
+  {
+    "prompt": "compare that with the salt bridges from earlier",
+    "grounding": "Earlier results live in the 'Remembered results' lines of the Scene block; call recall(topic='salt bridge') for the full earlier result, run the new analysis only if it is not remembered, then compare the two using the tool numbers only."
   }
 ]

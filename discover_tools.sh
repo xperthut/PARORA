@@ -5,6 +5,8 @@
 # evals/run.py (which imports the exported variables) so the eval harness sees
 # the same backends the app does. Variables already set are left alone.
 # Installs nothing -- that is setup_tools.sh.
+# run.sh no longer sources this: it carries the same discovery (plus
+# automatic installs) itself. Kept for evals/run.py.
 
 _PARORA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AMBERTOOLS_ENV="${AMBERTOOLS_ENV:-ambertools}"

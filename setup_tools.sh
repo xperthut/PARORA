@@ -4,6 +4,9 @@
 # (torch env + model checkpoint) -- and
 # offer to install whichever are missing.
 #
+# run.sh now installs all of these automatically on every launch; this
+# script stays for an interactive, ask-first re-check.
+#
 # None of these are required to run the app (run.sh already runs fine
 # without any of them; the tools that need them just report "unavailable").
 # This script exists for someone who wants the fuller feature set and would

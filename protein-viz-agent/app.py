@@ -51,6 +51,7 @@ from analysis_tools import (
     contact_detection_from_universe,
     salt_bridge_detection_from_universe,
     hydrogen_bond_detection_from_universe,
+    HBOND_MIN_DISTANCE,
     nearby_residues_from_universe,
     measure_angle_from_universe,
     measure_dihedral_from_universe,
@@ -920,11 +921,21 @@ def _skipped(text: str, ok: bool = True) -> ToolResult:
     return ToolResult(text, ok, {"status": "skipped"})
 
 
+MODEL_RESULT_CHARS = 8000   # per tool result; the rest stays in data / the trace
+
+
 def _for_model(result: ToolResult) -> str:
     """A result as the model reads it: the summary, then any follow-up hints."""
+    text = result.summary
+    # A 26 KB table filled the 16k context and the reply came back as "The".
+    if len(text) > MODEL_RESULT_CHARS:
+        cut = text.rfind("\n", 0, MODEL_RESULT_CHARS)
+        cut = cut if cut > MODEL_RESULT_CHARS // 2 else MODEL_RESULT_CHARS
+        text = (text[:cut] + f"\n…(output trimmed: {len(text) - cut} more characters not "
+                "shown — say the list is longer; never guess the rest)")
     if not result.next_hints:
-        return result.summary
-    return (f"{result.summary}\n(Possible follow-ups — offer them, do not run them unasked: "
+        return text
+    return (f"{text}\n(Possible follow-ups — offer them, do not run them unasked: "
             + "; ".join(result.next_hints) + ")")
 
 
@@ -5379,6 +5390,11 @@ def tool_highlight(target: str, style: str = "ball+stick",
                     sels.append(residue)
         ngl = " or ".join(sels)
         labels = [f"{len(sels)} residues from the last interaction scan"]
+    elif spec in st.session_state.selections and spec != "highlight":
+        # A selection a tool just made: select_within('heme_neighbors') then
+        # highlight('heme_neighbors') failed twice with "could not make sense
+        # of 'heme', 'neighbors'" (S7 self-check eval).
+        ngl, labels = st.session_state.selections[spec], [f"the selection '{spec}'"]
     elif _pocket_target(spec) != (None, None):
         pocket_keys, label = _pocket_target(spec)
         if pocket_keys is None:
@@ -5895,12 +5911,22 @@ def _salt_bridge_pairs(df):
     def _chain(label):
         return str(label).rsplit(":", 1)[-1] if ":" in str(label) else ""
 
-    unique_pairs = (df[["acidic_residue", "basic_residue"]]
-                    .drop_duplicates().reset_index(drop=True))
-    pairs = [(r.acidic_residue, r.basic_residue)
-             for r in unique_pairs.itertuples(index=False)]
+    # Each pair with its closest atom contact: asked "which is the shortest",
+    # qwen2.5:14b picked the first pair listed (2.717 Å) over a 2.519 Å one
+    # further down the atom table (S7).
+    if "distance_A" in df.columns:
+        closest = df.groupby(["acidic_residue", "basic_residue"], sort=False)["distance_A"].min()
+        pairs = [(a, b, float(d)) for (a, b), d in closest.items()]
+    else:
+        pairs = [(r.acidic_residue, r.basic_residue, None) for r in
+                 df[["acidic_residue", "basic_residue"]].drop_duplicates().itertuples(index=False)]
     return ([p for p in pairs if _chain(p[0]) == _chain(p[1])],
             [p for p in pairs if _chain(p[0]) != _chain(p[1])])
+
+
+def _pair_label(p) -> str:
+    a, b, d = p
+    return f"{a}–{b}" + (f" {d:.2f} Å" if d is not None else "")
 
 
 def _df_failed(df) -> bool:
@@ -5940,7 +5966,7 @@ def _format_salt_bridge_summary(df, cutoff: float, max_rows: int = 100) -> str:
     pairs = intra + inter
 
     def _list(ps):
-        shown = ", ".join(f"{a}–{b}" for a, b in ps[:40])
+        shown = ", ".join(_pair_label(p) for p in ps[:40])
         return shown + (f", …and {len(ps) - 40} more" if len(ps) > 40 else "")
 
     response = (
@@ -5948,6 +5974,10 @@ def _format_salt_bridge_summary(df, cutoff: float, max_rows: int = 100) -> str:
         f"({len(df)} acidic–basic atom contacts within {cutoff:.1f} Å): "
         f"{len(intra)} within one chain, {len(inter)} between two chains."
     )
+    dists = [p for p in pairs if p[2] is not None]
+    if dists:
+        best = min(dists, key=lambda p: p[2])
+        response += f" Closest pair: {_pair_label(best)}."
     if intra:
         response += f"\nWithin one chain ({len(intra)}): {_list(intra)}."
     if inter:
@@ -6143,8 +6173,8 @@ def tool_detect_salt_bridges(
         if _df_rows(df) and {"acidic_residue", "basic_residue"} <= set(df.columns):
             intra, inter = _salt_bridge_pairs(df)
             data.update(pairs=len(intra) + len(inter),
-                        within=[f"{a}–{b}" for a, b in intra],
-                        between=[f"{a}–{b}" for a, b in inter],
+                        within=[_pair_label(p) for p in intra],
+                        between=[_pair_label(p) for p in inter],
                         summary=f"{len(intra) + len(inter)} candidate salt-bridge residue "
                                 f"pairs ({_df_rows(df)} acidic–basic atom contacts within "
                                 f"{cutoff:.1f} Å): {len(intra)} within one chain, "
@@ -6163,17 +6193,29 @@ def tool_detect_hydrogen_bonds(
         return _fail("MDAnalysis unavailable — cannot detect hydrogen bonds",
                      {"unavailable": "mdanalysis"})
 
+    cutoff = _safe_float(cutoff, 3.5)
+    max_rows = _safe_int(max_rows, 100)
     try:
-        df = hydrogen_bond_detection_from_universe(
-            u,
-            cutoff=cutoff,
-            max_rows=max_rows
-        )
+        # Count every pair; max_rows only trims the printed list. The detector
+        # stopped at 100, so "how many H-bonds" read 100, and the full table
+        # (26 KB for 1CRN) overflowed the model's context — its reply was "The".
+        df = hydrogen_bond_detection_from_universe(u, cutoff=cutoff, max_rows=10**6)
         if _df_failed(df):
             return _fail(str(df.iloc[0]["error"]))
-        return _ok(df.to_string(index=False),
-                   {"cutoff": cutoff, "hbonds": _df_rows(df),
-                    "truncated": _df_rows(df) >= max_rows})
+        rows = df.to_dict(orient="records") if "donor_residue" in df.columns else []
+        if not rows:
+            return _ok(f"No hydrogen-bond candidates within {cutoff:.1f} Å.",
+                       {"cutoff": cutoff, "hbonds": 0, "truncated": False})
+        pairs = [f"{r['donor_residue']} {r['donor_atom']} → {r['acceptor_residue']} "
+                 f"{r['acceptor_atom']} {r['distance_A']:.2f} Å" for r in rows]
+        head = (f"{len(rows)} candidate hydrogen bonds (donor → acceptor heavy atoms "
+                f"{HBOND_MIN_DISTANCE}–{cutoff:.1f} Å apart; a distance-only screen, no "
+                "angle or hydrogen-position check).")
+        shown = pairs[:max_rows]
+        more = f"\n…and {len(pairs) - len(shown)} more." if len(pairs) > len(shown) else ""
+        return _ok(head + "\n" + "\n".join(shown) + more,
+                   {"cutoff": cutoff, "hbonds": len(rows), "summary": head,
+                    "truncated": len(pairs) > len(shown)})
     except Exception as e:
         return _fail(f"Error detecting hydrogen bonds: {e}")
 
@@ -8709,9 +8751,15 @@ def _ambiguity_question(prompt: str) -> str:
     return ""
 
 
+# The Scene block is prompt context; a repair turn once pasted it into the reply.
+_SCENE_ECHO = re.compile(r"^\s*(Scene — current structure|Remembered results of earlier "
+                         r"requests|Plan progress:|Tool results:)")
+
+
 def _clean_reply(text: str) -> str:
-    """Drop tool-use meta remarks from a final reply."""
-    kept = [ln for ln in text.splitlines() if not _META_LINE.match(ln)]
+    """Drop tool-use meta remarks, and prompt blocks echoed back, from a final reply."""
+    paras = [p for p in re.split(r"\n\s*\n", text) if not _SCENE_ECHO.match(p)]
+    kept = [ln for ln in "\n\n".join(paras).splitlines() if not _META_LINE.match(ln)]
     return "\n".join(kept).strip()
 
 
@@ -9247,6 +9295,310 @@ def _plan_follow_up(plan: dict) -> str:
         "failed or skipped, covering each one.")
 
 
+# ── Self-check before answering (S7) ─────────────────────────────────────────
+# _unsupported_facts checks ids, decimals and residue names token by token; it
+# cannot see that "and who deposited it?" went unanswered, that "the shortest
+# is ASP6–LYS127 (2.717 Å)" ignores a 2.519 Å pair in the same table, or that
+# a B-factor table became "this loop moves the most in solution". One extra
+# JSON call reads the request, plan, evidence and draft, lists the request's
+# parts with answered or not, and the draft's unsupported or overstated
+# sentences with the reason. Code keeps only what it can pin down — a part
+# must be the user's words, a flagged sentence must be in the draft and carry
+# something checkable, hedged wording is never an overclaim — so the critic
+# cannot invent work. Problems → one repair turn (tools allowed); what a second
+# check still finds is noted under the reply. View-only and tool-less replies
+# skip it: nothing to check against, and they are most requests.
+
+CRITIC = os.getenv("PARORA_CRITIC", "1").strip().lower() not in ("0", "false", "off", "no")
+CRITIC_EVIDENCE_CHARS = 9000
+CRITIC_RESULT_CHARS = 2500
+_CRITIC_CLAIM = {"type": "object",
+                 "properties": {"quote": {"type": "string"}, "why": {"type": "string"}},
+                 "required": ["quote", "why"]}
+_CRITIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "parts": {"type": "array", "items": {
+            "type": "object",
+            "properties": {"part": {"type": "string"}, "answered": {"type": "boolean"},
+                           "tool": {"type": "string"}},
+            "required": ["part", "answered", "tool"]}},
+        "unsupported": {"type": "array", "items": _CRITIC_CLAIM},
+        "overclaims": {"type": "array", "items": _CRITIC_CLAIM},
+    },
+    "required": ["parts", "unsupported", "overclaims"],
+}
+# What each kind of evidence cannot show, for the tools that ran.
+_CRITIC_LIMITS = [
+    ({"predict_mutation_effect"},
+     "An ESM-2 score is a sequence-model prediction: stating as certain that a mutation "
+     "damages, destroys or preserves function or stability, or giving a ΔΔG, overclaims."),
+    ({"bfactor_summary", "select_by_bfactor"},
+     "B-factors are crystallographic displacement (mobility, disorder or model error) in "
+     "one crystal: stating that a region moves or is flexible in solution as fact overclaims."),
+    ({"find_contacts", "nearby_residues", "detect_contacts", "find_interactions",
+      "detect_hydrogen_bonds", "detect_salt_bridges", "select_within"},
+     "Contacts, distances and interaction lists give geometry only: binding strength, "
+     "affinity or which residue binds 'most strongly' stated as fact overclaims."),
+    ({"find_pockets"},
+     "fpocket pockets and druggability are predictions: calling one the real binding "
+     "site or the best drug target as fact overclaims."),
+    ({"protein_function"},
+     "A function under INFERRED / LOW CONFIDENCE stated as the protein's known "
+     "function overclaims."),
+    ({"find_structural_neighbors", "describe_fold"},
+     "AlphaFold DB hits are predicted models: calling them experimental or known "
+     "structures overclaims."),
+]
+_CRITIC_STOP = {"the", "a", "an", "of", "and", "or", "to", "is", "are", "it", "this", "that",
+                "what", "which", "how", "does", "do", "in", "on", "for", "with", "me", "tell",
+                "there", "be", "its", "any", "them", "they", "you", "can", "i"}
+# Hedged wording is the right way to state a prediction, never an overclaim:
+# qwen2.5:14b flagged "likely tolerated according to the ESM-2 model" twice.
+# A sentence that names the evidence's own limit ("higher crystallographic
+# displacement or disorder") was flagged as overclaiming flexibility.
+_HEDGE = re.compile(r"\b(likely|unlikely|suggests?|suggesting|predict\w*|may|might|could|"
+                    r"possibl[ey]|probabl[ey]|candidates?|estimat\w*|appears?|potential(ly)?|"
+                    r"proxy|crystallographic|displacement|disorder|geometry-based|"
+                    r"distance-only|sequence statistics|not (an? )?(experimental|measure\w*))\b",
+                    re.I)
+# Something an unsupported claim can be wrong about: a number, a residue or id
+# token, a superlative or a comparison with a norm. Plain background ("higher
+# B-factors mean more mobility") is not a claim about this structure's data.
+_CHECKABLE = re.compile(
+    r"\d|\b(one|two|three|four|five|six|seven|eight|nine|ten|dozen|hundred)\b|"
+    r"\b[A-Z][A-Za-z]{2}\s?\d+\b|\b(shortest|longest|closest|strongest|weakest|highest|"
+    r"lowest|largest|smallest|most|least|only|all|none|no)\b|"
+    r"\b(typical|usual|normal|average|unusual|compared|than)\b", re.I)
+# Claims that pick or compare: their numbers being in the evidence does not
+# make the pick right ("the shortest is 2.717 Å" when 2.519 Å is listed too).
+_PICKS = re.compile(r"\b(shortest|longest|closest|strongest|weakest|highest|lowest|largest|"
+                    r"smallest|most|least|only|none|typical|usual|normal|average|unusual|"
+                    r"compared|than)\b", re.I)
+# An offer or suggestion ("you can run find_interactions to see ...") claims
+# nothing; it was flagged as an overclaim of a failed call.
+_OFFER = re.compile(r"^\W*(to \w+|if you|you can|we can|i can|would you|shall i|let me)\b|"
+                    r"\b(you|we|i) (can|could) (run|call|use|highlight|select|show|try)\b", re.I)
+# A sentence that declines a part outright answers it (rule B: "say plainly
+# that you cannot tell"); the critic still listed "who deposited it?" after
+# "The depositor information is not available".
+_DECLINE = re.compile(r"\b(cannot|can't|can ?not|could ?n[o']t|unable|failed|not found|"
+                      r"(does|do|did)(n't| not) exist|no (such|chain|residue|structure)|"
+                      r"not (available|provided|possible|"
+                      r"included|listed|known|determin\w*|in the (data|file|results))|"
+                      r"no (data|information|tool|record|way)|does(n't| not) (say|include|"
+                      r"contain|list|report|give|provide)|without (experimental|further|"
+                      r"additional))\b",
+                      re.I)
+
+
+def _words(text: str) -> list:
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in _CRITIC_STOP]
+
+
+def _quoted_in(quote: str, text: str) -> bool:
+    """A critic quote is really in `text`: verbatim, or 3/4 of its words."""
+    norm = lambda s: " ".join(re.findall(r"[a-z0-9.]+", s.lower()))
+    if norm(quote) and norm(quote) in norm(text):
+        return True
+    q = _words(quote)
+    return len(q) >= 3 and sum(w in set(_words(text)) for w in q) >= 0.75 * len(q)
+
+
+# The critic's own reason sometimes agrees with the sentence it flags ("the
+# draft correctly identifies the shortest contact", "Pocket 2 has the highest
+# druggability score" for "Pocket 2 is the most druggable").
+_WHY_AGREES = re.compile(r"(?<!not )(?<!in)\b(correct(ly)?|accurate(ly)?|is supported|"
+                         r"matches the evidence|was (correctly )?reported)\b", re.I)
+
+
+def _numbers_backed(quote: str, evidence: str) -> bool:
+    """
+    Every number and residue/chain token in `quote` is in the evidence, and it
+    picks nothing. Tokens, not just numbers: chain-A pairs relabelled
+    "ASP6:A–LYS127:B" kept every distance right.
+    """
+    nums = re.findall(r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])", quote)
+    ev = re.sub(r"\s+", "", evidence.upper())
+    tokens = re.findall(r"\b[A-Za-z]{1,3}\d+(?:[:/][A-Za-z0-9])?\b|\b[A-Za-z0-9]/\d+\b|"
+                        r"\b[\w.-]+\.(?:pdb|cif|zip|png|prmtop|inpcrd|rst7|gjf|com|xyz|mol2|"
+                        r"frcmod|top|gro|mdp|in|sh)\b", quote)
+    return (bool(nums or tokens) and not _PICKS.search(quote)
+            and not _unsupported_facts(" ".join(nums), evidence)
+            and all(re.search(rf"(?<![\d.]){re.escape(n)}(?![\d])", evidence)
+                    for n in nums if "." not in n)
+            and all(re.sub(r"\s+", "", t.upper()) in ev for t in tokens))
+
+
+def _declined(part: str, draft: str) -> bool:
+    """The draft says outright that it cannot answer `part`."""
+    stems = {w[:5] for w in _words(part) if len(w) >= 4}
+    return any(_DECLINE.search(sent) and stems & {w[:5] for w in _words(sent) if len(w) >= 4}
+               for sent in re.split(r"(?<=[.!?])\s+|\n+", draft))
+
+
+def _critic_wanted(ran: list) -> bool:
+    """Self-check only replies built on tool results beyond view changes."""
+    if not CRITIC:
+        return False
+    worked = [n for n, r in ran if n not in MEMORY_SKIP]
+    # A pocket-only request gets fpocket's own report as the reply (P12).
+    return bool(worked) and not all(n == "find_pockets" for n in worked)
+
+
+def _critic_check(request: str, draft: str, ran: list, plan: dict | None) -> dict:
+    """
+    One JSON call: the parts of `request` the draft leaves unanswered, and the
+    draft's claims the evidence does not back or overstates, each with why.
+    Items code cannot verify against the request/draft are dropped.
+    Returns {"unanswered": [{part, tool}], "unsupported": [{quote, why}],
+    "overclaims": [{quote, why}]}, or {} when the call fails.
+    """
+    tools = {n for n, _ in ran}
+    limits = [txt for names, txt in _CRITIC_LIMITS if names & tools]
+    ev_text = "\n".join([_state_block()] + [r.summary for _, r in ran]
+                        + [json.dumps(r.data, default=str) for _, r in ran if r.data])
+    evidence, used = [], 0
+    for n, r in ran:
+        body = r.summary.strip()
+        if r.data.get("summary") and r.data["summary"] not in body:
+            body = f"{r.data['summary']}\n{body}"
+        body = body[:CRITIC_RESULT_CHARS] + (" …" if len(body) > CRITIC_RESULT_CHARS else "")
+        line = f"[{n}] {'ok' if r.ok else 'FAILED — changed nothing'}: {body}"
+        if used + len(line) > CRITIC_EVIDENCE_CHARS:
+            evidence.append(f"[{n}] (result omitted for length)")
+            continue
+        evidence.append(line)
+        used += len(line)
+    system = (
+        "You check a protein-structure assistant's draft reply before the user sees it. "
+        "Return JSON {\"parts\": [{\"part\", \"answered\"}], \"unsupported\": [{\"quote\", "
+        "\"why\"}], \"overclaims\": [{\"quote\", \"why\"}]}.\n"
+        "- parts: split the REQUEST into each separate question or action, in the user's "
+        "own words, and mark answered=true if the DRAFT answers or does it, or plainly says "
+        "it could not and why; answered=false if the draft skips it, only offers to do it "
+        "later, or replies to something else. For a part not answered, `tool` is the one "
+        "tool from TOOLS that would provide it, or \"\" if none can; for others \"\".\n"
+        "- unsupported: sentences of the DRAFT, quoted word for word, that state a specific "
+        "fact about this structure — a count, number, residue, chain, name, method, date, "
+        "person, a 'shortest/highest/only' pick, or a comparison with what is typical — "
+        "that neither the EVIDENCE nor the SCENE contains, or that the EVIDENCE contradicts "
+        "(check superlatives against every row). `why`: what the evidence actually says, "
+        "or that it has nothing on it. General background with no specific fact is fine.\n"
+        "- overclaims: sentences of the DRAFT, quoted word for word, that state as certain "
+        "what the evidence can only suggest, or report a FAILED call as having worked. "
+        "`why`: what the evidence can and cannot show. Hedged wording ('suggests', "
+        "'predicted', 'may', 'likely', 'candidate') is never an overclaim."
+        + ("\nLimits of the evidence here:\n- " + "\n- ".join(limits) if limits else "")
+        + "\nStandard caveat notes (ESM-2, inferred function, AlphaFold DB, tool counts) are "
+        "appended to the reply by code: never flag one as missing. Empty lists are the "
+        "normal answer; report only clear problems.")
+    plan_text = f"PLAN (code-tracked):\n{_render_plan(plan)}\n\n" if plan else ""
+    user = (f"TOOLS:\n{_tool_catalog()}\n\n"
+            f"REQUEST: {request}\n\n{plan_text}SCENE:\n{_state_block()[:3000]}\n\n"
+            f"EVIDENCE (tool results of this request):\n" + "\n\n".join(evidence)
+            + f"\n\nDRAFT:\n{draft}")
+    try:
+        response = ollama_client.chat(
+            model=MODEL,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            format=_CRITIC_SCHEMA,
+            options={**OLLAMA_OPTIONS, "temperature": 0},
+            keep_alive=KEEP_ALIVE,
+            think=THINK,
+        )
+        raw = json.loads(response.get("message", {}).get("content", "") or "{}")
+    except Exception as e:
+        _log(f"⚠️ Self-check failed ({e}) — reply kept as is", logging.WARNING)
+        return {}
+    req_words = set(_words(request))
+    unanswered, dropped = [], []
+    for p in raw.get("parts") or []:
+        if not isinstance(p, dict) or p.get("answered") is not False:
+            continue
+        part, w = str(p.get("part", "")).strip()[:300], _words(str(p.get("part", "")))
+        tool = str(p.get("tool") or "").strip()
+        # A hint only for a tool this part's own words route to, not yet run:
+        # the critic offered predict_mutation_effect for "how tightly does
+        # benzamidine bind", and the repair reply then discussed it.
+        routed = set().union(*(names for pat, names in TOOL_GROUPS.values()
+                               if re.search(pat, part.lower())))
+        if tool not in routed or tool in tools:
+            tool = ""
+        # A missing part must be something the user said, not a new task.
+        if not w or sum(x in req_words for x in w) < 0.5 * len(w):
+            dropped.append(f"part: {part}")
+        elif _declined(part, draft):
+            dropped.append(f"declined: {part}")
+        else:
+            unanswered.append({"part": part, "tool": tool})
+    claims = {}
+    for kind in ("unsupported", "overclaims"):
+        kept = []
+        for c in raw.get(kind) or []:
+            if not isinstance(c, dict):
+                continue
+            quote, why = str(c.get("quote", "")).strip()[:300], str(c.get("why", "")).strip()[:300]
+            if not quote or not _quoted_in(quote, draft):
+                dropped.append(f"{kind} not in draft: {quote}")
+            elif _HEDGE.search(quote) and (kind == "overclaims" or not re.search(r"\d", quote)):
+                dropped.append(f"hedged: {quote}")
+            elif _OFFER.search(quote) or _DECLINE.search(quote):
+                dropped.append(f"offer/decline: {quote}")
+            elif _numbers_backed(quote, ev_text):
+                dropped.append(f"numbers in evidence: {quote}")
+            elif _WHY_AGREES.search(why):
+                dropped.append(f"why agrees: {quote}")
+            elif kind == "unsupported" and not _CHECKABLE.search(quote):
+                dropped.append(f"nothing checkable: {quote}")
+            else:
+                kept.append({"quote": quote, "why": why})
+        claims[kind] = kept[:4]
+    found = {"unanswered": unanswered[:4], **claims}
+    _log(f"🧐 Self-check: {json.dumps(found, ensure_ascii=False)}"
+         + (f" — dropped {dropped}" if dropped else ""))
+    return found
+
+
+def _critic_repair_note(found: dict) -> str:
+    """The repair instruction for the model, from a self-check's findings."""
+    parts = []
+    if found.get("unanswered"):
+        parts.append("These parts of the request are not answered: "
+                     + "; ".join(f"\"{u['part']}\""
+                                 + (f" (`{u['tool']}` can provide it)" if u["tool"] else "")
+                                 for u in found["unanswered"])
+                     + ". Answer each, first in the reply — call the tool named if it has not "
+                     "run with the right arguments. If no tool can, write one sentence saying "
+                     "you cannot tell from the available data, and why; never leave it out.")
+    if found.get("unsupported"):
+        parts.append("These statements do not match the tool results: "
+                     + "; ".join(f"\"{c['quote']}\"" + (f" ({c['why']})" if c["why"] else "")
+                                 for c in found["unsupported"])
+                     + ". Re-read the results and correct them, or remove them.")
+    if found.get("overclaims"):
+        parts.append("These statements claim more than the evidence shows: "
+                     + "; ".join(f"\"{c['quote']}\"" + (f" ({c['why']})" if c["why"] else "")
+                                 for c in found["overclaims"])
+                     + ". Reword each as what the tool actually measured or predicted, "
+                     "with its limit.")
+    return ("Self-check of your draft: " + " ".join(parts) + " Keep everything else that "
+            "was right, and reply in full, written for the user: do not name tools and do "
+            "not mention this check.")
+
+
+def _critic_note(found: dict) -> str:
+    """What a second self-check still found, shown under the reply."""
+    bits = []
+    if found.get("unanswered"):
+        bits.append("not answered: " + "; ".join(f"“{u['part']}”" for u in found["unanswered"]))
+    claims = found.get("unsupported", []) + found.get("overclaims", [])
+    if claims:
+        bits.append("may not be backed by the results: "
+                    + "; ".join(f"“{c['quote']}”" for c in claims))
+    return ("\n\n_Self-check — " + " · ".join(bits) + "._") if bits else ""
+
+
 def run_agent(user_prompt: str, status=None) -> str:
     """
     Execute a gated, deduplicated multi-turn tool-calling loop for one user command.
@@ -9278,6 +9630,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     _progress(status, "Reading your request…")
     st.session_state.agent_trace = []
     st.session_state.agent_plan = None
+    st.session_state.agent_critic = []
     st.session_state.request_no = st.session_state.get("request_no", 0) + 1
 
     # A reply to the question asked last turn: turn "2" back into the original
@@ -9561,6 +9914,8 @@ def run_agent(user_prompt: str, status=None) -> str:
     fact_checked = False                   # One correction pass for unsupported facts
     disulfide_nudged = False               # One retry for a disulfide answer with no finder run
     zoom_nudged = False                    # One retry for a zoom request with no zoom call
+    critic_state = "todo"                  # S7 self-check: todo → repairing → done
+    critic_first = ("", {})                # The draft and findings that led to a repair
     user_chains = {c.upper() for c in re.findall(r"\bchain\s+([A-Za-z0-9])\b", user_prompt, re.I)}
 
     for turn in range(MAX_TURNS):
@@ -9679,7 +10034,14 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "These plan steps have not run: "
                     + "; ".join(f"{s['n']}. {s['goal']}"
                                 + (f" (`{s['tool']}`)" if s["tool"] else "") for s in unrun)
-                    + ". Call the tools for them now. If one cannot be done, or is "
+                    + ". Call the tools for them now"
+                    # "5. zoom to them" alone lost what "them" was: the model
+                    # answered "no specific residues mentioned" (S7 eval).
+                    + (" — 'it'/'them' in a step means an earlier step's result; "
+                       "selections made so far: "
+                       + ", ".join(f"'{k}'" for k in st.session_state.selections)
+                       if st.session_state.selections else "")
+                    + ". If one cannot be done, or is "
                     "answered in words, reply covering every step and say plainly which "
                     "ones were not done and why. Do not mention this note.")})
                 continue
@@ -9696,6 +10058,31 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "call the tool that provides it; if no tool can, say you cannot tell. Do "
                     "not mention this check.")})
                 continue
+            # S7: self-check the draft — once, and once more after a repair.
+            critic_note = ""
+            if critic_state in ("todo", "repairing") and _critic_wanted(ran):
+                _progress(status, "Self-checking the answer…")
+                found = _critic_check(user_prompt, final_text, ran, plan)
+                st.session_state.agent_critic.append(
+                    {"round": 1 if critic_state == "todo" else 2, **found})
+                if any(found.values()) and critic_state == "todo" and turn < MAX_TURNS - 2:
+                    critic_state = "repairing"
+                    critic_first = (final_text, found)
+                    _log("↻ Self-check found problems — one repair round")
+                    messages.append({"role": "assistant", "content": final_text})
+                    messages.append({"role": "user", "content": _critic_repair_note(found)})
+                    continue
+                # A repair that fixed nothing can still break things — one cut
+                # 11 ligand contacts to 4. Then the first draft stands, noted.
+                if critic_state == "repairing" and (
+                        sum(map(len, found.values())) >= sum(map(len, critic_first[1].values()))):
+                    _log("↩ Repair did not reduce the problems — keeping the first draft")
+                    final_text, found = critic_first
+                    unsupported = _unsupported_facts(final_text, _request_evidence())
+                critic_state = "done"
+                critic_note = _critic_note(found)
+                if critic_note:
+                    _log(f"⚠️ Self-check problems left in reply: {found}", logging.WARNING)
             _log(f"💬 Agent: {final_text}")
             _progress(status, "Composing reply…")
             reply = _clean_reply(final_text) or ("Done: " + "; ".join(summary_parts))
@@ -9703,6 +10090,7 @@ def run_agent(user_prompt: str, status=None) -> str:
                 _log(f"⚠️ Unverified facts left in reply: {unsupported}", logging.WARNING)
                 reply += ("\n\n_Not verified against any tool result: "
                           + ", ".join(unsupported) + " — treat with caution._")
+            reply += critic_note
             # P10: the 7B model paraphrases the ESM result without its caveats
             # and has called it "a significant decrease in stability" — so the
             # standard caveat rides on every reply that used the prediction.
@@ -9794,7 +10182,8 @@ def run_agent(user_prompt: str, status=None) -> str:
             # Deterministic fallback for explicitly requested chain scopes.
             # Local models may select the correct tool but omit the chain
             # argument even when the user clearly specifies one.
-            if name == "detect_salt_bridges" and not str(args.get("chain", "")).strip():
+            if (name == "detect_salt_bridges" and not str(args.get("chain", "")).strip()
+                    and len(user_chains) < 2):
                 chain_match = re.search(
                     r"\bchain\s+([A-Za-z0-9]+)\b",
                     user_prompt,
@@ -9843,6 +10232,12 @@ def run_agent(user_prompt: str, status=None) -> str:
                 if ch and ch not in user_chains:
                     args.pop("chain")
                     _log(f"🧭 Dropped chain '{ch}' the user never named")
+                # chain= keeps pairs with BOTH residues in that chain, so "salt
+                # bridges between chain A and chain B" sent as chain='A' could
+                # never find one (S7 self-check eval).
+                elif ch and name == "detect_salt_bridges" and len(user_chains) > 1:
+                    args.pop("chain")
+                    _log(f"🧭 Dropped chain '{ch}' — the user named {sorted(user_chains)}")
             if name == "predict_mutation_effect":
                 if not str(args.get("mutant") or "").strip():
                     mut = _mutation_from_prompt(user_prompt, str(args.get("residue", "")))

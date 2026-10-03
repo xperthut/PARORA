@@ -277,10 +277,16 @@ def salt_bridge_detection_from_universe(
         "cutoff_A": cutoff,
     }])
 
+HBOND_MIN_DISTANCE = 2.5   # Å: closer donor–acceptor pairs are covalent neighbours
+
+
 def hydrogen_bond_detection_from_universe(u, cutoff: float = 3.5, max_rows: int = 100) -> pd.DataFrame:
     """
     Lightweight donor/acceptor proximity screen.
     This is a demo-safe approximation, not a full geometric H-bond classifier.
+    Pairs under HBOND_MIN_DISTANCE are skipped: they are bonded neighbours
+    (backbone N(i)–O(i-1) at ~2.25 Å, disulfide SG–SG at ~2.0 Å), not
+    H-bonds — on 1CRN they were a third of the "H-bonds" reported.
     """
     donors = u.select_atoms("protein and (name N NE NH1 NH2 NZ ND1 NE2 OG OG1 OH SG)")
     acceptors = u.select_atoms("protein and (name O OD1 OD2 OE1 OE2 OG OG1 OH SD SG ND1 NE2)")
@@ -294,7 +300,7 @@ def hydrogen_bond_detection_from_universe(u, cutoff: float = 3.5, max_rows: int 
             if d_atom.segid == a_atom.segid and d_atom.resid == a_atom.resid:
                 continue
             dist = float(np.linalg.norm(d_atom.position - a_atom.position))
-            if dist <= cutoff:
+            if HBOND_MIN_DISTANCE <= dist <= cutoff:
                 rows.append({
                     "donor_residue": f"{d_atom.resname}{d_atom.resid}:{d_atom.segid}",
                     "donor_atom": d_atom.name,

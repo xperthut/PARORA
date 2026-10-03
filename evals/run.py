@@ -23,7 +23,7 @@ Case format (one JSON object per line; '#'-lines and blank lines ignored):
 
     id        unique slug
     category  lookup | multistep | plan | ambiguity | destructive | recovery |
-              guardrail | multiturn
+              guardrail | multiturn | selfcheck
     groups    TOOL_GROUPS names the case exercises (coverage report)
     source    "log" (seeded from logs/parora.log) or "synthetic"
     requires  optional: network, fpocket, foldseek, esm, dssp, pymol, amber;
@@ -280,6 +280,7 @@ class Harness:
                  or (bool(questions) and len(body) < 600))
         plan = copy.deepcopy(ss.get("agent_plan"))
         return {"prompt": prompt, "reply": reply, "asked": asked, "trace": trace, "plan": plan,
+                "critic": copy.deepcopy(ss.get("agent_critic", [])),
                 "seconds": round(time.monotonic() - t0, 2),
                 "llm_calls": self.llm_calls - n0}
 

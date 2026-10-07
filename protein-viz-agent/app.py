@@ -803,6 +803,18 @@ def get_universe():
     return st.session_state.universe
 
 
+def _no_universe(what: str) -> "ToolResult":
+    """
+    Why get_universe() came back empty: nothing loaded, or MDAnalysis failed.
+    Saying "load a structure" with 4HHB on screen sent the model to reload it,
+    and hid the failure the S8 recovery ladder routes to the plain parser.
+    """
+    if not structures():
+        return _fail(f"Load a protein structure before {what}.")
+    return _fail(f"MDAnalysis unavailable — cannot do this ({what}).",
+                 {"unavailable": "mdanalysis"})
+
+
 def mda_to_ngl_serial(ag) -> str:
     """Convert MDAnalysis AtomGroup → NGL @serial selection string."""
     serials = ag.atoms.ids if hasattr(ag.atoms, "ids") else ag.atoms.indices + 1
@@ -927,6 +939,8 @@ MODEL_RESULT_CHARS = 8000   # per tool result; the rest stays in data / the trac
 def _for_model(result: ToolResult) -> str:
     """A result as the model reads it: the summary, then any follow-up hints."""
     text = result.summary
+    if result.data.get("recovered"):           # S8: say what the ladder fixed
+        text = f"({result.data['recovered']})\n{text}"
     # A 26 KB table filled the 16k context and the reply came back as "The".
     if len(text) > MODEL_RESULT_CHARS:
         cut = text.rfind("\n", 0, MODEL_RESULT_CHARS)
@@ -1463,6 +1477,9 @@ def tool_inspect_preparation(target: str = "") -> ToolResult:
     if not structures():
         return _fail(NO_STRUCTURE)
     entry, finding = inspection_for(target)
+    if target and not find_structure(target):
+        return _fail(f"No structure called '{target}' is loaded. Loaded: "
+                     + ", ".join(s["pdb_id"] for s in structures()) + ".")
     if not finding:
         return _fail(f"Could not read '{target or 'the active structure'}'.")
     lines = [f"{entry['pdb_id']}: {finding['atoms']} atoms, {finding['residues']} "
@@ -3816,17 +3833,22 @@ def _generic_ligand(target: str, action: str):
                       "call find_pockets.")
     if len(comps) == 1:
         return comps[0]["code"], None
+    return None, ask_clarification(
+        "This structure has more than one hetero group — which one do you mean?",
+        _ligand_options(comps, action))
+
+
+def _ligand_options(comps: list, action: str) -> list:
+    """ask_user options for a file's hetero groups, ligands first, at most 5."""
     rank = {"ligand": 0, "cofactor": 1, "ion": 2, "additive": 3}
-    comps = sorted(comps, key=lambda c: rank.get(c.get("category"), 4))
     options = []
-    for c in comps[:5]:
+    for c in sorted(comps, key=lambda c: rank.get(c.get("category"), 4))[:5]:
         name = srep.pretty_chemical(c.get("name") or "") or c["code"]
         where = ", ".join(c.get("chains") or [])
         label = (f"{c['code']} ({name}, {c.get('count', 1)}× "
                  f"{'chain' if len(c.get('chains') or []) == 1 else 'chains'} {where})")
         options.append({"label": label, "meaning": f"{action} {c['code']}"})
-    return None, ask_clarification(
-        "This structure has more than one hetero group — which one do you mean?", options)
+    return options
 
 
 def _pocket_target(spec: str):
@@ -5017,7 +5039,7 @@ def tool_measure_mda_distance(sel1: str, sel2: str) -> ToolResult:
     """Measure a deterministic distance using raw MDAnalysis selection syntax."""
     u = get_universe()
     if not u:
-        return _fail("Load a protein structure before measuring a distance.")
+        return _no_universe("measuring a distance")
 
     sel1 = _clean_mda_selection(sel1)
     sel2 = _clean_mda_selection(sel2)
@@ -6039,7 +6061,7 @@ def tool_summarize_chains() -> ToolResult:
     u = get_universe()
     if not u:
         return (_ok(names, data) if names else
-                _fail("Load a protein structure before requesting a chain summary."))
+                _no_universe("requesting a chain summary"))
 
     try:
         df = summarize_chains_from_universe(u)
@@ -6058,7 +6080,7 @@ def tool_list_residues(
     """List residues, optionally restricted to one chain or segment."""
     u = get_universe()
     if not u:
-        return _fail("Load a protein structure before listing residues.")
+        return _no_universe("listing residues")
 
     chain = str(chain or "").strip()
     max_rows = _safe_int(max_rows, 200)
@@ -6145,7 +6167,7 @@ def tool_detect_salt_bridges(
     """
     u = get_universe()
     if not u:
-        return _fail("Load a protein structure before identifying salt bridges.")
+        return _no_universe("identifying salt bridges")
 
     chain = str(chain).strip()
     cutoff = _safe_float(cutoff, 4.0)
@@ -6227,7 +6249,7 @@ def tool_nearby_residues(
     """Find and summarize residues near an MDAnalysis selection."""
     u = get_universe()
     if not u:
-        return _fail("Load a protein structure before finding nearby residues.")
+        return _no_universe("finding nearby residues")
 
     selection = _clean_mda_selection(selection)
     cutoff = _safe_float(cutoff, 5.0)
@@ -6284,7 +6306,7 @@ def tool_measure_mda_angle(sel1: str, sel2: str, sel3: str) -> ToolResult:
     """Measure an angle between three MDAnalysis atom selections."""
     u = get_universe()
     if not u:
-        return _fail("Load a protein structure before measuring an angle.")
+        return _no_universe("measuring an angle")
 
     selections = [
         _clean_mda_selection(sel1),
@@ -6322,7 +6344,7 @@ def tool_measure_mda_dihedral(sel1: str, sel2: str, sel3: str, sel4: str) -> Too
     """Measure a dihedral angle between four MDAnalysis atom selections."""
     u = get_universe()
     if not u:
-        return _fail("Load a protein structure before measuring a dihedral.")
+        return _no_universe("measuring a dihedral")
 
     selections = [
         _clean_mda_selection(sel1),
@@ -9599,6 +9621,312 @@ def _critic_note(found: dict) -> str:
     return ("\n\n_Self-check — " + " · ".join(bits) + "._") if bits else ""
 
 
+# ── Automatic error recovery (suggestion.txt S8) ─────────────────────────────
+# A failed call goes down a ladder, run by code before the model reads it:
+#   1. normalize   the argument that failed names something real under another
+#                  spelling — retry once with that name
+#   2. equivalent  the backend failed, not the input — the same question
+#                  through another tool (MDAnalysis → the plain PDB parser)
+#   3. ask         a name from the user's own words that this file does not
+#                  use — ask_user with the file's real hetero groups
+#   4. report      fail as before, plus the facts that make guessing needless
+#                  (the chains present, the residue range)
+# todo.txt P13: nearby_residues("A/HIS87") failed twice and the model invented
+# GLN86/ASP88. In the eval traces of 2026-10-01/02, 30 distinct failures: 9 a
+# structure named in a way it is not loaded ('_PREP1CRN' for 1CRN_PREP), the
+# rest a residue typo ('A/LY48'), a drug's name ('erlotinib' for AQ4), a
+# made-up selection name ('heme_contacts'), or a residue/chain absent.
+
+_NOT_LOADED = re.compile(r"No structure called '([^']*)' is loaded")
+_BAD_SPEC = re.compile(r"^'(.+?)' — (?:could not make sense of|nothing matches)|"
+                       r"Could not work out what '(.+?)' refers to|"
+                       r"Unknown selection token: '([^']+)'")
+_BACKEND_FAILED = re.compile(r"^Tool error:|MDAnalysis unavailable|Unknown selection token|"
+                             r"SelectionError|^Error (?:measuring|detecting)", re.I)
+
+# Common names a file may not carry in HETNAM/HETSYN.
+_LIGAND_WORDS = {
+    "heme": {"HEM", "HEC", "HEA", "HEB"}, "haem": {"HEM", "HEC", "HEA", "HEB"},
+    "phosphate": {"PO4"}, "sulfate": {"SO4"}, "sulphate": {"SO4"},
+    "glycerol": {"GOL"}, "zinc": {"ZN"}, "magnesium": {"MG"}, "calcium": {"CA"},
+    "iron": {"FE", "FE2"}, "chloride": {"CL"}, "sodium": {"NA"}, "potassium": {"K"},
+}
+
+# Synonyms for matching a made-up selection name to one that exists.
+_SEL_WORDS = {"heme": "hem", "haem": "hem", "neighbors": "near", "neighbours": "near",
+              "nearby": "near", "contacts": "near", "contact": "near", "within": "near",
+              "around": "near", "shell": "near", "lining": "near", "sel": "", "selection": "",
+              "residues": "", "res": "", "the": ""}
+
+# Words that never name a chemical, singular (a trailing s/es is stripped):
+# 'pocket 1' sent to select_within once asked "'pockets' is not a name 4HHB
+# uses — which hetero group?" for "list the residues lining pocket 1".
+_GENERIC_WORDS = {"chain", "residu", "residue", "ligand", "protein", "the", "and", "pocket",
+                  "site", "lining", "contact", "neighbor", "neighbour", "near", "nearby",
+                  "structure", "domain", "helix", "helic", "sheet", "strand", "loop", "atom",
+                  "selection", "interaction", "bond", "water", "solvent", "ion", "region",
+                  "surface", "interface", "cavity", "binding", "active", "all", "highlight",
+                  "show", "find", "list", "select", "within", "around", "heteroatom",
+                  "hetero", "group", "molecule", "compound", "drug", "inhibitor", "cofactor"}
+
+# Same question, other tool: (tool, args from the failed call's args), or None
+# when the failed call's arguments do not translate.
+_EQUIVALENT = {
+    "measure_mda_distance": lambda a: ("measure_distance",
+                                       {"a": a.get("sel1", ""), "b": a.get("sel2", "")}),
+    "measure_mda_angle": lambda a: ("measure_angle", {"a": a.get("sel1", ""),
+                                                      "b": a.get("sel2", ""),
+                                                      "c": a.get("sel3", "")}),
+    "measure_mda_dihedral": lambda a: ("measure_dihedral", {
+        "a": a.get("sel1", ""), "b": a.get("sel2", ""),
+        "c": a.get("sel3", ""), "d": a.get("sel4", "")}),
+    "nearby_residues": lambda a: ("find_contacts", {"target": a.get("selection", ""),
+                                                    "radius": a.get("cutoff", 5.0)}),
+    "detect_contacts": lambda a: (
+        ("find_contacts", {"target": a.get("sel1", ""), "radius": a.get("cutoff", 4.0)})
+        if str(a.get("sel2", "protein")).strip().lower() in ("protein", "all", "")
+        and str(a.get("sel1", "")).strip().lower() not in ("protein", "all", "") else None),
+}
+
+# What picking a hetero group means, per tool — the option's `meaning`.
+_ASK_ACTION = {"find_contacts": "list the residues in contact with",
+               "find_interactions": "find the interactions of",
+               "nearby_residues": "list the residues near",
+               "detect_contacts": "list the residues in contact with",
+               "select_within": "select the residues near",
+               "highlight": "highlight", "zoom": "zoom to", "add_label": "label",
+               "measure_distance": "measure the distance to"}
+
+
+def _call_tool(name: str, args: dict) -> ToolResult:
+    """One dispatch, exceptions turned into a failed result."""
+    dispatch = TOOL_DISPATCH.get(name)
+    if not dispatch:
+        return _fail(f"Unknown tool: {name}")
+    try:
+        return as_tool_result(dispatch(args))
+    except Exception as e:
+        log.exception("Tool '%s' raised with args=%s", name, args)
+        return _fail(f"Tool error: {e}")
+
+
+def _name_tokens(text: str) -> set:
+    """'_PREP1CRN' and '1CRN_PREP' → {'1CRN', 'PREP'}: PDB ids, then words."""
+    up = str(text).upper()
+    ids = set(re.findall(r"\d[A-Z0-9]{3}", up))
+    for i in ids:
+        up = up.replace(i, " ")
+    return ids | set(re.findall(r"[A-Z]{2,}", up))
+
+
+def _closest_structure(value: str):
+    """The one loaded structure a misspelt name means, or None."""
+    want = _name_tokens(value)
+    if not want:
+        return None
+    # The loaded label has to say at least everything the guess does: '_PREP'
+    # finds 1CRN_PREP, but '1M17_PREP' never falls back to the unprepared 1M17.
+    hits = {s["sid"]: s for s in structures()
+            if any(want <= _name_tokens(label) for label in (s["pdb_id"], s["sid"]))}
+    return next(iter(hits.values()))["pdb_id"] if len(hits) == 1 else None
+
+
+def _closest_selection(value: str):
+    """The one named selection a made-up name means ('heme_contacts' → 'contacts_HEM_A')."""
+    def canon(s):
+        words = {_SEL_WORDS.get(w, w) for w in re.split(r"[\W_]+", s.lower()) if w}
+        return {w for w in words if w and not re.fullmatch(r"[a-z0-9]", w)}
+    want = canon(value)
+    if not want or value in st.session_state.selections:
+        return None
+    hits = [k for k in st.session_state.selections if k != value
+            and canon(k) and (want <= canon(k) or canon(k) <= want)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _het_names(entry) -> dict:
+    """{code: 'hetnam and hetsyn words, lower case'} straight from the file."""
+    names = {}
+    try:
+        for line in Path(entry["path"]).read_text(errors="replace").splitlines():
+            if line.startswith(("HETNAM", "HETSYN")):
+                code = line[11:14].strip().upper()
+                if code:
+                    names[code] = names.get(code, "") + " " + line[15:].strip().lower()
+            elif line.startswith(("ATOM", "HETATM")):
+                break
+    except OSError:
+        pass
+    return names
+
+
+def _ligand_by_name(word: str, entry):
+    """The one hetero group code a chemical name means in this file, or None."""
+    w = word.strip().lower()
+    if len(w) < 3 or not re.fullmatch(r"[a-z][a-z0-9-]*", w):
+        return None
+    present = set(_atoms_of(entry)["resnames_present"])
+    hits = {code for code, text in _het_names(entry).items()
+            if code in present and w in re.findall(r"[a-z0-9]+", text)}
+    hits |= _LIGAND_WORDS.get(w, set()) & present
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
+def _fix_residue_typo(value: str, entry):
+    """'A/LY48' → 'A/LYS48' when residue 48 of chain A is the one LYS; else None."""
+    atoms = _atoms_of(entry)
+    out, changed = value, False
+    for m in re.finditer(r"(?:\b([A-Za-z0-9])[/:])?\b([A-Za-z]{1,3})\s*(\d+)\b", value):
+        chain, given, num = m.group(1), m.group(2).upper(), int(m.group(3))
+        names = {atoms["resname"][i].upper() for i in range(len(atoms["resseq"]))
+                 if atoms["resseq"][i] == num and atoms["kind"][i] != "water"
+                 and (not chain or atoms["chain"][i].upper() == chain.upper())}
+        if len(names) != 1:
+            continue
+        real = next(iter(names))
+        if given != real and ((len(given) >= 2 and real.startswith(given))
+                              or squ.AA3_TO_1.get(real) == given):
+            out = out[:m.start(2)] + real + out[m.end(2):]
+            changed = True
+            break
+    return out if changed else None
+
+
+def _spec_facts(value: str, entry) -> str:
+    """The chains present, or the residue range of the chain named — for step 4."""
+    atoms = _atoms_of(entry)
+    spec = mz.parse_spec(value, [s["pdb_id"] for s in structures()],
+                         atoms["resnames_present"])
+    chains = sorted({c for c, k in zip(atoms["chain"], atoms["kind"]) if k != "water"})
+    if spec["chain"] and spec["chain"] not in {c.upper() for c in chains}:
+        return f"{entry['pdb_id']} has no chain {spec['chain']}; its chains are {', '.join(chains)}."
+    if spec["resseq"] is not None:
+        nums = [atoms["resseq"][i] for i in range(len(atoms["resseq"]))
+                if atoms["kind"][i] != "water"
+                and (not spec["chain"] or atoms["chain"][i].upper() == spec["chain"])]
+        if nums:
+            where = f"Chain {spec['chain']} of {entry['pdb_id']}" if spec["chain"] else entry["pdb_id"]
+            return f"{where} numbers its residues {min(nums)}–{max(nums)}."
+    return ""
+
+
+def _recover(name: str, args: dict, result: ToolResult, user_prompt: str):
+    """
+    Run the recovery ladder on one failed call (see above).
+
+    Returns:
+        None when there is nothing to do, else (tool, args, result, record):
+        the call that now stands — the original tool with fixed arguments, an
+        equivalent tool, a question for the user, or the original failure with
+        facts added — and a record of what was tried, for the trace.
+    """
+    if result.ok or result.data.get("status") in ("blocked", "skipped"):
+        return None
+    text, entry = result.summary, active_structure()
+
+    def retry(tool, new_args, step, detail):
+        again = _call_tool(tool, new_args)
+        rec = {"step": step, "detail": detail, "tool": tool, "from_tool": name,
+               "from_args": dict(args), "args": dict(new_args), "ok": again.ok}
+        _log(f"🩹 Recovery ({step}): {detail} → {'ok' if again.ok else 'failed'}",
+             logging.INFO if again.ok else logging.WARNING)
+        tried.append(rec)
+        if not again.ok:
+            return None
+        note = (f"{name} failed ({text[:120]}); recovered automatically — {detail}. "
+                "Use the corrected name from now on.")
+        return (tool, new_args, ToolResult(again.summary, True,
+                                           {**again.data, "recovered": note},
+                                           again.files, again.next_hints),
+                {**rec, "tried": tried[:-1]})
+
+    tried = []
+    # ── 1. Normalize the argument that failed ───────────────────────────────
+    fixes = []                                       # (arg key, new value, why)
+    m = _NOT_LOADED.search(text)
+    if m:
+        bad = m.group(1)
+        real = _closest_structure(bad)
+        for k, v in args.items():
+            if real and isinstance(v, str) and v.strip() == bad:
+                fixes.append((k, real, f"'{bad}' is loaded as {real}"))
+    m = _BAD_SPEC.search(text)
+    bad_value = next((g for g in m.groups() if g), "") if m else ""
+    if bad_value and entry:
+        keys = [k for k, v in args.items() if isinstance(v, str)
+                and (v.strip() == bad_value or bad_value in v)]
+        for k in keys[:1]:
+            v = str(args[k])
+            sel = _closest_selection(v.strip())
+            if sel:
+                fixes.append((k, sel, f"no selection '{v}'; the one made is '{sel}'"))
+                continue
+            typo = _fix_residue_typo(v, entry)
+            if typo:
+                fixes.append((k, typo, f"'{v}' read as {typo}"))
+                continue
+            for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", v):
+                code = _ligand_by_name(w, entry)
+                if code:
+                    new = re.sub(rf"(?<![A-Za-z0-9]){re.escape(w)}(?![A-Za-z0-9])", code, v)
+                    fixes.append((k, new, f"'{w}' is {code} in {entry['pdb_id']}"))
+                    break
+    fixes = [f for f in fixes if f[1] != args.get(f[0])]
+    for k, new, why in fixes[:1]:
+        out = retry(name, {**args, k: new}, "normalize", why)
+        if out:
+            return out
+    # ── 2. Equivalent tool, when the backend failed rather than the input ───
+    if (_BACKEND_FAILED.search(text) or result.data.get("unavailable") == "mdanalysis") \
+            and name in _EQUIVALENT:
+        alt = _EQUIVALENT[name](args)
+        if alt:
+            out = retry(alt[0], alt[1], "equivalent",
+                        f"{name} failed in its backend; ran {alt[0]} instead")
+            if out:
+                return out
+    # ── 3. Ask, when the user's own word names nothing in the file ──────────
+    if bad_value and entry and name in _ASK_ACTION:
+        comps = (structure_summary() or {}).get("components") or []
+        # The user's whole word: for "highlight gefitinib" the model sent 'gef'.
+        said = re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", user_prompt)
+        word = next((u for w in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", bad_value)
+                     for u in said if u.lower().startswith(w.lower())
+                     and w.upper() not in squ.AA3_TO_1 and not re.search(r"\d", w)
+                     and not _ligand_by_name(u, entry)
+                     and u.upper() not in _atoms_of(entry)["resnames_present"]
+                     and re.sub(r"e?s$", "", u.lower()) not in _GENERIC_WORDS
+                     and re.sub(r"e?s$", "", w.lower()) not in _GENERIC_WORDS), "")
+        if word and comps:
+            options = _ligand_options(comps, _ASK_ACTION[name])
+            if len(options) == 1:
+                options.append({"label": f"Something else — '{word}' is not in this file",
+                                "meaning": f"'{word}' is not in {entry['pdb_id']} — say so "
+                                           "and do nothing else"})
+            asked = ask_clarification(
+                f"'{word}' is not a name {entry['pdb_id']} uses. Which of its hetero "
+                "groups do you mean?", options)
+            rec = {"step": "ask", "detail": f"'{word}' names nothing in {entry['pdb_id']}",
+                   "tool": name, "from_tool": name, "from_args": dict(args),
+                   "ok": asked.ok}
+            _log(f"🩹 Recovery (ask): '{word}' is not in {entry['pdb_id']} — asking")
+            if asked.ok:
+                return name, args, asked, {**rec, "tried": tried}
+    # ── 4. Report, with the facts that make a guess needless ────────────────
+    facts = _spec_facts(bad_value, entry) if bad_value and entry else ""
+    if facts and facts not in text and "It has:" not in text:
+        rec = {"step": "report", "detail": facts, "tool": name, "from_tool": name,
+               "from_args": dict(args), "ok": False, "tried": tried}
+        return name, args, ToolResult(f"{text} {facts}", False,
+                                      {**result.data, "facts": facts},
+                                      result.files, result.next_hints), rec
+    if tried:
+        return name, args, result, {"step": "report", "detail": "nothing recovered",
+                                    "tool": name, "from_tool": name,
+                                    "from_args": dict(args), "ok": False, "tried": tried}
+    return None
+
+
 def run_agent(user_prompt: str, status=None) -> str:
     """
     Execute a gated, deduplicated multi-turn tool-calling loop for one user command.
@@ -9908,6 +10236,7 @@ def run_agent(user_prompt: str, status=None) -> str:
     summary_parts = []
     called_sigs: set[str] = set()          # Tracks (name, args) pairs to avoid exact repeats
     failed_sigs: dict[str, str] = {}       # sig -> result, for calls that failed
+    fail_count: dict[str, int] = {}        # tool -> failures left standing (S8)
     selected_ngl_strs: set[str] = set()    # Tracks NGL strings that already have a highlight
     show_rep_fired = False                 # True once any non-ball+stick show has executed
     protein_nudged = False                 # One retry for a tool-less protein-level answer
@@ -10074,7 +10403,9 @@ def run_agent(user_prompt: str, status=None) -> str:
                     continue
                 # A repair that fixed nothing can still break things — one cut
                 # 11 ligand contacts to 4. Then the first draft stands, noted.
-                if critic_state == "repairing" and (
+                # An empty first draft (the model went silent after a nudge) is
+                # no draft to fall back to: keeping it replied "Done: <dump>".
+                if critic_state == "repairing" and critic_first[0].strip() and (
                         sum(map(len, found.values())) >= sum(map(len, critic_first[1].values()))):
                     _log("↩ Repair did not reduce the problems — keeping the first draft")
                     final_text, found = critic_first
@@ -10458,6 +10789,19 @@ def run_agent(user_prompt: str, status=None) -> str:
                 # above; the full traceback -- what actually broke inside the
                 # tool -- only ever lands here, in the log.
                 log.exception("Tool '%s' raised with args=%s", name, args)
+            # S8: a failure goes down the recovery ladder before the model sees
+            # it. What stands afterwards — fixed args, another tool, a question
+            # or the failure with facts added — is what gets recorded below.
+            recovery, asked_tool = None, name
+            if not result.ok:
+                _progress(status, f"{name.replace('_', ' ')} failed — trying to recover…")
+                fixed = _recover(name, args, result, user_prompt)
+                if fixed:
+                    name, args, result, recovery = fixed
+                    if recovery["step"] in ("normalize", "equivalent"):
+                        called_sigs.add(f"{name}:{json.dumps(args, sort_keys=True)}")
+            if not result.ok:
+                fail_count[asked_tool] = fail_count.get(asked_tool, 0) + 1
             elapsed_ms = (time.monotonic() - t0) * 1000
             if elapsed_ms > 2000:
                 log.warning("Tool '%s' took %.0f ms", name, elapsed_ms)
@@ -10480,10 +10824,13 @@ def run_agent(user_prompt: str, status=None) -> str:
             ran.append((name, result))
             _remember(name, args, result)
             if plan and not result.data.get("needs_user_choice"):
-                _advance_plan(plan, name, result)
+                # A step is ticked by the tool it asked for, even when an
+                # equivalent tool answered it (S8).
+                _advance_plan(plan, asked_tool, result)
                 _show_plan()
             tool_results.append({"tool": name, "result": result,
-                                 "args": dict(args), "ms": round(elapsed_ms)})
+                                 "args": dict(args), "ms": round(elapsed_ms),
+                                 "recovery": recovery})
             # A call that succeeds may have fixed what an earlier one lacked
             # (parameterize_ligand, then setup_amber again), so failed calls
             # become retryable; one that fails stays blocked until then.
@@ -10503,7 +10850,9 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "failed": "ms" in r and not res.ok,
                     "result": res.summary[:800], "ms": r.get("ms"),
                     "data": json.loads(json.dumps(res.data, default=str)) if "ms" in r else {},
-                    "files": res.files, "next_hints": res.next_hints})
+                    "files": res.files, "next_hints": res.next_hints,
+                    "recovery": (json.loads(json.dumps(r["recovery"], default=str))
+                                 if r.get("recovery") else None)})
 
         # A question for the user (ask_user, or a tool that found the request
         # ambiguous) ends the request here: the answer decides what runs next,
@@ -10550,6 +10899,13 @@ def run_agent(user_prompt: str, status=None) -> str:
                 "so never report its absence of results as a finding ('no salt bridges "
                 "were found'). Retry once with corrected arguments if the "
                 "error shows how, otherwise tell the user plainly what failed and why. "
+                # S8: the P13 pattern — two failed guesses, then an invented
+                # answer. A second standing failure ends the guessing.
+                + "".join(f"{t} has now failed {n} times in this request — do not call it "
+                          "again with another guess; tell the user what failed and what "
+                          "the error says is present instead. "
+                          for t, n in fail_count.items() if n >= 2
+                          and any(r["tool"] == t for r in failed))
                 + ("" if show_rep_fired and not plan else follow_up))
         messages.append({
             "role": "user",

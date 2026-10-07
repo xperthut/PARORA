@@ -46,6 +46,8 @@ Case format (one JSON object per line; '#'-lines and blank lines ignored):
       not_say    [regex] — none may match the reply
       max_calls  upper bound on calls that ran
       no_failed  true → no call that ran reported failure
+      recovery   regex — some call's S8 recovery step (normalize | equivalent |
+                 ask | report) matches; "none" → no call needed recovery
       plan_complete  true → run_agent made a plan (S6) and the reply's checklist
                  accounts for every step: none left open ("☐"), none
                  marked "not run"
@@ -192,6 +194,12 @@ def score(expect: dict, trace: list, reply: str, asked: bool, plan: dict = None)
     if expect.get("no_failed"):
         bad = [c["tool"] for c in ran if c.get("failed")]
         checks.append(("no_failed", not bad, "failed " + ", ".join(bad) if bad else ""))
+
+    if expect.get("recovery"):
+        steps = [c["recovery"]["step"] for c in trace if c.get("recovery")]
+        ok = (not steps if expect["recovery"] == "none"
+              else any(re.fullmatch(expect["recovery"], st) for st in steps))
+        checks.append(("recovery", ok, "steps: " + (", ".join(steps) or "none")))
 
     if expect.get("plan_complete"):
         steps = (plan or {}).get("steps", [])

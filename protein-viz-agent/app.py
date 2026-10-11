@@ -28,6 +28,8 @@
 
 import streamlit as st
 import base64
+import copy
+import filecmp
 import os
 import json
 import logging
@@ -259,6 +261,7 @@ SIMULATIONS_DIR.mkdir(exist_ok=True)
 
 # ── Session state defaults ────────────────────────────────────────────────────
 # Initialise every key on first run; subsequent reruns leave existing values.
+_confirm_env = os.environ.get("PARORA_CONFIRM", "auto").strip().lower()
 defaults = {
     "messages":      [],        # chat history shown in the left panel
     "debug_logs":    [],        # internal tool-call trace for the debug expander
@@ -298,6 +301,11 @@ defaults = {
     "toolbar_open":    None,    # (top, sub) of the open toolbar dialog — see _toolbar_dialog
     "facts":           [],      # every successful agent tool result — see _remember (S5)
     "request_no":      0,       # chat requests run_agent has handled
+    "undo_stack":      [],      # scene before each changing request — see _push_undo (S9)
+    # When to ask before acting — see _confirm_reason (S9): "always", "auto"
+    # (writes the request did not name) or "never".
+    "confirm_before":  (_confirm_env if _confirm_env in ("always", "auto", "never")
+                        else "auto"),
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -2824,6 +2832,222 @@ def tool_remove_structure(target: str) -> ToolResult:
     left = [x["pdb_id"] for x in structures()]
     return _ok(f"Removed {label}. Still loaded: {', '.join(left) or 'none'}.",
                {"removed": label, "loaded": left})
+
+
+# ── Undo and confirm-before-write (S9) ───────────────────────────────────────
+# The hide and write gates used to match English keywords: "get rid of the
+# waters" was blocked, and nothing could tell a request from a hypothetical.
+# Now a scene change is never blocked — run_agent keeps the scene from before
+# each request that changed it, and undo puts it back. Writes run when the
+# user's words name them; otherwise the call is held and the user gets a
+# Yes / No card instead of a refusal. Files a request wrote are moved to
+# UNDO_TRASH on undo, not deleted.
+
+# Everything a request can change that the user would see: the viewer, the
+# loaded files and the records that point at prepared / parameterised copies.
+SCENE_KEYS = ("structures", "active_sid", "pdb_id", "pdb_path", "selections",
+              "representations", "background", "camera_target", "superpose_msg",
+              "measurements", "interactions", "annotations", "active_only",
+              "prepared", "oriented", "ligand_params")
+UNDO_DEPTH = 20
+UNDO_TRASH = Path("./.undo_trash")
+
+# Tools that write files, each with the words that name it. A write named in
+# the user's own request runs; anything else is held for a Yes / No.
+WRITE_TOOLS = {
+    "save_structure":        r"\bsave|\bwrite|\bexport|\bcopy\b|\.pdb\b",
+    "remove_solvent":        r"(remov|strip|delet|drop|get rid|clean|without|\bno\b|exclud)"
+                             r"\w*\b.{0,40}\b(waters?|solvents?|hoh|wat)\b|\bdesolvat|\bdehydrat|"
+                             r"\bdry\b",
+    # Preparing and parameterising are steps of a named simulation setup too:
+    # setup_amber's own error sends the model to them.
+    "prepare_structure":     r"\bprep|\bclean|\bfix|protonat|hydrogen|altloc|\bcap\b|"
+                             r"ready for|\bamber|tleap|\bmd\b|simulat|gromacs|rosetta|\bdock|"
+                             r"oniom|qm/mm",
+    "parameterize_ligand":   r"parameteri[sz]|\bgaff|antechamber|frcmod|mol2|\bcharges?\b|"
+                             r"\bamber|tleap|\bmd\b|simulat|oniom|qm/mm",
+    "setup_amber":           r"\bamber|tleap|prmtop|\bmd\b|molecular dynamics|simulat",
+    "setup_gromacs":         r"gromacs|\bmdp\b|\bgmx\b",
+    "setup_rosetta_docking": r"rosetta|\bdock",
+    "setup_qm":              r"\bqm\b|quantum|\bdft\b|gaussian|\borca\b|psi4|b3lyp|wb97|"
+                             r"\bhf\b|basis set|semi-?empirical",
+    "setup_oniom":           r"oniom|qm/mm",
+    "orient_membrane":       r"orient|\bopm\b|memembed|membrane",
+    "build_membrane":        r"membrane|bilayer|lipid|popc|pope|packmol",
+    "render_image":          r"render|image|figure|picture|\bpng\b|ray ?trac|snapshot",
+}
+# Scene changes that wipe the view: asked first only when confirm_before is
+# "always". In "auto" undo covers them.
+SCENE_WIPE_TOOLS = {"hide_all", "clear_scene", "replace_scene", "remove_structure"}
+
+# A question about an outcome is not an order to produce it: "what would this
+# look like without water" ran remove_solvent and wrote a file.
+_HYPOTHETICAL = re.compile(
+    r"\bwhat (would|if|happens)\b|\bhow (would|does|do|much|many)\b|"
+    r"\b(would|could|does|is) (it|this|that|the structure)\b|\bshould i\b|"
+    r"\bdo i need\b|\bis (it|this|the structure) [\w ]*enough\b|\bwhich\b.*\?|"
+    r"\bwhy\b|\bexplain\b")
+
+_WRITE_WHAT = {
+    "save_structure":        "save a copy of the structure",
+    "remove_solvent":        "remove the waters and write a solvent-free copy",
+    "prepare_structure":     "write a cleaned-up (prepared) copy of the structure",
+    "parameterize_ligand":   "write ligand parameter files (mol2/frcmod)",
+    "setup_amber":           "write Amber simulation input files",
+    "setup_gromacs":         "write GROMACS simulation input files",
+    "setup_rosetta_docking": "write Rosetta docking input files",
+    "setup_qm":              "write a QM input file",
+    "setup_oniom":           "write a QM/MM (ONIOM) input file",
+    "orient_membrane":       "write a membrane-oriented copy of the structure",
+    "build_membrane":        "build and write a membrane system",
+    "render_image":          "render and save an image",
+    "hide_all":              "hide every representation",
+    "clear_scene":           "unload every structure",
+    "replace_scene":         "unload everything and load another structure",
+    "remove_structure":      "unload a structure",
+}
+
+
+def _confirm_reason(name: str, args: dict, prompt_lower: str) -> str:
+    """
+    Why this call should wait for a Yes / No, or "" to run it now.
+
+    "never" runs everything; "always" asks before every write or scene wipe;
+    "auto" asks only before a write the request did not name, or one asked
+    as a question, or a save that would overwrite an existing file.
+    """
+    mode = st.session_state.get("confirm_before", "auto")
+    if mode == "never" or (name not in WRITE_TOOLS and name not in SCENE_WIPE_TOOLS):
+        return ""
+    if name == "save_structure":
+        # Overwriting is the one write undo cannot take back. A byte-identical
+        # file loses nothing (an eval rerun saving the same copy).
+        target = STRUCTURES_DIR / str(args.get("filename") or "output.pdb")
+        source = st.session_state.get("pdb_path")
+        if target.exists() and not (source and Path(source).exists()
+                                    and filecmp.cmp(source, target, shallow=False)):
+            return f"{target} already exists and would be overwritten"
+    if mode == "always":
+        return "you asked to confirm every write and scene wipe"
+    if name not in WRITE_TOOLS:
+        return ""
+    request = prompt_lower.split(" — clarification:")[0]
+    if not re.search(WRITE_TOOLS[name], prompt_lower):
+        return "the request did not ask for it"
+    if _HYPOTHETICAL.search(request) and not re.search(
+            r"\b(please|go ahead|do it|then)\b|^(can|could|would) you\b", request):
+        return "the request reads as a question, not an instruction"
+    return ""
+
+
+def _confirm_question(holds: list) -> tuple:
+    """The Yes / No card for calls held by _confirm_reason: (question, options)."""
+    pdb = st.session_state.get("pdb_id") or "the structure"
+    parts = []
+    for name, args, reason in holds:
+        what = _WRITE_WHAT.get(name, name.replace("_", " "))
+        if name == "save_structure":
+            what = f"save {pdb} as structures/{args.get('filename') or 'output.pdb'}"
+        elif name == "remove_solvent":
+            what = f"remove the waters from {pdb} and write {pdb}_no_solvent.pdb"
+        parts.append(f"{what} ({reason})")
+    tools = ", ".join(dict.fromkeys(h[0] for h in holds))
+    overwrite = any("overwritten" in h[2] for h in holds)
+    question = ("Before I go on — should I " + "; and ".join(parts) + "? "
+                + ("The old file cannot be brought back by undo." if overwrite
+                   else "Anything written can be undone afterwards."))
+    return question, [
+        {"label": "Yes", "meaning": f"yes — I confirm: run {tools} as proposed"},
+        {"label": "No", "meaning": f"no — do not run {tools} and do not write any file; "
+                                   "answer the rest of the request without it"}]
+
+
+def _scene_snapshot() -> dict:
+    """A deep copy of everything SCENE_KEYS names."""
+    snap = {}
+    for k in SCENE_KEYS:
+        v = st.session_state.get(k)
+        try:
+            snap[k] = copy.deepcopy(v)
+        except Exception:                   # an uncopyable record — keep the reference
+            snap[k] = v
+    return snap
+
+
+def _scene_fingerprint(snap: dict) -> str:
+    return repr(snap)
+
+
+def _push_undo(label: str, scene: dict, files: list) -> None:
+    """Remember the scene from before a request, and the files it wrote."""
+    stack = st.session_state.setdefault("undo_stack", [])
+    stack.append({"label": label.strip()[:80], "scene": scene, "files": list(files),
+                  "request": st.session_state.get("request_no", 0)})
+    del stack[:-UNDO_DEPTH]
+
+
+def _trash(files: list) -> list:
+    """Move files into UNDO_TRASH/<stamp>/; returns the names moved."""
+    dest = UNDO_TRASH / time.strftime("%Y%m%d-%H%M%S")
+    moved = []
+    for f in files:
+        p = Path(f)
+        if not p.is_file():
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / p.name
+        n = 1
+        while target.exists():
+            target, n = dest / f"{p.stem}_{n}{p.suffix}", n + 1
+        try:
+            shutil.move(str(p), str(target))
+            moved.append(p.name)
+        except OSError as e:
+            log.warning("Undo could not move %s: %s", p, e)
+    return moved
+
+
+def tool_undo_last() -> ToolResult:
+    """
+    Put the scene back as it was before the last request that changed it.
+
+    Restores structures, layers, selections, labels and measurements, and
+    moves the files that request wrote into UNDO_TRASH (never deletes them).
+    """
+    stack = st.session_state.get("undo_stack") or []
+    if not stack:
+        st.session_state["_undo_base"] = _scene_snapshot()
+        return _ok("Nothing to undo — no earlier request changed the scene or wrote a file "
+                   "in this session.", {"undone": None})
+    entry = stack.pop()
+    for k, v in entry["scene"].items():
+        st.session_state[k] = copy.deepcopy(v)
+    st.session_state.universe = None        # the active file may have changed back
+    moved = _trash(entry["files"])
+    # Results of writes that were undone are no longer facts (S5 memory).
+    st.session_state.facts = [f for f in st.session_state.get("facts", [])
+                              if not (f.get("request") == entry["request"]
+                                      and f.get("tool") in WRITE_TOOLS)]
+    st.session_state["_undo_base"] = _scene_snapshot()
+    loaded = ", ".join(s["pdb_id"] for s in structures()) or "nothing"
+    text = (f"Undid “{entry['label']}”: the scene is back as it was before it "
+            f"(loaded: {loaded}; {len(st.session_state.representations)} layer(s) drawn).")
+    if moved:
+        text += f" Moved {', '.join(moved)} to {UNDO_TRASH}/."
+    if stack:
+        text += f" {len(stack)} earlier step(s) can still be undone."
+    return _ok(text, {"undone": entry["label"], "files_moved": moved,
+                      "loaded": [s["pdb_id"] for s in structures()],
+                      "undo_left": len(stack)})
+
+
+def _written_since(path: str, t0: float) -> bool:
+    try:
+        # ctime too: save_structure's copy2 keeps the source's old mtime.
+        s = Path(path).stat()
+        return Path(path).is_file() and max(s.st_mtime, s.st_ctime) >= t0 - 1
+    except OSError:
+        return False
 
 
 @st.cache_data(show_spinner=False)
@@ -7193,6 +7417,16 @@ TOOLS = [
     },
     {
         "type": "function", "function": {
+            "name": "undo_last",
+            "description": ("Undo the last request that changed the scene: restores the "
+                            "structures, representations, colours, selections and labels "
+                            "from before it, and discards files it wrote. Use for 'undo', "
+                            "'revert that', 'go back', 'put it back the way it was'."),
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function", "function": {
             "name": "show_all",
             "description": "Show all atoms with a given representation type",
             "parameters": {"type": "object", "properties": {
@@ -7938,6 +8172,7 @@ TOOL_DISPATCH = {
     "show":              lambda a: tool_show(a.get("rep_type", "cartoon"), a.get("selection", "protein"), a.get("color", "element"), bool(a.get("exclusive", False))),
     "hide":              lambda a: tool_hide(a.get("selection", "all")),
     "hide_all":          lambda _: tool_hide_all(),
+    "undo_last":         lambda _: tool_undo_last(),
     "show_all":          lambda a: tool_show_all(a.get("rep_type", "cartoon")),
     "color":             lambda a: tool_color(a.get("color", "red"), a.get("selection", "all")),
     "set_transparency":  lambda a: tool_set_transparency(a.get("value", 0.5), a.get("selection", "all")),
@@ -8217,6 +8452,7 @@ def _system_prompt() -> str:
         "   A label is text in the viewer; it does NOT select, colour or hide "
         "   anything, so never pair it with `select` or `show`. "
         "6. Never call `hide` unless the user explicitly asked to hide something. "
+        "6a. 'undo', 'revert that', 'go back', 'put it back' → `undo_last`. "
         "7. Call `render_image` ONLY when the user asks to render / ray trace / "
         "   make a figure, image, picture or PNG. It produces a still image and does "
         "   not change the interactive viewer, so never call it to 'show' something. "
@@ -8336,6 +8572,9 @@ TOOL_GROUPS = {
                  r"measured|saved|computed|got|said)|remember|recall|\bthat (pocket|"
                  r"distance|score|file|result)",
                  {"recall"}),
+    "undo":     (r"\bundo|\brevert|go back|put (it|that|them) back|the way it was|"
+                 r"previous (view|scene|look)",
+                 {"undo_last"}),
 }
 
 # Always offered: orientation, and the escape hatches for a misrouted message.
@@ -8496,7 +8735,7 @@ MEMORY_TOPICS = {
 MEMORY_SKIP = {"ask_user", "recall", "select", "highlight", "show", "show_all", "hide",
                "hide_all", "color", "set_transparency", "zoom", "set_background",
                "add_label", "clear_labels", "list_labels", "clear_superposition",
-               "download_foldseek_database"}
+               "download_foldseek_database", "undo_last"}
 
 MEMORY_LINES = 12          # remembered results shown in the Scene block
 MEMORY_LINE_CHARS = 220    # per line; `recall` has the rest
@@ -8684,7 +8923,7 @@ NUMBER_GATE_EXEMPT = {
     "download_foldseek_database", "find_structural_neighbors", "superpose_structures",
     "clear_superposition", "describe_structure", "list_structures", "clear_scene",
     "prepare_structure", "inspect_preparation", "orient_membrane", "build_membrane",
-    "membrane_status", "clear_labels", "list_labels", "describe_fold",
+    "membrane_status", "clear_labels", "list_labels", "describe_fold", "undo_last",
     # Simulation setup: component codes (08Q, 1PE) and physical settings, no
     # residue selections.
     "parameterize_ligand", "setup_amber", "setup_gromacs", "setup_rosetta_docking",
@@ -9409,7 +9648,7 @@ _DECLINE = re.compile(r"\b(cannot|can't|can ?not|could ?n[o']t|unable|failed|not
                       r"not (available|provided|possible|"
                       r"included|listed|known|determin\w*|in the (data|file|results))|"
                       r"no (data|information|tool|record|way)|does(n't| not) (say|include|"
-                      r"contain|list|report|give|provide)|without (experimental|further|"
+                      r"contain|list|report|give|provide|specify|state|mention|show)|without (experimental|further|"
                       r"additional))\b",
                       re.I)
 
@@ -9452,10 +9691,19 @@ def _numbers_backed(quote: str, evidence: str) -> bool:
             and all(re.sub(r"\s+", "", t.upper()) in ev for t in tokens))
 
 
+# Comparison words a decline rephrases: "is that more than typical" declined
+# as "cannot state if this number is above average" shares no stem (S9 eval).
+_STEM_SAME = {"typic": "norm", "avera": "norm", "usual": "norm", "norma": "norm",
+              "expec": "norm", "above": "more", "highe": "more", "great": "more",
+              "excee": "more", "below": "less", "lower": "less", "fewer": "less"}
+
+
 def _declined(part: str, draft: str) -> bool:
     """The draft says outright that it cannot answer `part`."""
-    stems = {w[:5] for w in _words(part) if len(w) >= 4}
-    return any(_DECLINE.search(sent) and stems & {w[:5] for w in _words(sent) if len(w) >= 4}
+    def stems(text):
+        return {_STEM_SAME.get(w[:5], w[:5]) for w in _words(text) if len(w) >= 4}
+    want = stems(part)
+    return any(_DECLINE.search(sent) and want & stems(sent)
                for sent in re.split(r"(?<=[.!?])\s+|\n+", draft))
 
 
@@ -9831,6 +10079,17 @@ def _recover(name: str, args: dict, result: ToolResult, user_prompt: str):
         _log(f"🩹 Recovery ({step}): {detail} → {'ok' if again.ok else 'failed'}",
              logging.INFO if again.ok else logging.WARNING)
         tried.append(rec)
+        # The fixed name got past the first error and hit a real one (setup_amber
+        # on 1M17_PREP: the ligand needs parameters). That error is what the
+        # model must read — the stale "'_PREP' is not loaded" sent it guessing.
+        if (not again.ok and step == "normalize"
+                and not (_NOT_LOADED.search(again.summary) or _BAD_SPEC.search(again.summary))):
+            note = (f"{name} failed ({text[:120]}); the name was corrected automatically — "
+                    f"{detail} — and the call then failed for another reason, below.")
+            return (tool, new_args, ToolResult(again.summary, False,
+                                               {**again.data, "recovered": note},
+                                               again.files, again.next_hints),
+                    {**rec, "tried": tried[:-1]})
         if not again.ok:
             return None
         note = (f"{name} failed ({text[:120]}); recovered automatically — {detail}. "
@@ -9927,7 +10186,49 @@ def _recover(name: str, args: dict, result: ToolResult, user_prompt: str):
     return None
 
 
+_UNDO_ONLY = re.compile(
+    r"\s*(please\s+)?(undo|revert)(\s+(that|it|this|last|the last (change|step|request|"
+    r"action|thing)))?(\s+please)?\s*[.!]?\s*", re.I)
+
+
 def run_agent(user_prompt: str, status=None) -> str:
+    """
+    One chat request, made undoable (S9).
+
+    Runs _run_agent_loop and, when the request changed the scene or wrote
+    files, pushes the scene from before it onto the undo stack. A bare "undo"
+    needs no model call. The reply names any file written, since undo moves
+    those to UNDO_TRASH.
+    """
+    st.session_state.pop("_undo_base", None)
+    st.session_state.request_files = []
+    if _UNDO_ONLY.fullmatch(user_prompt) and not st.session_state.get("clarify"):
+        _log(f"📨 User: {user_prompt}")
+        st.session_state.agent_trace, st.session_state.agent_plan = [], None
+        st.session_state.agent_critic = []
+        result = tool_undo_last()
+        _trace({"turn": 0, "tool": "undo_last", "args": {}, "status": "ran", "ok": result.ok,
+                "failed": False, "result": result.summary, "ms": 0, "data": result.data,
+                "files": [], "next_hints": [], "recovery": None})
+        st.session_state.pop("_undo_base", None)
+        _log(f"↶ {result.summary}")
+        return result.summary
+    t0 = time.time()
+    before = _scene_snapshot()
+    reply = _run_agent_loop(user_prompt, status)
+    base = st.session_state.pop("_undo_base", None) or before
+    files = [f for f in dict.fromkeys(st.session_state.pop("request_files", []))
+             if _written_since(f, t0)]
+    if files or _scene_fingerprint(_scene_snapshot()) != _scene_fingerprint(base):
+        _push_undo(user_prompt, base, files)
+        if files:
+            names = [Path(f).name for f in files]
+            shown = ", ".join(names[:4]) + (f" and {len(names) - 4} more" if len(names) > 4 else "")
+            reply = f"{reply}\n\n_Wrote {shown} — say “undo” (or press ↶ Undo) to discard._"
+    return reply
+
+
+def _run_agent_loop(user_prompt: str, status=None) -> str:
     """
     Execute a gated, deduplicated multi-turn tool-calling loop for one user command.
 
@@ -9938,9 +10239,9 @@ def run_agent(user_prompt: str, status=None) -> str:
          message instead (_state_block).
       2. Inspects any tool calls returned and applies the following gates:
          - select gate  : blocked when a representation show is active/pending
-         - destructive  : hide/hide_all blocked unless the user asked to hide
-         - load/search  : blocked when a structure is already loaded
-         - write        : save/align/remove_solvent blocked unless explicitly requested
+         - confirm (S9) : a write the request did not name is held for a Yes /
+                          No card (_confirm_reason); scene changes are not
+                          gated — run_agent makes them undoable
       3. Deduplicates exact repeat calls and redundant ball+stick highlights.
       4. After a non-ball+stick show fires, cuts the loop short and asks for
          a one-sentence confirmation instead of more tool calls.
@@ -9966,9 +10267,18 @@ def run_agent(user_prompt: str, status=None) -> str:
     # see what the user actually wants.
     pending = st.session_state.pop("clarify", None)
     paused_plan = st.session_state.pop("plan_paused", None)
+    write_hold = st.session_state.pop("write_hold", None)      # S9 Yes / No card
     clarify_note, clarified = "", False
     if pending:
         choice = resolve_clarification(pending, user_prompt)
+        if (not choice and write_hold and write_hold["request"] == pending["request"]
+                and len(user_prompt.split()) <= 6):
+            reply_word = user_prompt.strip().lower()
+            if re.match(r"(ok(ay)?|sure|go ahead|do it|yep|yeah|y\b|confirm|proceed|please)",
+                        reply_word):
+                choice = pending["options"][0]
+            elif re.match(r"(nope|cancel|don.?t|stop|skip|n\b)", reply_word):
+                choice = pending["options"][1]
         if not choice and not pending["options"] and len(user_prompt.split()) <= 8:
             # A short answer to an open question ("2W72") is that answer.
             choice = {"meaning": user_prompt.strip()}
@@ -10193,29 +10503,27 @@ def run_agent(user_prompt: str, status=None) -> str:
     _log(
         f"🧰 {len(active_tools)}/{len(TOOLS)} tool schemas sent")
 
-    # Gate: destructive tools only when user explicitly asked for hiding
-    DESTRUCTIVE_TOOLS = {"hide_all", "hide"}
-    hide_requested = any(w in prompt_lower for w in {"hide", "clear", "remove", "delete", "clean", "erase"})
-    # "reset the view/scene" may mean start over; "reset the colors to
-    # default" does not — qwen2.5:14b answered it with hide_all + show
-    # cartoon, wiping every rep the user had drawn (S2a).
-    if "reset" in prompt_lower and not re.search(
-            r"colou?r|transparen|opacity|zoom|camera|orientation|label", prompt_lower):
-        hide_requested = True
-
-    # Gate: write/side-effect tools only when explicitly requested by the user
-    WRITE_TOOLS = {"save_structure", "remove_solvent", "align_structures"}
-    # "remove solvent"/"remove water" as exact phrases missed the equally
-    # natural "remove the solvent" / "remove all water" — found while
-    # testing this gate for P5 (todo.txt): match the action verb and the
-    # object as separate words instead of one rigid phrase.
-    write_requested = (
-        any(w in prompt_lower for w in {"save", "write", "align", "no water"})
-        or (
-            any(v in prompt_lower for v in {"remove", "strip"})
-            and any(o in prompt_lower for o in {"solvent", "water"})
-        )
-    )
+    # The keyword gates on hide/hide_all and on writes are gone (S9): a scene
+    # change is undoable (run_agent pushes the scene before each request), and
+    # a write the request did not name is held for a Yes / No (_confirm_reason).
+    # The answer to that card arrives as the next request: Yes lets the held
+    # tools run, No keeps them from running at all.
+    holds: list = []                       # (name, args, reason) waiting for the user
+    # An answer that did not resolve to an option ("the one in chain B") still
+    # continues the request that asked: its words name the write too.
+    confirm_text = prompt_lower + (f" — clarification: {pending['request'].lower()}"
+                                   if pending and not clarified else "")
+    confirmed_tools: set = set()
+    declined_tools: set = set()
+    if write_hold and pending and write_hold["request"] == pending["request"]:
+        said = user_prompt.split(" — clarification:")[-1].strip().lower()
+        if said.startswith("yes"):
+            confirmed_tools = set(write_hold["tools"])
+        elif said.startswith("no"):
+            declined_tools = set(write_hold["tools"])
+        _log(f"🧭 Held write(s) {write_hold['tools']}: "
+             + ("confirmed" if confirmed_tools else "declined" if declined_tools
+                else "no answer — new request"))
 
     # Gate: Foldseek's two costly options are the user's call, never the
     # model's — uploading their coordinates to a third-party server, and a
@@ -10636,6 +10944,25 @@ def run_agent(user_prompt: str, status=None) -> str:
             # selection-like argument must come from the user's words, the
             # scene, or a tool result in this request; otherwise block and
             # have the model ask.
+            # The user named residue numbers and nothing has run yet, so no
+            # tool result can have offered others: a selection carrying none of
+            # them is a substitute. "highlight residue 900 in chain A" on 4HHB
+            # (chain A ends at 141) came back as highlight('A/141'), and the
+            # gate below let it through — 141 is in the Scene's residue range.
+            said_res = set(re.findall(r"\bres(?:idue)?s?\s*(?:number\s*)?(\d+)", prompt_lower))
+            if name not in NUMBER_GATE_EXEMPT and said_res and not ran:
+                arg_nums = {n for k, v in args.items()
+                            if isinstance(v, str) and k not in NUMBER_GATE_FREE_ARGS
+                            for n in re.findall(r"\d+", v)}
+                if arg_nums and not (arg_nums & said_res):
+                    _log(f"🚫 Blocked '{name}' — residue {sorted(arg_nums)} for the user's "
+                         f"{sorted(said_res)}")
+                    tool_results.append({"tool": name, "result": _blocked(
+                        f"Blocked — the user asked for residue {', '.join(sorted(said_res))}, "
+                        f"not {', '.join(sorted(arg_nums))}. Call it with the number the user "
+                        "gave; if that residue is not in the structure, the tool says so — then "
+                        "tell the user it does not exist and what range does.")})
+                    continue
             if name not in NUMBER_GATE_EXEMPT:
                 seen = set(re.findall(r"\d+", _request_evidence()))
                 invented = sorted({n for k, v in args.items()
@@ -10672,11 +10999,20 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "Blocked — use 'show' for representations, 'select' for highlights.")})
                 continue
 
-            # ── Gate: destructive ───────────────────────────────────────────
-            if name in DESTRUCTIVE_TOOLS and not hide_requested:
-                _log(f"🚫 Blocked '{name}' — not requested")
+            # ── Confirm before writing (S9) ─────────────────────────────────
+            if name in declined_tools:
+                _log(f"🚫 Blocked '{name}' — the user said no")
                 tool_results.append({"tool": name, "result": _blocked(
-                    "Blocked — user did not request hiding.")})
+                    f"Blocked — the user declined {name}; nothing was written. Do not call "
+                    "it again: answer the rest of the request without it.")})
+                continue
+            reason = "" if name in confirmed_tools else _confirm_reason(name, args, confirm_text)
+            if reason:
+                _log(f"⏸ Held '{name}' for the user's Yes / No — {reason}")
+                holds.append((name, dict(args), reason))
+                tool_results.append({"tool": name, "result": ToolResult(
+                    "Held — waiting for the user's confirmation; nothing was written yet.",
+                    True, {"status": "held", "reason": reason})})
                 continue
 
             # The load/search gate (LOAD_TOOLS + a regex classifier for
@@ -10688,13 +11024,6 @@ def run_agent(user_prompt: str, status=None) -> str:
             # "show me the binding site", "look up the salt bridges",
             # "search for hydrogen bonds" (none re-fetched the loaded
             # structure) and "load PDB 4HHB" (still loaded correctly).
-
-            # ── Gate: write/side-effect ─────────────────────────────────────
-            if name in WRITE_TOOLS and not write_requested:
-                _log(f"🚫 Blocked '{name}' — not requested by user")
-                tool_results.append({"tool": name, "result": _blocked(
-                    "Blocked — user did not request this operation.")})
-                continue
 
             # ── Gate: Foldseek online upload / database download ───────────
             if name == "find_structural_neighbors":
@@ -10820,6 +11149,8 @@ def run_agent(user_prompt: str, status=None) -> str:
             if status is not None:
                 status.write(f"{'✓' if result.ok else '✗'} {name.replace('_', ' ')}")
             _log(f"🔧 {name}({args}) → {result}", level)
+            if result.ok and name in WRITE_TOOLS:      # undone with the request (S9)
+                st.session_state.setdefault("request_files", []).extend(result.files)
             summary_parts.append(f"{name}: {result}")
             ran.append((name, result))
             _remember(name, args, result)
@@ -10853,6 +11184,16 @@ def run_agent(user_prompt: str, status=None) -> str:
                     "files": res.files, "next_hints": res.next_hints,
                     "recovery": (json.loads(json.dumps(r["recovery"], default=str))
                                  if r.get("recovery") else None)})
+
+        # S9: held writes become one Yes / No card for the whole batch.
+        if holds and not st.session_state.get("clarify"):
+            question, options = _confirm_question(holds)
+            ask_clarification(question, options)
+            st.session_state.write_hold = {"tools": sorted({h[0] for h in holds}),
+                                           "request": st.session_state.current_request}
+            if status is not None:
+                status.write("⏸ " + ", ".join(h[0].replace("_", " ") for h in holds)
+                             + " — waiting for your Yes / No")
 
         # A question for the user (ask_user, or a tool that found the request
         # ambiguous) ends the request here: the answer decides what runs next,
@@ -14753,11 +15094,36 @@ with left:
                 st.markdown(f"- `{name}`: {short}")
         st.markdown(f"**Representations:** {len(st.session_state.representations)}")
 
-    if st.button("🆕 Clear scene", type="secondary",
-                 help="Unload every structure and start over"):
-        # Reset all session state keys to their defaults
+    # S9: undo the last request that changed the scene, and when to ask first.
+    _stack = st.session_state.undo_stack
+    _b1, _b2 = st.columns(2)
+    with _b1:
+        if st.button("↶ Undo", key="undo_btn", use_container_width=True,
+                     disabled=not _stack,
+                     help=(f"Undo “{_stack[-1]['label']}” — files it wrote go to "
+                           f"{UNDO_TRASH}/" if _stack else "Nothing to undo")):
+            _res = tool_undo_last()
+            st.session_state.pop("_undo_base", None)
+            st.session_state.messages.append({"role": "user", "content": "↶ Undo"})
+            st.session_state.messages.append({"role": "assistant", "content": _res.summary})
+            st.rerun()
+    with _b2:
+        clear_clicked = st.button("🆕 Clear scene", type="secondary",
+                                  use_container_width=True,
+                                  help="Unload every structure and start over")
+    st.selectbox(
+        "Ask before", ["auto", "always", "never"], key="confirm_before",
+        format_func={"auto": "Writes I did not ask for",
+                     "always": "Every write and scene wipe",
+                     "never": "Never (undo only)"}.get,
+        help="When the agent stops for a Yes / No before acting. Scene changes can "
+             "always be undone; 'auto' also asks before writing a file the request "
+             "did not name, or one asked about as a question.")
+    if clear_clicked:
+        # Reset all session state keys to their defaults, except the setting
         for k, v in defaults.items():
-            st.session_state[k] = v
+            if k != "confirm_before":
+                st.session_state[k] = copy.deepcopy(v)
         st.rerun()
 
 

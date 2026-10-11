@@ -12,3 +12,6 @@ prepared/
 simulations/
 Ollama.dmg
 .agents/
+
+# Files moved aside by undo (S9)
+.undo_trash/

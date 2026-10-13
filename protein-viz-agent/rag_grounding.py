@@ -137,6 +137,67 @@ def _get_index():
     return _index
 
 
+def _stem(term: str) -> str:
+    # Just enough to meet "bonds"/"bond", "bridges"/"bridge", "colored"/"color";
+    # a real stemmer would be a dependency for a few dozen tool documents.
+    for suffix, repl in (("ies", "y"), ("ing", ""), ("ed", ""), ("es", ""), ("s", "")):
+        if term.endswith(suffix) and len(term) - len(suffix) >= 3 and not term.endswith("ss"):
+            return term[: len(term) - len(suffix)] + repl
+    return term
+
+
+class DocRanker:
+    """
+    TF-IDF ranking of named documents, several per name allowed (S10: per
+    tool its name, its description with argument descriptions, and each
+    example prompt that uses it, kept apart so a long description does not
+    drown the one word that names the tool). A name scores its best document.
+    Same scheme as the example store, plus light stemming: a tool description
+    says "bond", the user says "bonds".
+    """
+
+    def __init__(self, docs: list):
+        self.names = [n for n, _ in docs]
+        tokens = [self._tokens(text) for _, text in docs]
+        df = {}
+        for toks in tokens:
+            for term in set(toks):
+                df[term] = df.get(term, 0) + 1
+        n = len(tokens) or 1
+        self.idf = {t: math.log((1 + n) / (1 + c)) + 1 for t, c in df.items()}
+        self.vectors = [self._vector(toks) for toks in tokens]
+
+    @staticmethod
+    def _tokens(text: str) -> list:
+        return [_stem(t) for t in _tokenize(text.replace("_", " "))]
+
+    def _vector(self, tokens: list) -> dict:
+        tf = {}
+        for t in tokens:
+            if t in self.idf:
+                tf[t] = tf.get(t, 0) + 1
+        # Sublinear tf: a long description repeating "structure" ten times
+        # should not outrank a short one that says it once.
+        vec = {t: (1 + math.log(c)) * self.idf[t] for t, c in tf.items()}
+        norm = math.sqrt(sum(w * w for w in vec.values())) or 1.0
+        return {t: w / norm for t, w in vec.items()}
+
+    def scores(self, text: str) -> dict:
+        """Best cosine similarity of `text` to each name's documents."""
+        q = self._vector(self._tokens(text))
+        best = {}
+        for name, vec in zip(self.names, self.vectors):
+            sim = sum(w * vec.get(t, 0.0) for t, w in q.items())
+            best[name] = max(best.get(name, 0.0), sim)
+        return best
+
+
+def all_examples() -> list:
+    """Every (prompt, grounding) pair in the example store, or [] when it failed to load."""
+    index = _get_index()
+    return list(index.examples) if index is not None else []
+
+
 def retrieve_examples(prompt: str, k: int = 4) -> list:
     """The k example (prompt, grounding) pairs most similar to `prompt`, or [] if none clear the similarity floor."""
     index = _get_index()

@@ -30,6 +30,7 @@ import streamlit as st
 import base64
 import copy
 import filecmp
+import functools
 import os
 import json
 import logging
@@ -141,7 +142,7 @@ import Protein_accession as pacc
 
 from parora_logging import setup_logging
 from parora_config import get_config
-from rag_grounding import format_grounding
+from rag_grounding import DocRanker, all_examples, format_grounding
 
 log = setup_logging("app")
 
@@ -301,6 +302,8 @@ defaults = {
     "toolbar_open":    None,    # (top, sub) of the open toolbar dialog — see _toolbar_dialog
     "facts":           [],      # every successful agent tool result — see _remember (S5)
     "request_no":      0,       # chat requests run_agent has handled
+    "offered_tools":   [],      # tool schemas offered so far, append-only — see _offer_tools (S10)
+    "last_tools":      [],      # tools the previous request ran (S10)
     "undo_stack":      [],      # scene before each changing request — see _push_undo (S9)
     # When to ask before acting — see _confirm_reason (S9): "always", "auto"
     # (writes the request did not name) or "never".
@@ -6049,6 +6052,31 @@ def tool_save_structure(filename: str) -> ToolResult:
     return _ok(f"Saved to {out}", files=[out])
 
 
+_COORD_RECORDS = ("ATOM", "HETATM", "MODEL", "ENDMDL", "TER", "END", "CONECT", "MASTER",
+                  "CRYST1", "ORIGX", "SCALE", "MTRIX", "ANISOU")
+
+
+def _carry_header(src, dst) -> None:
+    """
+    Put back the header records MDAnalysis's PDB writer drops (DBREF, HETNAM,
+    HETSYN, MODRES, SOURCE, ...): without them a de-solvated 1M17 no longer
+    says AQ4 is erlotinib (S8's name lookup asked instead) nor which UniProt
+    entry each chain is. Inserted before the first coordinate record.
+    """
+    try:
+        old = Path(src).read_text(errors="replace").splitlines(keepends=True)
+        new = Path(dst).read_text(errors="replace").splitlines(keepends=True)
+    except OSError:
+        return
+    have = {ln[:6].strip() for ln in new}
+    extra = [ln for ln in old
+             if ln[:6].strip() not in have and not ln.startswith(_COORD_RECORDS)]
+    if not extra:
+        return
+    at = next((i for i, ln in enumerate(new) if ln.startswith(_COORD_RECORDS)), len(new))
+    Path(dst).write_text("".join(new[:at] + extra + new[at:]))
+
+
 def tool_remove_solvent() -> ToolResult:
     """
     Strip all water molecules from the current structure and save the result.
@@ -6075,6 +6103,7 @@ def tool_remove_solvent() -> ToolResult:
         no_water = u.select_atoms("not water")
         out_path = STRUCTURES_DIR / f"{st.session_state.pdb_id}_no_solvent.pdb"
         no_water.write(str(out_path))
+        _carry_header(entry["path"], out_path)
         entry["path"] = str(out_path)
         entry["source"] = "local"
         st.session_state.pdb_path = str(out_path)
@@ -7017,6 +7046,20 @@ TOOLS = [
                 "topic": {"type": "string", "description": "What to look up: a fact id such as 'F3', a topic ('pocket', 'distance', 'salt bridge', 'file'), a tool name, a PDB id or a residue. Empty = everything remembered."},
                 "limit": {"type": "integer", "description": "How many results to return, newest and best matches first (default 5)"}
             }, "required": ["topic"]}
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "list_more_tools",
+            "description": (
+                "Only part of the toolbox is listed here. When none of the listed tools "
+                "can do what the user asked, call this with a few words describing the "
+                "task ('salt bridges', 'membrane', 'render image'): it lists the best "
+                "matching tools and makes them callable on the next turn. Changes nothing."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string", "description": "The task in a few words"}
+            }, "required": ["query"]}
         }
     },
     {
@@ -8065,6 +8108,7 @@ def _known_args(fn, args: dict) -> dict:
 TOOL_DISPATCH = {
     "ask_user": lambda a: tool_ask_user(a.get("question", ""), a.get("options") or []),
     "recall":   lambda a: tool_recall(str(a.get("topic", "")), a.get("limit", 5)),
+    "list_more_tools": lambda a: tool_list_more_tools(str(a.get("query", ""))),
     # ---------- Analysis tools from analysis_tools.py ----------
     "measure_mda_distance": lambda a: tool_measure_mda_distance(
         a.get("sel1", ""),
@@ -8509,8 +8553,9 @@ def _system_prompt() -> str:
 
 TOOL_GROUPS = {
     "lookup":   (r"protein|uniprot|gene|structures for|structures of|entries|"
-                 r"depositions|search|look up|homolog|species|isoform",
-                 {"find_protein", "protein_structures", "load_protein"}),
+                 r"depositions|search|look up|homolog|species|isoform|function|\brole\b|"
+                 r"what does .{0,40}\bdo\b|what (it|they) does?\b",
+                 {"find_protein", "protein_structures", "load_protein", "protein_function"}),
     "load":     (r"\bload|fetch|download|open|add\b|remove structure|unload|clear|reset|"
                  r"start over|upload|local file",
                  {"fetch_structure", "load_local", "add_structure", "remove_structure",
@@ -8526,7 +8571,7 @@ TOOL_GROUPS = {
                  {"measure_distance", "measure_angle", "measure_dihedral",
                   "find_contacts", "measure_mda_distance", "measure_mda_angle",
                   "measure_mda_dihedral", "select_within", "nearby_residues"}),
-    "interact": (r"interaction|hydrogen bond|h-?bond|salt bridge|disulfide|"
+    "interact": (r"interact|hydrogen bond|h-?bond|salt bridge|disulfide|"
                  r"pi-?stack|hydrophobic|binding site|active site|pocket",
                  {"find_interactions", "highlight", "find_contacts",
                   "detect_salt_bridges", "detect_hydrogen_bonds", "detect_contacts"}),
@@ -8535,7 +8580,7 @@ TOOL_GROUPS = {
                  {"find_pockets", "highlight"}),
     "describe": (r"describe|what is in|what.s in|composition|ligand|cofactor|"
                  r"residue|chain|how many|non-?standard|sequence|resolution|summar|"
-                 r"b-?factor",
+                 r"b-?factor|flexib|mobil|rigid|disorder",
                  {"describe_structure", "list_structures", "summarize_chains",
                   "list_residues", "bfactor_summary"}),
     "prepare":  (r"prepare|clean|fix|protonat|hydrogen|altloc|missing|state|model|"
@@ -8577,27 +8622,102 @@ TOOL_GROUPS = {
                  {"undo_last"}),
 }
 
-# Always offered: orientation, and the escape hatches for a misrouted message.
-CORE_TOOLS = {"describe_structure", "list_structures", "select", "show", "color", "recall"}
+# Always offered: asking, loading, the basic view, orientation, memory, and
+# the way to reach a tool retrieval did not send.
+CORE_TOOLS = {"ask_user", "recall", "fetch_structure", "load_protein", "select", "show",
+              "color", "highlight", "describe_structure", "list_structures", "list_more_tools"}
 
-def _route_tools(prompt_lower: str):
-    """
-    The tool schemas worth sending for this message.
+# S10: tools ranked per request instead of all ~66 schemas (~10k tokens) on
+# every call. Score = TF-IDF over each tool's own words and the example
+# prompts that use it, plus a bonus when a TOOL_GROUPS pattern hits — the
+# regexes catch stems ("transparen", "simulat") word matching misses.
+TOOL_TOP_K = int(os.environ.get("PARORA_TOOL_K", "10"))   # 0 = send every schema
+TOOL_GROUP_BONUS = 0.3
 
-    Returns (tools, is_subset). is_subset is False when the full list is being
-    sent, which tells run_agent there is no fallback left to try.
+
+@functools.lru_cache(maxsize=1)
+def _tool_ranker() -> DocRanker:
+    docs = []
+    for t in TOOLS:
+        fn = t["function"]
+        params = fn.get("parameters", {}).get("properties", {})
+        docs.append((fn["name"], fn["name"]))
+        docs.append((fn["name"], " ".join(
+            [fn["name"], fn.get("description", "")]
+            + [f"{k} {v.get('description', '')}" for k, v in params.items()])))
+    # Example prompts whose grounding names a tool describe it in users' words.
+    for ex in all_examples():
+        for name in _tools_named(ex["grounding"]):
+            docs.append((name, ex["prompt"]))
+    return DocRanker(docs)
+
+
+def _tools_named(text: str) -> set:
+    """Tool names written out in `text` — a nudge, a hint, a plan step."""
+    return {n for n in TOOL_DISPATCH if re.search(rf"(?<![\w.]){n}(?![\w.])", text)}
+
+
+def _pick_tools(prompt: str, k: int = TOOL_TOP_K, extra_text: str = "",
+                prior: set = frozenset()) -> set:
     """
-    wanted = set(CORE_TOOLS)
-    hit = False
-    for pattern, names in TOOL_GROUPS.values():
-        if re.search(pattern, prompt_lower):
-            wanted |= names
-            hit = True
-    # No group matched, or routing barely narrowed anything — send everything.
-    if not hit or len(wanted) > 0.6 * len(TOOLS):
-        return TOOLS, False
-    routed = [t for t in TOOLS if t["function"]["name"] in wanted]
-    return routed, len(routed) < len(TOOLS)
+    The tool names worth sending for this request: CORE_TOOLS, the top `k` by
+    score, tools `extra_text` names (plan steps, a pending question), and
+    `prior` — what the previous request ran, for "now do the same for chain B".
+    """
+    if k <= 0:
+        return set(TOOL_DISPATCH)
+    low = prompt.lower()
+    words = _tool_ranker().scores(prompt)
+    scores = dict(words)
+    hit_groups = [names for pattern, names in TOOL_GROUPS.values() if re.search(pattern, low)]
+    for names in hit_groups:
+        for n in names:
+            scores[n] = scores.get(n, 0.0) + TOOL_GROUP_BONUS
+    ranked = [n for n, s in sorted(scores.items(), key=lambda kv: -kv[1]) if s > 0]
+    picked = set(CORE_TOOLS) | set(ranked[:k]) | _tools_named(extra_text) | set(prior)
+    # A long request hits many groups and their bonuses tie; each group still
+    # gets its two best by words — "…, label lysine 48, and zoom to it" lost
+    # add_label to the style group's thirteen otherwise.
+    for names in hit_groups:
+        picked |= set(sorted(names, key=lambda n: -words.get(n, 0.0))[:2])
+    return picked & set(TOOL_DISPATCH)
+
+
+_SCHEMA_BY_NAME = {t["function"]["name"]: t for t in TOOLS}
+
+
+def _offer_tools(names) -> list:
+    """
+    Add `names` to this session's offered tools and return their schemas.
+
+    The list only grows, and new tools go at its end: Ollama reuses the KV
+    cache for the longest common prefix, and the tool block follows the
+    system prompt, so a set re-sorted per request re-read ~2-8k tokens every
+    request (6-9 s on qwen2.5:14b) where the full, unchanging list cost 0.2 s
+    once warm. Appending keeps the earlier tools cached; a long session
+    converges on the full list.
+    """
+    offered = st.session_state.setdefault("offered_tools", [])
+    if not offered:
+        offered.extend(n for n in _SCHEMA_BY_NAME if n in CORE_TOOLS)
+    offered.extend(n for n in _SCHEMA_BY_NAME if n in set(names) and n not in offered)
+    return [_SCHEMA_BY_NAME[n] for n in offered]
+
+
+def tool_list_more_tools(query: str = "") -> ToolResult:
+    """The tools not sent this turn that best match `query`; run_agent adds them."""
+    scores = _tool_ranker().scores(query or "")
+    ranked = [n for n, s in sorted(scores.items(), key=lambda kv: -kv[1])
+              if s > 0 and n != "list_more_tools"][:8]
+    if not ranked:
+        names = sorted(n for n in TOOL_DISPATCH if n != "list_more_tools")
+        return _ok("No tool matches that well. Every tool: " + ", ".join(names),
+                   data={"tools": []})
+    desc = {t["function"]["name"]: t["function"]["description"].split(". ")[0]
+            for t in TOOLS}
+    lines = [f"- {n}: {desc.get(n, '')[:160]}" for n in ranked]
+    return _ok("These tools are now available — call the one that fits:\n" + "\n".join(lines),
+               data={"tools": ranked})
 
 
 def _state_block() -> str:
@@ -8732,8 +8852,8 @@ MEMORY_TOPICS = {
 
 # Calls whose outcome is the live scene, which _state_block already spells out,
 # or that only ask/list: remembering them would bury the results among clicks.
-MEMORY_SKIP = {"ask_user", "recall", "select", "highlight", "show", "show_all", "hide",
-               "hide_all", "color", "set_transparency", "zoom", "set_background",
+MEMORY_SKIP = {"ask_user", "recall", "list_more_tools", "select", "highlight", "show",
+               "show_all", "hide", "hide_all", "color", "set_transparency", "zoom", "set_background",
                "add_label", "clear_labels", "list_labels", "clear_superposition",
                "download_foldseek_database", "undo_last"}
 
@@ -8917,7 +9037,8 @@ _RESIDUE_TOKEN = re.compile(
 # Tools whose string arguments are identifiers or free text, not residue
 # selections — PDB ids, accessions, file names, the question itself.
 NUMBER_GATE_EXEMPT = {
-    "ask_user", "recall", "fetch_structure", "add_structure", "replace_scene", "load_protein",
+    "ask_user", "recall", "list_more_tools", "fetch_structure", "add_structure",
+    "replace_scene", "load_protein",
     "find_protein", "protein_structures", "protein_function", "load_local",
     "remove_structure", "render_image", "save_structure", "set_background",
     "download_foldseek_database", "find_structural_neighbors", "superpose_structures",
@@ -9378,6 +9499,8 @@ def _tool_catalog() -> str:
     lines = []
     for t in TOOLS:
         f = t["function"]
+        if f["name"] == "list_more_tools":      # a menu, not a step
+            continue
         first = re.split(r"(?<=\.)\s", f.get("description", "").strip(), maxsplit=1)[0]
         lines.append(f"- {f['name']}: {first[:140]}")
     return "\n".join(lines)
@@ -10216,6 +10339,9 @@ def run_agent(user_prompt: str, status=None) -> str:
     t0 = time.time()
     before = _scene_snapshot()
     reply = _run_agent_loop(user_prompt, status)
+    # S10: the next request is offered these again ("now do the same for B").
+    st.session_state.last_tools = sorted({e["tool"] for e in st.session_state.get(
+        "agent_trace", []) if e.get("status") == "ran"} - {"list_more_tools"})
     base = st.session_state.pop("_undo_base", None) or before
     files = [f for f in dict.fromkeys(st.session_state.pop("request_files", []))
              if _written_since(f, t0)]
@@ -10233,8 +10359,8 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
     Execute a gated, deduplicated multi-turn tool-calling loop for one user command.
 
     The loop runs up to MAX_TURNS iterations. On each turn it:
-      1. Sends the message history to Ollama, with the tool schemas routed to
-         this message (_route_tools) and the system message held byte-stable so
+      1. Sends the message history to Ollama, with the tool schemas picked for
+         this message (_pick_tools, S10) and the system message held byte-stable so
          the prefix stays cached; the live scene rides in the newest user
          message instead (_state_block).
       2. Inspects any tool calls returned and applies the following gates:
@@ -10499,9 +10625,24 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
         _show_plan()
         return f"\n\n**Plan**\n{_render_plan(plan)}"
 
-    active_tools, tools_are_subset = TOOLS, False
-    _log(
-        f"🧰 {len(active_tools)}/{len(TOOLS)} tool schemas sent")
+    # S10: a ranked subset of the schemas, not all of them. Tools named in the
+    # opening message (plan steps, few-shot examples, remembered results, a
+    # pending question) come along, and so does whatever a later nudge, hint
+    # or list_more_tools result names (_offer_named before each call).
+    # Earlier requests' tools stay offered (_offer_tools: cache-friendly order).
+    picked = _pick_tools(user_prompt, extra_text=messages[1]["content"],
+                         prior=set(st.session_state.get("last_tools", [])))
+    active_tools = _offer_tools(picked)
+    _log(f"🧰 {len(active_tools)}/{len(TOOLS)} tool schemas sent "
+         f"({len(picked)} picked for this request)")
+
+    def _offer_named() -> None:
+        nonlocal active_tools
+        new = _tools_named("\n".join(str(m.get("content", "")) for m in messages[2:]))
+        new -= set(st.session_state.offered_tools)
+        if new:
+            active_tools = _offer_tools(new)
+            _log(f"🧰 +{', '.join(sorted(new))} — {len(active_tools)}/{len(TOOLS)} schemas")
 
     # The keyword gates on hide/hide_all and on writes are gone (S9): a scene
     # change is undoable (run_agent pushes the scene before each request), and
@@ -10560,6 +10701,7 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
             status,
             "Thinking…" if turn == 0 else f"Thinking about next step (turn {turn + 1})…",
         )
+        _offer_named()
         try:
             response = ollama_client.chat(
                 model=MODEL,
@@ -10582,18 +10724,12 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
         msg = response.get("message", {})
         tool_calls = msg.get("tool_calls", [])
 
-        # No tool calls → agent is done; return its text reply. Unless this was
-        # the first turn on a routed subset and nothing has run yet, in which
-        # case the tool it wanted may simply not have been offered — retry once
-        # with the full list rather than answering from a half-set menu.
+        # No tool calls → agent is done; return its text reply. (S10 dropped the
+        # retry with every schema after a tool-less first turn: in 11 eval cases
+        # it cost ~35 s each and never reached a tool that was not offered —
+        # list_more_tools is the way out of a short menu.)
         if not tool_calls:
             final_text = msg.get("content", "").strip()
-            if tools_are_subset and not summary_parts:
-                _log(
-                    "↻ No tool chosen from the routed subset — retrying with all "
-                    f"{len(TOOLS)} schemas")
-                active_tools, tools_are_subset = TOOLS, False
-                continue
             # A question about the protein beyond the loaded file, answered
             # with no lookup at all: qwen2.5:7b does this about half the time
             # for "I mean the protein, not the scene", reciting the loaded

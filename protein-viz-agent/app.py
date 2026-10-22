@@ -2065,7 +2065,8 @@ def oniom_pairing(build: dict):
     # 38,454 atoms on 3PTB).
     saved = re.search(r"^savepdb\s+\S+\s+(\S+)", build.get("script", ""), re.M)
     leap_pdbs = ([Path(build["dir"]) / saved.group(1)] if saved else
-                 sorted(Path(build["dir"]).glob("*_leap.pdb"),
+                 sorted((p for p in Path(build["dir"]).glob("*_leap.pdb")
+                         if not p.name.startswith(".")),     # AppleDouble, see run_tleap
                         key=lambda p: p.stat().st_mtime, reverse=True))
     leap_pdbs = [p for p in leap_pdbs if p.exists()]
     if not leap_pdbs:
@@ -15144,6 +15145,50 @@ def _protein_exports(prof: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# S11: 👍 / 👎 on a reply saves (request, tool trace) as a few-shot candidate
+# ═══════════════════════════════════════════════════════════════════════════════
+# Appended to FEEDBACK_DIR/rag_candidates.jsonl, one line per click (a changed
+# rating is a new line; the latest per id wins). Nothing here touches
+# rag_examples.json — evals/curate_examples.py reviews, dedups and merges.
+
+FEEDBACK_DIR = Path(os.environ.get("PARORA_FEEDBACK_DIR", Path(__file__).parent / "feedback"))
+FEEDBACK_FILE = FEEDBACK_DIR / "rag_candidates.jsonl"
+
+
+def _feedback_record(typed: str) -> dict:
+    """What a thumbs click on the reply just produced needs: the request as
+    run_agent saw it (a clarified request carries its chosen meaning), the
+    calls in order, and the scene they ran against. Results are trimmed to
+    their first line — the curate script reads names, args and ok, not data."""
+    calls = [{"tool": e["tool"], "args": e.get("args", {}), "status": e.get("status"),
+              "ok": e.get("ok"), "recovery": (e.get("recovery") or {}).get("step"),
+              "result": str(e.get("result", "")).split("\n", 1)[0][:200]}
+             for e in st.session_state.get("agent_trace", [])]
+    return {"id": uuid.uuid4().hex[:12], "typed": typed,
+            "request": st.session_state.get("current_request") or typed,
+            "trace": calls, "structures": [x["pdb_id"] for x in structures()],
+            "model": MODEL, "request_no": st.session_state.get("request_no", 0)}
+
+
+def _save_feedback(msg: dict) -> None:
+    """on_change of a reply's st.feedback widget: 1 = 👍, 0 = 👎, None = cleared."""
+    fb = msg.get("fb")
+    if not fb:
+        return
+    rating = st.session_state.get(f"fb_{fb['id']}")
+    row = {**fb, "rating": {1: "up", 0: "down"}.get(rating, "cleared"),
+           "reply": str(msg.get("content", ""))[:2000],
+           "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    try:
+        FEEDBACK_DIR.mkdir(parents=True, exist_ok=True)
+        with open(FEEDBACK_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+        _log(f"👍 Feedback {row['rating']} saved for “{fb['typed'][:60]}”")
+    except OSError as e:
+        _log(f"Feedback not saved: {e}", logging.WARNING)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # UI Layout
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -15158,6 +15203,9 @@ with left:
         for msg in st.session_state.messages:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
+                if msg.get("fb"):
+                    st.feedback("thumbs", key=f"fb_{msg['fb']['id']}",
+                                on_change=_save_feedback, args=(msg,))
 
     # ── Working context ──────────────────────────────────────────────────────
     # The agent applies an unqualified request to whatever protein is pinned
@@ -15200,7 +15248,8 @@ with left:
         # screen-lock during a slow multi-turn request isn't a blank wait.
         with st.status("🤖 Working on it…", expanded=True) as status:
             reply = run_agent(prompt, status=status)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.session_state.messages.append({"role": "assistant", "content": reply,
+                                              "fb": _feedback_record(prompt)})
             status.update(label="✅ Done", state="complete", expanded=False)
         st.rerun()
 

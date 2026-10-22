@@ -62,6 +62,7 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import statistics
 import sys
 import time
@@ -249,6 +250,24 @@ class Harness:
             del ss[k]
         for k, v in self.app.defaults.items():
             ss[k] = copy.deepcopy(v)
+
+    def clear_outputs(self, case: dict, out_dir: Path) -> list:
+        """Move aside structures/<name>.pdb files a case's prompts will save.
+        Left over from an earlier run, a differing one turns the save into
+        S9's always-asked overwrite question (strip-and-save and
+        plan-crambin-six failed that way once remove_solvent's header
+        changed). Moved into the report dir, never deleted; a case that
+        needs the file (save-overwrite-asks) makes it in its preload."""
+        text = " ".join(t["prompt"] if isinstance(t, dict) else t for t in case["turns"])
+        moved = []
+        for name in dict.fromkeys(re.findall(r"[\w.-]+\.pdb\b", text)):
+            path = APP_DIR / "structures" / name
+            if path.is_file():
+                dest = out_dir / "stale_outputs" / case["id"]
+                dest.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(path), str(dest / name))
+                moved.append(name)
+        return moved
 
     def preload(self, items: list) -> list:
         errors = []
@@ -442,6 +461,7 @@ def main():
             rid = c["id"] if a.repeat == 1 else f"{c['id']}#{rep + 1}"
             r = {"id": rid, "case": c["id"], "category": c["category"],
                  "groups": c["groups"], "turns": [], "checks": []}
+            h.clear_outputs(c, out_dir)
             r["preload_errors"] = h.preload(c["preload"])
             if r["preload_errors"]:
                 r["passed"] = False

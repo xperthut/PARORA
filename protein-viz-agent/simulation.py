@@ -801,20 +801,31 @@ def run_tleap(script_text: str, work_dir, extra_files=None,
                 "warnings": [], "prmtop": None, "inpcrd": None}
 
     (work_dir / "leap.log").write_text(log)
-    prmtop = next((p for p in work_dir.glob("*.prmtop") if p.stat().st_size), None)
-    inpcrd = next((p for p in work_dir.glob("*.inpcrd") if p.stat().st_size), None)
+    # Not "._system.prmtop": macOS writes such AppleDouble sidecars on
+    # exFAT/SMB volumes, pathlib's glob matches them, and amber_run_files then
+    # copied those 4 KB over the real topology ("0 atoms", ONIOM refused).
+    prmtop = next((p for p in work_dir.glob("*.prmtop")
+                   if not p.name.startswith(".") and p.stat().st_size), None)
+    inpcrd = next((p for p in work_dir.glob("*.inpcrd")
+                   if not p.name.startswith(".") and p.stat().st_size), None)
     result = {
         "ok": bool(prmtop and inpcrd),
         "prmtop": str(prmtop) if prmtop else None,
         "inpcrd": str(inpcrd) if inpcrd else None,
         "log": log,
+        # Not leap's closing tally ("Exiting LEaP: Errors = 0; ..."), which
+        # every build prints and made each success show "1 error line".
         "errors": [l.strip() for l in log.splitlines()
-                   if "Error" in l or "FATAL" in l or "Fatal" in l],
+                   if ("Error" in l or "FATAL" in l or "Fatal" in l)
+                   and not l.lstrip().startswith("Exiting LEaP")],
         "warnings": [l.strip() for l in log.splitlines() if "Warning" in l],
         "dir": str(work_dir),
     }
     if prmtop:
         result.update(topology_summary(prmtop))
+        if not result.get("atoms"):
+            result["ok"] = False
+            result["errors"].append(f"{prmtop.name} has no atoms — not a readable Amber topology.")
     return result
 
 

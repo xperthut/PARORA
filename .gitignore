@@ -92,3 +92,6 @@ evals/reports/
 
 # run.sh first-launch marker for setup_tools.sh
 .tools_checked
+
+# S11 thumbs-up candidates (real user prompts)
+protein-viz-agent/feedback/

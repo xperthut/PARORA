@@ -46,29 +46,59 @@ _MIN_SCORE = 0.15
 # comment in _TfidfIndex.query for the failure this prevents.
 _RELATIVE_FLOOR = 0.5
 
+# A learned example (S11) rides along only when it shares most of the
+# prompt's weighted vocabulary — a paraphrase, not a topic neighbour. Set
+# against the 2026-10-22 merge regressions: "describe the folding topology of
+# this domain" vs "describe the prepared structure" (one shared word) must
+# stay out.
+_LEARNED_MIN = 0.6
+
 
 def _tokenize(text: str) -> list:
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS]
 
 
 class _TfidfIndex:
+    """
+    Hand-written examples (no "source" key) and learned ones (S11: harvested
+    by evals/curate_examples.py, "source" set) are kept apart. The first
+    alone set the IDF and fill the k slots exactly as before learned examples
+    existed. A learned example only adds one line after them, and only when
+    it is a close match (_LEARNED_MIN). Merging the two pools let every new
+    example move every IDF and crowd hand-written reply guidance out of the
+    k slots — the 2026-10-22 merge test lost 3 eval cases that way.
+    """
+
     def __init__(self, examples: list):
         self.examples = examples
         docs_tokens = [_tokenize(ex["prompt"]) for ex in examples]
+        self.learned = [bool(ex.get("source")) for ex in examples]
 
         doc_freq = {}
-        for tokens in docs_tokens:
+        for tokens, learned in zip(docs_tokens, self.learned):
+            if learned:
+                continue
             for term in set(tokens):
                 doc_freq[term] = doc_freq.get(term, 0) + 1
 
-        n_docs = len(docs_tokens) or 1
+        n_docs = (len(docs_tokens) - sum(self.learned)) or 1
         self.idf = {
             term: math.log((1 + n_docs) / (1 + count)) + 1
             for term, count in doc_freq.items()
         }
-        self.doc_vectors = [self._vectorize(tokens) for tokens in docs_tokens]
+        # A word only learned examples use weighs as a word seen once would.
+        # Only learned-side vectors carry it, so hand-written scores never see it.
+        rare = math.log((1 + n_docs) / 2) + 1
+        self.learned_idf = dict(self.idf)
+        for tokens, learned in zip(docs_tokens, self.learned):
+            if learned:
+                for term in tokens:
+                    self.learned_idf.setdefault(term, rare)
+        self.doc_vectors = [self._vectorize(tokens, self.learned_idf if learned else self.idf)
+                            for tokens, learned in zip(docs_tokens, self.learned)]
 
-    def _vectorize(self, tokens: list) -> dict:
+    def _vectorize(self, tokens: list, idf_table: dict = None) -> dict:
+        idf_table = self.idf if idf_table is None else idf_table
         term_freq = {}
         for term in tokens:
             term_freq[term] = term_freq.get(term, 0) + 1
@@ -76,7 +106,7 @@ class _TfidfIndex:
         vec = {}
         norm_sq = 0.0
         for term, count in term_freq.items():
-            idf = self.idf.get(term)
+            idf = idf_table.get(term)
             if idf is None:
                 continue
             weight = count * idf
@@ -87,14 +117,30 @@ class _TfidfIndex:
         return {term: weight / norm for term, weight in vec.items()}
 
     def query(self, text: str, k: int) -> list:
-        qvec = self._vectorize(_tokenize(text))
+        tokens = _tokenize(text)
+        found = self._query_hand(self._vectorize(tokens), k)
+        if any(self.learned):
+            lvec = self._vectorize(tokens, self.learned_idf)
+            best = max(((self._sim(lvec, dvec), i) for i, dvec in enumerate(self.doc_vectors)
+                        if self.learned[i]), default=(0.0, None))
+            if best[0] >= _LEARNED_MIN:
+                found.append(self.examples[best[1]])
+        return found
+
+    @staticmethod
+    def _sim(qvec: dict, dvec: dict) -> float:
+        small, big = (qvec, dvec) if len(qvec) <= len(dvec) else (dvec, qvec)
+        return sum(weight * big.get(term, 0.0) for term, weight in small.items())
+
+    def _query_hand(self, qvec: dict, k: int) -> list:
         if not qvec:
             return []
 
         scored = []
         for i, dvec in enumerate(self.doc_vectors):
-            small, big = (qvec, dvec) if len(qvec) <= len(dvec) else (dvec, qvec)
-            sim = sum(weight * big.get(term, 0.0) for term, weight in small.items())
+            if self.learned[i]:
+                continue
+            sim = self._sim(qvec, dvec)
             if sim >= _MIN_SCORE:
                 scored.append((sim, i))
 

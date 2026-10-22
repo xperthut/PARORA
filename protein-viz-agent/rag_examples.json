@@ -206,5 +206,251 @@
   {
     "prompt": "compare that with the salt bridges from earlier",
     "grounding": "Earlier results live in the 'Remembered results' lines of the Scene block; call recall(topic='salt bridge') for the full earlier result, run the new analysis only if it is not remembered, then compare the two using the tool numbers only."
+  },
+  {
+    "prompt": "make chain A in red color, chain B in blue color and rest in gray color.",
+    "grounding": "Call color(color='red', selection='chain A'), then color(color='blue', selection='chain B'), then color(selection='rest', color='grey').",
+    "source": "eval:three-colors",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "fetch ubiquitin 1UBQ, show lysine 48 as sticks and zoom to it",
+    "grounding": "Call fetch_structure(pdb_id='1UBQ'), then show(rep_type='licorice', selection='chain A/48'), then zoom(selection='chain A/48'). Use the exact numbers from this prompt.",
+    "source": "eval:fetch-show-zoom-k48",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "remove the water and save the result as crambin_dry.pdb",
+    "grounding": "Call remove_solvent(), then save_structure(filename='crambin_dry.pdb').",
+    "source": "eval:strip-and-save",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "what's the angle made by residues 12 and 40",
+    "grounding": "Call ask_user(question='Which residue should be the vertex of the angle?', options=['Residue 12 as the vertex', 'Residue 40 as the vertex']). Use the exact numbers from this prompt.",
+    "source": "eval:angle-two-paraphrase",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "load spike protein",
+    "grounding": "Call load_protein(name='spike protein').",
+    "source": "eval:spike-ambiguous-name",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "remove the labels",
+    "grounding": "Call clear_labels().",
+    "source": "eval:remove-labels",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "remove the solvent",
+    "grounding": "Call remove_solvent().",
+    "source": "eval:remove-solvent-explicit",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "describe the folding topology of this domain",
+    "grounding": "Call describe_fold().",
+    "source": "eval:fold-topology-not-refused",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "which salt bridges stabilize this protein",
+    "grounding": "Call detect_salt_bridges().",
+    "source": "eval:saltbridges-stabilize-not-refused",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "prepare this for Amber and set up a 20 ns MD run",
+    "grounding": "Call prepare_structure(profile='amber'), then setup_amber(nanoseconds=20). Use the exact numbers from this prompt.",
+    "source": "eval:sim-prepare-then-amber",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "get rid of the waters",
+    "grounding": "Call remove_solvent().",
+    "source": "eval:strip-waters-phrasing",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "color chain A red",
+    "grounding": "Call color(color='red', selection='chain A').",
+    "source": "eval:color-chain-a-red",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "show cartoon of chain A",
+    "grounding": "Call show(rep_type='cartoon', selection='chain A').",
+    "source": "eval:show-cartoon-chain-a",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "display the protein as surface",
+    "grounding": "Call show(rep_type='surface', selection='protein').",
+    "source": "eval:show-surface",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "set the background to white",
+    "grounding": "Call set_background(color='white').",
+    "source": "eval:set-background",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "make chain C 50% transparent",
+    "grounding": "Call set_transparency(value=0.5, selection='chain C'). Use the exact numbers from this prompt.",
+    "source": "eval:transparency-chain-c",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "summarize the B-factors",
+    "grounding": "Call bfactor_summary().",
+    "source": "eval:bfactor-summary",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "select the residues with a B-factor above 30",
+    "grounding": "Call select_by_bfactor(name='high_bfactors', operator='>', threshold=30). Use the exact numbers from this prompt.",
+    "source": "eval:select-by-bfactor",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "distance between A/58 and A/87",
+    "grounding": "Call measure_distance(b='A/87', a='A/58'). Use the exact numbers from this prompt.",
+    "source": "eval:distance-spec",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "measure the distance between sel1='resid 5 and name CA' and sel2='resid 10 and name CA'",
+    "grounding": "Call measure_mda_distance(sel1='resid 5 and name CA', sel2='resid 10 and name CA'). Use the exact numbers from this prompt.",
+    "source": "eval:distance-mda-syntax",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "what fold is this",
+    "grounding": "Call describe_fold().",
+    "source": "eval:what-fold",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "what known structures is this similar to",
+    "grounding": "Call find_structural_neighbors().",
+    "source": "eval:structural-neighbours",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "render a ray-traced image of this",
+    "grounding": "Call render_image(quality='publication').",
+    "source": "eval:render-image",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "label chain A as alpha subunit",
+    "grounding": "Call add_label(text='alpha subunit', target='chain A', offset=0).",
+    "source": "eval:add-label",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "is the membrane build finished?",
+    "grounding": "Call membrane_status().",
+    "source": "eval:membrane-status",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "is this structure ready for simulation?",
+    "grounding": "Call inspect_preparation().",
+    "source": "eval:inspect-prep",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "prepare this structure for Amber",
+    "grounding": "Call prepare_structure(profile='amber').",
+    "source": "eval:prepare-amber",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "superpose 2W72 onto 4HHB and report the RMSD",
+    "grounding": "Call superpose_structures(mobile='2W72', reference='4HHB').",
+    "source": "eval:superpose-two",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "also load 1UBQ",
+    "grounding": "Call add_structure(pdb_id='1UBQ').",
+    "source": "eval:add-second-structure",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "remove 1UBQ from the scene",
+    "grounding": "Call remove_structure(target='1UBQ').",
+    "source": "eval:remove-structure",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "list the X-ray structures of HER2 with a ligand",
+    "grounding": "Call protein_structures(method='X-ray', ligands_only=True, name='HER2').",
+    "source": "eval:xray-with-ligand",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "write a Gaussian input for a QM region within 5 Å of the benzamidine",
+    "grounding": "Call setup_qm(radius=5, center='BEN'). Use the exact numbers from this prompt.",
+    "source": "eval:sim-qm-5A",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "set up a DFT optimisation of the benzamidine site with residues within 4 Å, total charge 0, using wB97XD/def2-SVP",
+    "grounding": "Call setup_qm(method='wB97XD', basis='def2-SVP', radius=4, charge=0, center='BEN'). Use the exact numbers from this prompt.",
+    "source": "eval:sim-qm-charge-given",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "load 2W72 and superpose it on 4HHB",
+    "grounding": "Call add_structure(pdb_id='2W72'), then superpose_structures(mobile='2W72', reference='4HHB', method='auto').",
+    "source": "eval:load-and-superpose",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "get the contacts for the ligand",
+    "grounding": "Call find_contacts(target='ligand').",
+    "source": "eval:generic-ligand-two-hets",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "load 1CRN, remove the water, find the disulfide bonds, measure the distance between residue 3 and residue 40, show it as cartoon colored by chain, and save it as crambin_plan.pdb",
+    "grounding": "Call fetch_structure(pdb_id='1CRN'), then remove_solvent(), then find_interactions(types='disulfide'), then measure_distance(a='3', b='40'), then show(color='chainindex', rep_type='cartoon', selection='protein'), then save_structure(filename='crambin_plan.pdb'). Use the exact numbers from this prompt.",
+    "source": "eval:plan-crambin-six",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "how many hydrogen bonds does this protein have, and is that more than typical for its size?",
+    "grounding": "Call detect_hydrogen_bonds(cutoff=3.5), then describe_structure().",
+    "source": "eval:selfcheck-hbond-typical",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "find the salt bridges in chain A and tell me which one is the shortest",
+    "grounding": "Call detect_salt_bridges(chain='A'), then recall(topic='salt bridge').",
+    "source": "eval:selfcheck-saltbridge-shortest",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "which part of this protein is most flexible?",
+    "grounding": "Call bfactor_summary().",
+    "source": "eval:selfcheck-flexible-bfactor",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "how many residues does this have, and what is the distance between residue 1 and residue 76?",
+    "grounding": "Call describe_structure(), then measure_distance(a='1', b='76'). Use the exact numbers from this prompt.",
+    "source": "eval:selfcheck-clean-distance",
+    "added": "2026-10-22"
+  },
+  {
+    "prompt": "which residues touch the heme in chain A",
+    "grounding": "Call find_contacts(include_water=False, target='HEM and :A', radius=4).",
+    "source": "eval:recover-heme-word",
+    "added": "2026-10-22"
   }
 ]

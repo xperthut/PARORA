@@ -23,7 +23,7 @@ Case format (one JSON object per line; '#'-lines and blank lines ignored):
 
     id        unique slug
     category  lookup | multistep | plan | ambiguity | destructive | recovery |
-              guardrail | multiturn | selfcheck
+              guardrail | multiturn | selfcheck | parallel
     groups    TOOL_GROUPS names the case exercises (coverage report)
     source    "log" (seeded from logs/parora.log) or "synthetic"
     requires  optional: network, fpocket, foldseek, esm, dssp, pymol, amber;
@@ -45,6 +45,9 @@ Case format (one JSON object per line; '#'-lines and blank lines ignored):
       say        [regex] — each must match the reply
       not_say    [regex] — none may match the reply
       max_calls  upper bound on calls that ran
+      max_llm_calls  upper bound on model round trips for the turn (S12)
+      parallel   regex list — calls of each tool ran in one concurrent group
+                 of 2+ (S12)
       no_failed  true → no call that ran reported failure
       recovery   regex — some call's S8 recovery step (normalize | equivalent |
                  ask | report) matches; "none" → no call needed recovery
@@ -150,7 +153,8 @@ def _describe(spec: dict) -> str:
     return f"{spec['name']}({args}){' ok' if spec.get('ok') else ''}"
 
 
-def score(expect: dict, trace: list, reply: str, asked: bool, plan: dict = None) -> list:
+def score(expect: dict, trace: list, reply: str, asked: bool, plan: dict = None,
+          llm_calls: int = None) -> list:
     """Each check → (label, passed, detail)."""
     ran = [c for c in trace if c["status"] == "ran"]
     checks = []
@@ -191,6 +195,17 @@ def score(expect: dict, trace: list, reply: str, asked: bool, plan: dict = None)
     if "max_calls" in expect:
         checks.append(("max_calls", len(ran) <= expect["max_calls"],
                        f"{len(ran)} ran" if len(ran) > expect["max_calls"] else ""))
+
+    if "max_llm_calls" in expect and llm_calls is not None:
+        checks.append(("max_llm_calls", llm_calls <= expect["max_llm_calls"],
+                       f"{llm_calls} model calls" if llm_calls > expect["max_llm_calls"] else ""))
+
+    if expect.get("parallel"):
+        side = [c["tool"] for c in ran if (c.get("parallel") or 1) > 1]
+        missing = [p for p in expect["parallel"]
+                   if not any(re.fullmatch(p, t, re.I) for t in side)]
+        checks.append(("parallel", not missing,
+                       "not run concurrently: " + ", ".join(missing) if missing else ""))
 
     if expect.get("no_failed"):
         bad = [c["tool"] for c in ran if c.get("failed")]
@@ -474,7 +489,8 @@ def main():
                     expect = {**(expect or {}), **c["expect"]}
                 tr = h.turn(prompt)
                 r["turns"].append(tr)
-                for label, ok, detail in score(expect or {}, tr["trace"], tr["reply"], tr["asked"], tr.get("plan")):
+                for label, ok, detail in score(expect or {}, tr["trace"], tr["reply"], tr["asked"], tr.get("plan"),
+                                              tr.get("llm_calls")):
                     r["checks"].append({"turn": i + 1, "check": label,
                                         "passed": ok, "detail": detail})
             r["passed"] = all(ch["passed"] for ch in r["checks"])

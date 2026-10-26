@@ -85,7 +85,7 @@ yarn-error.log*
 .gstack/
 
 # Text files
-todo.txt
+todo*.txt
 suggestion.txt
 # Eval harness run output (evals/run.py)
 evals/reports/

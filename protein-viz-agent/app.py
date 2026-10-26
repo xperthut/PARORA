@@ -27,6 +27,7 @@
 # =============================================================================
 
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 import base64
 import copy
 import filecmp
@@ -37,6 +38,7 @@ import logging
 import math
 import re
 import shutil
+import threading
 import time
 import uuid
 import requests
@@ -2880,6 +2882,20 @@ WRITE_TOOLS = {
     "build_membrane":        r"membrane|bilayer|lipid|popc|pope|packmol",
     "render_image":          r"render|image|figure|picture|\bpng\b|ray ?trac|snapshot",
 }
+# Tools one batch may run side by side (S12): read-only on the scene, and
+# their time goes to a subprocess (fpocket, Foldseek, DSSP, ESM-2) or HTTP
+# (SIFTS, UniProt, RCSB), so threads overlap the waiting. Salt bridges and
+# H-bonds only read the shared Universe. Anything that draws, writes or picks
+# a selection stays sequential. PARORA_PARALLEL=0 runs everything in turn.
+PARALLEL_TOOLS = {"find_pockets", "find_structural_neighbors", "describe_fold",
+                  "predict_mutation_effect", "protein_function", "protein_structures",
+                  "detect_salt_bridges", "detect_hydrogen_bonds", "bfactor_summary",
+                  "summarize_chains"}
+PARALLEL_MAX = max(1, int(os.environ.get("PARORA_PARALLEL", "4") or 1))
+# Of those, the ones that take nothing from another tool's result (no residue
+# or selection argument): a plan step of one never depends on another.
+WHOLE_STRUCTURE_TOOLS = PARALLEL_TOOLS - {"predict_mutation_effect"}
+
 # Scene changes that wipe the view: asked first only when confirm_before is
 # "always". In "auto" undo covers them.
 SCENE_WIPE_TOOLS = {"hide_all", "clear_scene", "replace_scene", "remove_structure"}
@@ -9449,6 +9465,51 @@ def _progress(status, msg: str) -> None:
         status.write(msg)
 
 
+def _dispatch_tool(name: str, args: dict) -> ToolResult:
+    """Call one tool by name; an exception becomes a failed ToolResult."""
+    dispatch = TOOL_DISPATCH.get(name)
+    if not dispatch:
+        _log(f"❓ Unknown tool requested: {name}", logging.WARNING)
+    try:
+        raw = dispatch(args) if dispatch else _fail(f"Unknown tool: {name}")
+        if not isinstance(raw, ToolResult):
+            _log(f"⚠️ '{name}' returned a bare {type(raw).__name__}, not a "
+                 "ToolResult — classified by the legacy text check", logging.WARNING)
+        return as_tool_result(raw)
+    except Exception as e:
+        # The user only ever sees the one-line "Tool error: ..." string; the
+        # full traceback -- what actually broke inside the tool -- only ever
+        # lands here, in the log.
+        log.exception("Tool '%s' raised with args=%s", name, args)
+        return _fail(f"Tool error: {e}")
+
+
+def _run_parallel(calls: list) -> list:
+    """
+    Run independent (name, args) calls on a thread pool (S12).
+
+    Returns [(ToolResult, ms)] in the order given. Each worker thread gets
+    the script run context, or st.session_state / st.spinner inside a tool
+    would not reach this session. A single call runs on this thread.
+    """
+    def run(name, args, ctx=None):
+        if ctx is not None:
+            add_script_run_ctx(threading.current_thread(), ctx)
+        t0 = time.monotonic()
+        result = _dispatch_tool(name, args)
+        return result, (time.monotonic() - t0) * 1000
+
+    if len(calls) == 1:
+        return [run(*calls[0])]
+    # Build the shared Universe once here; racing workers would each parse it.
+    if any(n in ("detect_salt_bridges", "detect_hydrogen_bonds") for n, _ in calls):
+        get_universe()
+    ctx = get_script_run_ctx()
+    with ThreadPoolExecutor(max_workers=min(len(calls), PARALLEL_MAX)) as pool:
+        futures = [pool.submit(run, n, a, ctx) for n, a in calls]
+        return [f.result() for f in futures]
+
+
 # ── Plan-then-act (S6) ───────────────────────────────────────────────────────
 # A long request ("load X, strip water, find the pocket, list H-bonds, render a
 # figure, set up Amber") used to lose steps: the loop picks one tool per turn
@@ -9578,6 +9639,13 @@ def _plan_request(user_prompt: str) -> dict | None:
             "status": "pending",
             "note": "",
         })
+    # A whole-structure analysis reads the loaded file, never another
+    # analysis' output. qwen2.5:14b chained "chains, salt bridges, H-bonds,
+    # pockets, fold" 1←2←3←4←5, which ran each alone (S12).
+    for s in steps:
+        if s["tool"] in WHOLE_STRUCTURE_TOOLS:
+            s["deps"] = [d for d in s["deps"]
+                         if steps[d - 1]["tool"] not in WHOLE_STRUCTURE_TOOLS]
     if len(steps) < 2:
         return None
     return {"request": user_prompt, "steps": steps}
@@ -9670,6 +9738,20 @@ def _plan_follow_up(plan: dict) -> str:
             "Reply with a plain-text summary that covers EVERY step in order: what it "
             "found or produced (with the tool's numbers), or why it failed or was skipped.")
     nxt = open_steps[0]
+    # S12: every open step whose dependencies are done can go in this turn;
+    # naming only the next one got one call per turn, a model round trip each.
+    done = {s["n"] for s in plan["steps"] if s["status"] == "done"}
+    ready = [s for s in open_steps if s is nxt or (s["tool"] and set(s["deps"]) <= done)]
+    if len(ready) > 1:
+        return head + (
+            "Ready now — independent steps; call ALL of these tools together in this "
+            "one turn:\n"
+            + "\n".join(f"  step {s['n']} — {s['goal']}"
+                        + (f" (`{s['tool']}`)" if s["tool"] else "") for s in ready)
+            + "\nIf a result changes what a later step needs, adapt that step. If a step "
+            "cannot be done, say so and why in the final reply — never claim it was done. "
+            "Reply in plain text only when every step is done, failed or skipped, "
+            "covering each one.")
     return head + (
         f"Next: step {nxt['n']} — {nxt['goal']}"
         + (f" (expected tool: `{nxt['tool']}`)" if nxt["tool"] else "")
@@ -10936,6 +11018,87 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
             return reply + _plan_footer()
 
         tool_results = []
+        # S12: gated PARALLEL_TOOLS calls wait here, each with the tool_results
+        # slot it fills, and run together at the next sequential call or at
+        # the end of the batch. Bookkeeping after a call stays in call order.
+        pending: list[tuple] = []
+
+        def _finish_call(slot, name, args, sig, result, tool_ms):
+            """Recover, record and remember one dispatched call (in call order)."""
+            nonlocal show_rep_fired
+            t0 = time.monotonic()
+            # S8: a failure goes down the recovery ladder before the model sees
+            # it. What stands afterwards — fixed args, another tool, a question
+            # or the failure with facts added — is what gets recorded below.
+            recovery, asked_tool = None, name
+            if not result.ok:
+                _progress(status, f"{name.replace('_', ' ')} failed — trying to recover…")
+                fixed = _recover(name, args, result, user_prompt)
+                if fixed:
+                    name, args, result, recovery = fixed
+                    if recovery["step"] in ("normalize", "equivalent"):
+                        called_sigs.add(f"{name}:{json.dumps(args, sort_keys=True)}")
+            if not result.ok:
+                fail_count[asked_tool] = fail_count.get(asked_tool, 0) + 1
+            elapsed_ms = tool_ms + (time.monotonic() - t0) * 1000
+            if elapsed_ms > 2000:
+                log.warning("Tool '%s' took %.0f ms", name, elapsed_ms)
+
+            # Track NGL strings that now have a ball+stick highlight
+            if name == "select" and result.ok:
+                ngl_str = st.session_state.selections.get(args.get("name", ""), "")
+                if ngl_str:
+                    selected_ngl_strs.add(ngl_str)
+
+            # Mark that a representation-type show has fired this run
+            if name == "show" and args.get("rep_type", "cartoon") != "ball+stick":
+                show_rep_fired = True
+
+            level = logging.INFO if result.ok else logging.ERROR
+            if status is not None:
+                status.write(f"{'✓' if result.ok else '✗'} {name.replace('_', ' ')}")
+            _log(f"🔧 {name}({args}) → {result}", level)
+            if result.ok and name in WRITE_TOOLS:      # undone with the request (S9)
+                st.session_state.setdefault("request_files", []).extend(result.files)
+            summary_parts.append(f"{name}: {result}")
+            ran.append((name, result))
+            _remember(name, args, result)
+            if plan and not result.data.get("needs_user_choice"):
+                # A step is ticked by the tool it asked for, even when an
+                # equivalent tool answered it (S8).
+                _advance_plan(plan, asked_tool, result)
+                _show_plan()
+            entry = {"tool": name, "result": result, "args": dict(args),
+                     "ms": round(elapsed_ms), "recovery": recovery}
+            if slot is None:
+                tool_results.append(entry)
+            else:
+                tool_results[slot] = entry
+            # A call that succeeds may have fixed what an earlier one lacked
+            # (parameterize_ligand, then setup_amber again), so failed calls
+            # become retryable; one that fails stays blocked until then.
+            if not result.ok:
+                failed_sigs[sig] = result.summary
+            else:
+                called_sigs.difference_update(failed_sigs)
+                failed_sigs.clear()
+
+        def _flush_parallel():
+            """Run the waiting PARALLEL_TOOLS calls together, then finish each in order."""
+            if not pending:
+                return
+            batch = pending[:]
+            pending.clear()
+            names = [p[1].replace("_", " ") for p in batch]
+            _progress(status, f"Running {', '.join(names)}"
+                              + (" in parallel…" if len(batch) > 1 else "…"))
+            if len(batch) > 1:
+                _log(f"⚡ Running {len(batch)} independent calls in parallel: "
+                     f"{', '.join(p[1] for p in batch)}")
+            outs = _run_parallel([(p[1], p[2]) for p in batch])
+            for (slot, name, args, sig), (result, ms) in zip(batch, outs):
+                _finish_call(slot, name, args, sig, result, ms)
+                tool_results[slot]["parallel"] = len(batch)
 
         # Asking and acting in the same breath means the model is unsure what
         # to act on — ask only.
@@ -10954,6 +11117,17 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
             func = tc.get("function", {})
             name = func.get("name", "")
             args = _tc_args(tc)
+
+            # S12: a call that cannot join the waiting group runs after it, so
+            # its gates see those results. A second call of one tool waits too
+            # (find_pockets keeps its last run in session state) unless it is
+            # the same call, which the dedup below skips: qwen2.5:14b repeated
+            # summarize_chains and detect_hydrogen_bonds in one batch, and
+            # flushing for them left every tool to run alone.
+            if pending and (name not in PARALLEL_TOOLS or any(
+                    p[1] == name and p[3] != f"{name}:{json.dumps(args, sort_keys=True)}"
+                    for p in pending)):
+                _flush_parallel()
 
             # Deterministic fallback for explicitly requested chain scopes.
             # Local models may select the correct tool but omit the chain
@@ -11193,6 +11367,10 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
             if step:
                 late = [d for d in plan["steps"] if d["n"] in step["deps"] and d["tool"]
                         and d["status"] != "done"]
+                if late and pending:
+                    # The dependency may be waiting in the parallel group (S12).
+                    _flush_parallel()
+                    late = [d for d in late if d["status"] != "done"]
                 if late:
                     d = late[0]
                     _log(f"⏸ Deferred '{name}' — plan step {step['n']} needs step {d['n']}, "
@@ -11237,78 +11415,17 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
 
             called_sigs.add(sig)
 
-            # Dispatch to the tool function
-            dispatch = TOOL_DISPATCH.get(name)
-            if not dispatch:
-                _log(f"❓ Unknown tool requested: {name}", logging.WARNING)
+            if name in PARALLEL_TOOLS and PARALLEL_MAX > 1:
+                tool_results.append(None)            # filled by _flush_parallel
+                pending.append((len(tool_results) - 1, name, dict(args), sig))
+                continue
             _progress(status, f"Running {name.replace('_', ' ')}…")
             t0 = time.monotonic()
-            try:
-                raw = dispatch(args) if dispatch else _fail(f"Unknown tool: {name}")
-                if not isinstance(raw, ToolResult):
-                    _log(f"⚠️ '{name}' returned a bare {type(raw).__name__}, not a "
-                         "ToolResult — classified by the legacy text check", logging.WARNING)
-                result = as_tool_result(raw)
-            except Exception as e:
-                result = _fail(f"Tool error: {e}")
-                # The user only ever sees the one-line "Tool error: ..." string
-                # above; the full traceback -- what actually broke inside the
-                # tool -- only ever lands here, in the log.
-                log.exception("Tool '%s' raised with args=%s", name, args)
-            # S8: a failure goes down the recovery ladder before the model sees
-            # it. What stands afterwards — fixed args, another tool, a question
-            # or the failure with facts added — is what gets recorded below.
-            recovery, asked_tool = None, name
-            if not result.ok:
-                _progress(status, f"{name.replace('_', ' ')} failed — trying to recover…")
-                fixed = _recover(name, args, result, user_prompt)
-                if fixed:
-                    name, args, result, recovery = fixed
-                    if recovery["step"] in ("normalize", "equivalent"):
-                        called_sigs.add(f"{name}:{json.dumps(args, sort_keys=True)}")
-            if not result.ok:
-                fail_count[asked_tool] = fail_count.get(asked_tool, 0) + 1
-            elapsed_ms = (time.monotonic() - t0) * 1000
-            if elapsed_ms > 2000:
-                log.warning("Tool '%s' took %.0f ms", name, elapsed_ms)
+            result = _dispatch_tool(name, args)
+            _finish_call(None, name, args, sig, result, (time.monotonic() - t0) * 1000)
+        _flush_parallel()
 
-            # Track NGL strings that now have a ball+stick highlight
-            if name == "select" and result.ok:
-                ngl_str = st.session_state.selections.get(args.get("name", ""), "")
-                if ngl_str:
-                    selected_ngl_strs.add(ngl_str)
-
-            # Mark that a representation-type show has fired this run
-            if name == "show" and args.get("rep_type", "cartoon") != "ball+stick":
-                show_rep_fired = True
-
-            level = logging.INFO if result.ok else logging.ERROR
-            if status is not None:
-                status.write(f"{'✓' if result.ok else '✗'} {name.replace('_', ' ')}")
-            _log(f"🔧 {name}({args}) → {result}", level)
-            if result.ok and name in WRITE_TOOLS:      # undone with the request (S9)
-                st.session_state.setdefault("request_files", []).extend(result.files)
-            summary_parts.append(f"{name}: {result}")
-            ran.append((name, result))
-            _remember(name, args, result)
-            if plan and not result.data.get("needs_user_choice"):
-                # A step is ticked by the tool it asked for, even when an
-                # equivalent tool answered it (S8).
-                _advance_plan(plan, asked_tool, result)
-                _show_plan()
-            tool_results.append({"tool": name, "result": result,
-                                 "args": dict(args), "ms": round(elapsed_ms),
-                                 "recovery": recovery})
-            # A call that succeeds may have fixed what an earlier one lacked
-            # (parameterize_ligand, then setup_amber again), so failed calls
-            # become retryable; one that fails stays blocked until then.
-            if not result.ok:
-                failed_sigs[sig] = result.summary
-            else:
-                called_sigs.difference_update(failed_sigs)
-                failed_sigs.clear()
-
-        # Every call above appended exactly one result, in call order.
+        # Every call above filled exactly one result, in call order.
         for tc, r in zip(tool_calls, tool_results):
             res = r["result"]
             _trace({"turn": turn, "tool": r["tool"],
@@ -11317,6 +11434,7 @@ def _run_agent_loop(user_prompt: str, status=None) -> str:
                     "ok": res.ok,
                     "failed": "ms" in r and not res.ok,
                     "result": res.summary[:800], "ms": r.get("ms"),
+                    "parallel": r.get("parallel", 1) if "ms" in r else None,
                     "data": json.loads(json.dumps(res.data, default=str)) if "ms" in r else {},
                     "files": res.files, "next_hints": res.next_hints,
                     "recovery": (json.loads(json.dumps(r["recovery"], default=str))

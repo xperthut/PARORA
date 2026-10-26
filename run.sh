@@ -144,7 +144,15 @@ if ! find_conda; then
             "curl -fsSL -o '$tmp/mc.sh' https://repo.anaconda.com/miniconda/Miniconda3-latest-$MC.sh \
              && bash '$tmp/mc.sh' -b -p '$HOME/miniconda3'"
         rm -rf "$tmp"
-        find_conda
+        # -b skips `conda init`: without it the user's own shell has no
+        # `conda` after this script ends (this script sources conda.sh below).
+        if find_conda; then
+            do_install "conda init (bash)" "$CONDA_ROOT/bin/conda" init bash
+            case "${SHELL:-}" in
+                */zsh) do_install "conda init (zsh)" "$CONDA_ROOT/bin/conda" init zsh ;;
+            esac
+            warn "Open a new terminal to use 'conda' yourself"
+        fi
     fi
 fi
 if [ -z "$CONDA_ROOT" ]; then
